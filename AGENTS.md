@@ -35,8 +35,8 @@ Build phases:
 2. Phase 2: pure hydro (Euler) with HLL + PLM + FE — Sod tube.
 3. Phase 3: full MHD with HLLD + PPM + RK3 + CT — Orszag-Tang.
 4. Phase 4: resistivity + per-edge BCs — Harris reconnection.
-5. **Phase 5** (current): UI (sidebar tabs, presets, stats, probe).
-6. Phase 6: LIC visualization.
+5. Phase 5: UI (sidebar tabs, presets, stats, probe).
+6. **Phase 6** (current): LIC visualization.
 7. Phase 7: polish (about, edu-content, JSON-LD, OG image, pointer perturbation).
 8. Phase 8: parent-repo wiring.
 
@@ -66,6 +66,79 @@ small enough that we compute aggregates on the CPU rather than
 building dedicated GPU reduction kernels. Phase 6 may move some
 aggregates onto the GPU when LIC kernels land.
 
+## Phase 6 LIC pass
+
+Animated line integral convolution along the magnetic field, decoupled
+from physics — runs once per displayed frame. Replaces the previous
+"colormap → composite" tail with "colormap → LIC advect → composite".
+
+Pieces:
+
+* `src/gpu/shaders/lic-advect.wgsl` — one invocation per interior cell.
+  Backward-traces 30 RK2 steps along the unit B-field (step size 0.5
+  cells, total ~15 cells of trace). At each step samples a 1024×1024
+  white-noise base buffer with bilinear interpolation and a per-frame
+  phase offset. Averages the samples and writes one f32 luminance per
+  interior cell into `lic_out` (ghost-padded storage for indexing
+  parity with `field` / `colored`). Transpiler-compatible: no
+  workgroup barriers, no textures, no matrices, no atomics, no
+  bitcast — just vec2<f32> math and scalar storage buffers.
+* `src/gpu/lic.js` — `LicRenderer` orchestrator. Mirrors
+  `PlasmaRenderer`'s shape; owns the per-frame bind group (depends on
+  ping-ponging `Bx_n` / `By_n` so rebuilt each render).
+* `src/gpu/shaders/composite.wgsl` — extended to read `lic_out` and
+  blend: `final.rgb = colored.rgb · mix(1, 0.5 + L, intensity)`. At
+  intensity=0 the colormap passes through unchanged; at intensity=1
+  full ±50% luminance modulation; slider clamps at 2 for users who
+  want a stronger swing.
+* `src/gpu/buffers.js` — `noise` (1024² f32, 4 MB) generated once at
+  init via mulberry32 PRNG (deterministic seed); `lic_out` (cellsT
+  f32, ghost-padded). Noise is resolution-independent — same buffer
+  serves any grid resolution; the LIC shader scales the sample
+  position. TODO marker on `_uploadNoise` for future blue-noise
+  upgrade (void-and-cluster, Mitchell's best-candidate).
+* `src/sim.js` — `setLicIntensity(v)`, `setLicDrift(dx, dy)`. The
+  per-render-frame `licPhase` accumulator advances by wall-clock dt
+  (not simulation dt — LIC drift is purely visual).
+* `src/ui.js` — LIC intensity + drift sliders in the advanced
+  settings dropdown.
+
+### LIC bind-group layout (transpiler contract)
+
+`lic-advect.wgsl` declares one bind group (group 0):
+
+| Binding | Type      | Resource      | Access      | Notes                          |
+|---------|-----------|---------------|-------------|--------------------------------|
+| 0       | uniform   | Uniforms      | read        | Uses ghost_w, grid_n, grid_n_total, lic_phase, lic_drift_x, lic_drift_y, noise_n |
+| 1       | storage   | Bx_face       | read        | f32, (N+5)×(N+4) ghost-padded  |
+| 2       | storage   | By_face       | read        | f32, (N+4)×(N+5) ghost-padded  |
+| 3       | storage   | noise         | read        | f32, 1024×1024 (4 MB), resolution-independent |
+| 4       | storage   | lic_out       | read_write  | f32, (N_total)² ghost-padded; only interior cells written |
+
+Dispatch: workgroups of 8×8, count `(N/8) × (N/8)` (interior cells only,
+no ghost). No workgroup-shared memory, no atomics, no barriers — the
+kernel is purely per-invocation.
+
+### `Uniforms` extension (Phase 6)
+
+The struct gains four LIC-related fields. Slot layout (16 × 4B = 64B,
+unchanged total size):
+
+| Slot  | Type | Field          | Notes                                        |
+|-------|------|----------------|----------------------------------------------|
+| 0–4   | f32  | dx … eta       | unchanged                                    |
+| 5     | f32  | `lic_phase`    | wall-clock seconds since first render        |
+| 6     | f32  | `lic_intensity`| 0–2, slider-controlled                       |
+| 7     | f32  | `lic_drift_x`  | noise-pixels per second, default 0.5         |
+| 8–13  | u32  | grid_n … view_mode | unchanged                                |
+| 14    | f32  | `lic_drift_y`  | noise-pixels per second, default 0.0         |
+| 15    | u32  | `noise_n`      | side length of noise buffer (= 1024)         |
+
+The composite render pipeline also has its bind group layout extended
+with `lic_out` at binding 2 (fragment-only, read-only-storage). The
+composite is intentionally render-only and stays GPU-only — only the
+LIC compute kernel needs to be transpilable.
+
 ### sim.js public API (new in Phase 5)
 
 `setPreset(name)`, `setBC(edge, mode)`, `setDrivenState(partial)`,
@@ -79,26 +152,29 @@ aggregates onto the GPU when LIC kernels land.
 preset. UI must call `stats.bindBuffers(sim.buffers)` and
 `probe.bindBuffers(sim.buffers)` to re-aim the readback paths.
 
-## Layout (current — Phase 4)
+## Layout (current — Phase 6)
 
 ```
 plasma/
-├── index.html              ← canvas + no-WebGPU fallback
+├── index.html              ← canvas + sidebar + topbar
 ├── main.js                 ← entry: WebGPU init, frame loop, accumulator
-├── styles.css              ← canvas + fallback layout (HUD lands later)
+├── styles.css              ← canvas + HUD layout
 ├── colors.js               ← _PALETTE extensions, frozen at startup
 ├── about.md                ← educational content (stub until Phase 7)
 ├── LICENSE                 ← AGPL-3.0
 └── src/
-    ├── config.js           ← grid size, CFL, γ, eta, ghost, BC enums, uniform layout
-    ├── sim.js              ← step orchestrator: BC → PPM → HLLD → EMF → CT → resistivity
+    ├── config.js           ← grid size, CFL, γ, eta, ghost, BC enums, uniform layout, LIC constants
+    ├── sim.js              ← step orchestrator: BC → PPM → HLLD → EMF → CT → resistivity + LIC state
     ├── presets.js          ← Sod, Brio-Wu, Orszag-Tang, Harris current sheet
     ├── colormaps.js        ← viridis LUT
+    ├── ui.js, stats-display.js, probe.js  ← Phase-5 UI
     └── gpu/
         ├── device.js       ← adapter+device init module
-        ├── buffers.js      ← ghost-padded slots, BC uniforms, stage params
+        ├── buffers.js      ← ghost-padded slots, BC uniforms, stage params, noise + lic_out
         ├── pipelines.js    ← compute + render pipeline factory
-        ├── render.js       ← view-field → colormap → composite
+        ├── render.js       ← view-field → colormap → LIC advect → composite
+        ├── lic.js          ← LicRenderer orchestrator (Phase 6)
+        ├── readback.js     ← staging-buffer pool (Phase 5)
         └── shaders/
             ├── shared-helpers.wgsl              ← Uniforms, BcUniforms, MHD prim/cons, indexing
             ├── apply-bcs.wgsl                   ← ghost-cell fill (4 modes × 4 edges)
@@ -111,7 +187,8 @@ plasma/
             ├── compute-dt.wgsl                  ← MHD CFL + parabolic resistive CFL
             ├── view-field.wgsl                  ← scalar extract (ρ, p, |v|, |B|, Jz)
             ├── colormap.wgsl                    ← LUT lookup (interior only)
-            └── composite.wgsl                   ← canvas blit (interior-relative UVs)
+            ├── lic-advect.wgsl                  ← Phase 6: backward-trace LIC along B (transpilable)
+            └── composite.wgsl                   ← canvas blit, colormap × LIC luminance
 ```
 
 ## Numerical method (Phase 4)

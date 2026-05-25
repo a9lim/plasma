@@ -53,6 +53,7 @@ import { VIRIDIS } from './colormaps.js';
 import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP,
     VIEW_JZ, ETA_DEFAULT, BC_PERIODIC, CFL, PRESSURE_FLOOR,
+    LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y,
 } from './config.js';
 
 const WG = WORKGROUP;
@@ -84,6 +85,15 @@ export class Sim {
         this.running     = true;
         this.speedScale  = 1;
         this.presetName  = 'orszag-tang';
+
+        // LIC state — phase animates per render frame in wall-clock time;
+        // intensity is UI-controlled. Drift constants stay fixed for now
+        // (locked decisions: ~0.5 cells/sec horizontal).
+        this.licIntensity = LIC_INTENSITY_DEFAULT;
+        this.licDriftX    = LIC_DRIFT_X;
+        this.licDriftY    = LIC_DRIFT_Y;
+        this.licPhase     = 0;
+        this._lastRenderTime = 0;
 
         this.buffers   = null;
         this.pipelines = null;
@@ -205,6 +215,22 @@ export class Sim {
     setSpeedScale(s)    { this.speedScale = s; }
 
     /**
+     * LIC modulation strength. 0 = colormap passes through unchanged,
+     * 1 = full ±50% luminance swing, 2 = double the swing (slider clamps).
+     */
+    setLicIntensity(v) {
+        this.licIntensity = Math.max(0, Math.min(2, +v || 0));
+        this._pushUniforms();
+    }
+
+    /** Drift speed in noise-pixels/sec — drift_x, drift_y are direction × speed. */
+    setLicDrift(dx, dy) {
+        this.licDriftX = +dx || 0;
+        this.licDriftY = +dy || 0;
+        this._pushUniforms();
+    }
+
+    /**
      * Re-allocate buffers at a new interior resolution and re-load the
      * current preset. Existing buffers are released by dropping the
      * `PlasmaBuffers` instance; GC handles GPU resource teardown when
@@ -252,6 +278,7 @@ export class Sim {
             speedScale: this.speedScale,
             running: this.running,
             bc: this.bcConfig,
+            licIntensity: this.licIntensity,
         });
     }
 
@@ -273,6 +300,7 @@ export class Sim {
             this.bcConfig = { ...this.bcConfig, ...obj.bc };
             this.buffers.pushBC(this.bcConfig);
         }
+        if (obj.licIntensity !== undefined) this.setLicIntensity(obj.licIntensity);
     }
 
     _pushUniforms() {
@@ -285,6 +313,10 @@ export class Sim {
             stepParity: this.stepCount & 1,
             viewMode: this.viewMode,
             eta: this.eta,
+            licPhase:     this.licPhase,
+            licIntensity: this.licIntensity,
+            licDriftX:    this.licDriftX,
+            licDriftY:    this.licDriftY,
         });
     }
 
@@ -586,6 +618,17 @@ export class Sim {
     }
 
     render() {
+        // Advance LIC phase by wall-clock dt (not simulation dt) — the
+        // drift is purely visual. Phase is in seconds; the shader
+        // multiplies by lic_drift_{x,y} (noise-pixels/sec) to get a
+        // sample offset in noise-pixel coords directly. On the very
+        // first render, _lastRenderTime is 0 so we skip the increment.
+        const now = performance.now();
+        if (this._lastRenderTime > 0) {
+            const dt = Math.min(0.1, (now - this._lastRenderTime) / 1000);
+            this.licPhase += dt;
+        }
+        this._lastRenderTime = now;
         this._pushUniforms();
         this.renderer.render();
     }

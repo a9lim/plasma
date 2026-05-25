@@ -44,6 +44,7 @@
 import {
     GRID_N, GHOST_WIDTH, UNIFORM_BUFFER_SIZE, BC_UNIFORM_BUFFER_SIZE,
     VIEW_DENSITY, BC_PERIODIC, ETA_DEFAULT,
+    LIC_NOISE_N, LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, LIC_NOISE_SEED,
 } from '../config.js';
 
 const VEC4_BYTES = 16;
@@ -216,9 +217,64 @@ export class PlasmaBuffers {
             usage: GPUBufferUsage.STORAGE,
         });
 
+        // ── LIC: noise base + per-cell luminance output ─────────────
+        // Noise buffer is resolution-independent — 1024×1024 f32. Sampled
+        // by integer indexing with bilinear interpolation in WGSL math.
+        // TODO(blue-noise): Phase 6 ships deterministic white noise
+        // (mulberry32 PRNG). A future pass should replace this with true
+        // blue noise (void-and-cluster or Mitchell's best-candidate) —
+        // white noise is grainier than ideal but visually adequate.
+        this.noise_n     = LIC_NOISE_N;
+        this.noise_size  = LIC_NOISE_N * LIC_NOISE_N * F32_BYTES;
+        this.noise = device.createBuffer({
+            label: 'plasma.lic_noise',
+            size: this.noise_size,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this._uploadNoise(LIC_NOISE_SEED);
+
+        // LIC output luminance — one f32 per cell, ghost-padded storage
+        // for indexing parity with `field` / `colored`. Interior writes only.
+        this.lic_out = device.createBuffer({
+            label: 'plasma.lic_out',
+            size: cellsT * F32_BYTES,
+            usage: GPUBufferUsage.STORAGE,
+        });
+
+        // LIC animation + intensity state (host-side; sim.js pushes via uniforms).
+        this._licPhase     = 0;
+        this._licIntensity = LIC_INTENSITY_DEFAULT;
+        this._licDriftX    = LIC_DRIFT_X;
+        this._licDriftY    = LIC_DRIFT_Y;
+
         // Default eta — caller can override via pushUniforms.
         this._eta = ETA_DEFAULT;
         this._viewMode = VIEW_DENSITY;
+    }
+
+    /**
+     * Generate a deterministic white-noise field via mulberry32 PRNG and
+     * upload to `this.noise`. Values are uniform in [0, 1).
+     *
+     * Called once at construction; reseeding is not exposed — the noise
+     * is meant to be a fixed fingerprint that the LIC trace samples
+     * different parts of as it advects.
+     */
+    _uploadNoise(seed) {
+        const N    = this.noise_n;
+        const arr  = new Float32Array(N * N);
+        // mulberry32: 32-bit state, 7-line PRNG. Deterministic at any
+        // seed; good enough mixing for visual noise.
+        let s = (seed >>> 0) || 1;
+        for (let i = 0; i < arr.length; i++) {
+            s = (s + 0x6D2B79F5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            const v = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            arr[i] = v;
+        }
+        this.device.queue.writeBuffer(this.noise, 0, arr.buffer);
     }
 
     /**
@@ -298,20 +354,36 @@ export class PlasmaBuffers {
 
     /**
      * Push the host uniform struct to GPU — writes BOTH sweep-direction
-     * uniform buffers. Layout:
-     *   f32 dx, gamma, view_min, view_max, eta, _pad, _pad, _pad
-     *   u32 grid_n, grid_n_total, ghost_w, sweep_dir, step_parity, view_mode, _pad, _pad
+     * uniform buffers. Layout (matches `struct Uniforms` in
+     * shared-helpers.wgsl):
+     *   slot 0..7  f32: dx, gamma, view_min, view_max, eta,
+     *                    lic_phase, lic_intensity, lic_drift_x
+     *   slot 8..13 u32: grid_n, grid_n_total, ghost_w, sweep_dir,
+     *                    step_parity, view_mode
+     *   slot 14    f32: lic_drift_y
+     *   slot 15    u32: noise_n
+     *
+     * Any field not passed in the args object falls back to the host-side
+     * cache (so callers that only know about a subset don't clobber LIC
+     * state).
      */
-    pushUniforms({ dx, gamma, viewMin, viewMax, gridN, stepParity, viewMode, eta }) {
-        if (eta !== undefined) this._eta = eta;
+    pushUniforms({
+        dx, gamma, viewMin, viewMax, gridN, stepParity, viewMode, eta,
+        licPhase, licIntensity, licDriftX, licDriftY,
+    } = {}) {
+        if (eta          !== undefined) this._eta          = eta;
+        if (licPhase     !== undefined) this._licPhase     = licPhase;
+        if (licIntensity !== undefined) this._licIntensity = licIntensity;
+        if (licDriftX    !== undefined) this._licDriftX    = licDriftX;
+        if (licDriftY    !== undefined) this._licDriftY    = licDriftY;
         this.uniformF32[0] = dx;
         this.uniformF32[1] = gamma;
         this.uniformF32[2] = viewMin;
         this.uniformF32[3] = viewMax;
         this.uniformF32[4] = this._eta;
-        this.uniformF32[5] = 0;
-        this.uniformF32[6] = 0;
-        this.uniformF32[7] = 0;
+        this.uniformF32[5] = this._licPhase;
+        this.uniformF32[6] = this._licIntensity;
+        this.uniformF32[7] = this._licDriftX;
         this.uniformU32[8]  = gridN >>> 0;
         this.uniformU32[9]  = (gridN + 2 * this.ghost) >>> 0;
         this.uniformU32[10] = this.ghost >>> 0;
@@ -319,8 +391,8 @@ export class PlasmaBuffers {
         this.uniformU32[12] = stepParity >>> 0;
         this.uniformU32[13] = (viewMode ?? this._viewMode) >>> 0;
         if (viewMode !== undefined) this._viewMode = viewMode;
-        this.uniformU32[14] = 0;
-        this.uniformU32[15] = 0;
+        this.uniformF32[14] = this._licDriftY;
+        this.uniformU32[15] = this.noise_n >>> 0;
         this.device.queue.writeBuffer(this.uniform_x, 0, this.uniformHost);
 
         // y-sweep variant.

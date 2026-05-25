@@ -1,14 +1,17 @@
 /**
- * @fileoverview View-field → colormap → composite render chain.
+ * @fileoverview View-field → colormap → LIC advect → composite render chain.
  *
- * Three GPU passes wired into one entry point:
+ * Four GPU passes wired into one entry point:
  *   1. view-field   — compute: U_current + face B → field (scalar by view-mode)
  *   2. colormap     — compute: field + LUT → colored (vec4 RGB)
- *   3. composite    — render:  colored → canvas via fullscreen triangle
+ *   3. lic-advect   — compute: B-field + noise → lic_out (per-cell luminance)
+ *   4. composite    — render:  colored × LIC luminance → canvas (fullscreen tri)
  *
- * view-field's bind group is rebuilt every render — the buffers ping-pong
- * every step (cell-state AND face-B together).
+ * view-field's and lic-advect's bind groups are rebuilt every render —
+ * the buffers ping-pong every step (cell-state AND face-B together).
  */
+
+import { LicRenderer } from './lic.js';
 
 const WG = 8;
 
@@ -47,8 +50,12 @@ export class PlasmaRenderer {
             entries: [
                 { binding: 0, resource: { buffer: buffers.uniform_x } },
                 { binding: 1, resource: { buffer: buffers.colored } },
+                { binding: 2, resource: { buffer: buffers.lic_out } },
             ],
         });
+
+        // LIC orchestrator owns its own (per-frame-rebuilt) bind group.
+        this.lic = new LicRenderer(device, pipelines, buffers);
     }
 
     _viewBindGroup() {
@@ -95,10 +102,16 @@ export class PlasmaRenderer {
             pass.setPipeline(pipelines.pipelines.colormap);
             pass.setBindGroup(0, this._colormapBG);
             pass.dispatchWorkgroups(groups, groups, 1);
+
+            // LIC advect — backward-traces along B-field, writes luminance.
+            // Chained in the same compute pass; reads Bx_n / By_n (already
+            // ghost-filled by apply-bcs at the end of the last step) and
+            // writes lic_out, which composite then samples.
+            this.lic.encode(pass);
             pass.end();
         }
 
-        // 3: composite to canvas.
+        // 4: composite to canvas (colormap × LIC luminance).
         {
             const view = this.context.getCurrentTexture().createView();
             const pass = encoder.beginRenderPass({

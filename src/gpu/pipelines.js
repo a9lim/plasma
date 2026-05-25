@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 5;
+const SHADER_VERSION = 6;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -188,7 +188,21 @@ function colormapBGL(device) {
 function compositeBGL(device) {
     return bgl(device, 'plasma.composite.bgl', [
         { binding: 0, visibility: VERTEX | FRAGMENT, buffer: UNIFORM },
-        { binding: 1, visibility: FRAGMENT,          buffer: RO_STO },
+        { binding: 1, visibility: FRAGMENT,          buffer: RO_STO },  // colored
+        { binding: 2, visibility: FRAGMENT,          buffer: RO_STO },  // lic_out
+    ]);
+}
+
+// LIC advect — backward-traces along B-field per interior cell, samples
+// noise with bilinear interpolation, writes per-cell luminance.
+// Contract documented in lic-advect.wgsl. Transpiler-compatible.
+function licAdvectBGL(device) {
+    return bgl(device, 'plasma.licAdvect.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // By_face
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // noise
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },  // lic_out
     ]);
 }
 
@@ -196,7 +210,7 @@ export async function createPipelines(device, format) {
     const [
         ppmModule, hlldModule, emfModule, updateUWModule, updateBWModule,
         applyBcsModule, applyResistivityModule,
-        dtModule, viewModule, colormapModule, compositeModule,
+        dtModule, viewModule, colormapModule, compositeModule, licAdvectModule,
     ] = await Promise.all([
         makeModule(device, 'plasma.reconstruct-ppm',          'reconstruct-ppm.wgsl'),
         makeModule(device, 'plasma.riemann-hlld',             'riemann-hlld.wgsl'),
@@ -209,6 +223,7 @@ export async function createPipelines(device, format) {
         makeModule(device, 'plasma.view-field',               'view-field.wgsl'),
         makeModule(device, 'plasma.colormap',                 'colormap.wgsl'),
         makeModule(device, 'plasma.composite',                'composite.wgsl'),
+        makeModule(device, 'plasma.lic-advect',               'lic-advect.wgsl'),
     ]);
 
     const reconstructLayout = reconstructPpmBGL(device);
@@ -222,6 +237,7 @@ export async function createPipelines(device, format) {
     const viewLayout        = viewBGL(device);
     const colormapLayout    = colormapBGL(device);
     const compositeLayout   = compositeBGL(device);
+    const licAdvectLayout   = licAdvectBGL(device);
 
     const mkPipeLayout = (bgl) => device.createPipelineLayout({ bindGroupLayouts: [bgl] });
 
@@ -298,6 +314,12 @@ export async function createPipelines(device, format) {
         primitive: { topology: 'triangle-list' },
     });
 
+    const licAdvect = device.createComputePipeline({
+        label: 'plasma.lic-advect',
+        layout: mkPipeLayout(licAdvectLayout),
+        compute: { module: licAdvectModule, entryPoint: 'main' },
+    });
+
     return {
         layouts: {
             reconstruct: reconstructLayout,
@@ -311,13 +333,14 @@ export async function createPipelines(device, format) {
             view:        viewLayout,
             colormap:    colormapLayout,
             composite:   compositeLayout,
+            licAdvect:   licAdvectLayout,
         },
         pipelines: {
             reconstructPpm, riemannHlld, computeEmf,
             updateConservedWeighted, updateBWeighted,
             applyBcs, applyResistivity,
             dtReset, dtReduce, dtFinalize,
-            viewField, colormap, composite,
+            viewField, colormap, composite, licAdvect,
         },
     };
 }

@@ -94,17 +94,17 @@ struct Uniforms {
     view_min:      f32,
     view_max:      f32,
     eta:           f32,
-    _pad_f0:       f32,
-    _pad_f1:       f32,
-    _pad_f2:       f32,
+    lic_phase:     f32,  // animated noise-sample phase offset (cells)
+    lic_intensity: f32,  // 0 = no LIC modulation, 1 = full strength
+    lic_drift_x:   f32,  // noise drift direction (cells/sec)
     grid_n:        u32,  // INTERIOR grid resolution per axis
     grid_n_total:  u32,  // grid_n + 2*ghost_w (total storage width per axis)
     ghost_w:       u32,  // ghost-cell width per side (= 2 in Phase 4)
     sweep_dir:     u32,  // 0 = x-sweep / x-face shaders, 1 = y-sweep / y-face shaders
     step_parity:   u32,  // 0 = even, 1 = odd — informational
     view_mode:     u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
-    _pad_u0:       u32,
-    _pad_u1:       u32,
+    lic_drift_y:   f32,  // noise drift direction y (cells/sec)
+    noise_n:       u32,  // noise-buffer side length (square, default 1024)
 };
 
 // BC modes — match config.js / enum values.

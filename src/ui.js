@@ -95,6 +95,12 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'p-floor (log10)', min: -8, max: -3, step: 0.5,
               value: Math.log10(sim.pressureFloor), format: v => '1e' + v.toFixed(1),
               onChange: v => sim.setPressureFloor(Math.pow(10, v)) },
+            { type: 'slider', label: 'LIC intensity', min: 0, max: 2, step: 0.05,
+              value: sim.licIntensity, format: v => v.toFixed(2),
+              onChange: v => sim.setLicIntensity(v) },
+            { type: 'slider', label: 'LIC drift', min: 0, max: 4, step: 0.1,
+              value: sim.licDriftX, format: v => v.toFixed(1) + ' px/s',
+              onChange: v => sim.setLicDrift(v, sim.licDriftY) },
         ], { width: 300 });
     }
 

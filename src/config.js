@@ -78,9 +78,11 @@ export const EDGE_S = 1;  // bottom
 export const EDGE_E = 2;  // right
 export const EDGE_W = 3;  // left
 
-// Uniform-buffer layout (Phase 4): see `Uniforms` struct in shared-helpers.wgsl.
-//   f32 dx, gamma, view_min, view_max, eta, _pad_f0, _pad_f1, _pad_f2
-//   u32 grid_n, grid_n_total, ghost_w, sweep_dir, step_parity, view_mode, _pad_u0, _pad_u1
+// Uniform-buffer layout (Phase 6): see `Uniforms` struct in shared-helpers.wgsl.
+//   f32 dx, gamma, view_min, view_max, eta, lic_phase, lic_intensity, lic_drift_x
+//   u32 grid_n, grid_n_total, ghost_w, sweep_dir, step_parity, view_mode
+//   f32 lic_drift_y
+//   u32 noise_n
 // 16 × 4B = 64B.
 export const UNIFORM_BUFFER_SIZE = 64;
 
@@ -89,3 +91,43 @@ export const UNIFORM_BUFFER_SIZE = 64;
 //   f32 driven_rho, driven_vx, driven_vy, driven_vz, driven_bx, driven_by, driven_bz, driven_p
 // 4*4 + 8*4 = 48B, padded to 64B for alignment headroom.
 export const BC_UNIFORM_BUFFER_SIZE = 64;
+
+// ── LIC (line integral convolution) — Phase 6 ──────────────────────────
+// Animated noise advection along B-field. The noise base is resolution-
+// independent (LIC samples it with bilinear interpolation), so we ship a
+// single 1024×1024 white-noise texture once at init and reuse across
+// resolution changes.
+export const LIC_NOISE_N = 1024;
+
+// PRNG seed for the deterministic white-noise base. Any 32-bit integer;
+// the actual value doesn't matter — pick something memorable for the
+// build to be reproducible. (Mulberry32 PRNG, see buffers.js.)
+export const LIC_NOISE_SEED = 0xC0FFEE;
+
+// Number of backward-trace steps per pixel. 30 × 0.5 cells = ~15 cells
+// of trace length — long enough to resolve magnetic islands and short
+// enough to stay performant at 1024².
+export const LIC_STEPS = 30;
+
+// Backward-trace step length in cell widths. RK2 midpoint integration.
+export const LIC_STEP_SIZE = 0.5;
+
+// Default UI slider value for LIC intensity. 0 = no LIC modulation,
+// 1 = full strength. Composite blends colormap by `mix(1, L, intensity*0.5+0.5)`,
+// so intensity=1 means a ±50% luminance modulation.
+export const LIC_INTENSITY_DEFAULT = 1.0;
+
+// Drift direction in noise-pixel units per second of wall-clock time.
+// The shader adds `lic_phase * drift_{x,y}` to the noise sample
+// position, so `drift` is the rate at which the noise pattern
+// translates relative to traced positions.
+// Phase 6 default: horizontal drift at 0.5 noise-pixel/sec — slow and
+// directional rather than chaotic. At a 1024² noise base with a 256²
+// grid, 0.5 noise-pixel/sec corresponds to ~0.125 cell/sec of apparent
+// motion — perceptible without being distracting.
+export const LIC_DRIFT_X = 0.5;
+export const LIC_DRIFT_Y = 0.0;
+
+// Epsilon below which |B| is treated as effectively zero (trace halts).
+// Prevents runaway sampling in field-free regions.
+export const LIC_B_EPS = 1.0e-8;
