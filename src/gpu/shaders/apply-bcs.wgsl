@@ -84,11 +84,11 @@ fn driven_cons() -> array<vec4<f32>, 2> {
     P.vx  = bc.driven_vx;
     P.vy  = bc.driven_vy;
     P.vz  = bc.driven_vz;
-    P.p   = max(bc.driven_p, PRESSURE_FLOOR);
+    P.p   = max(bc.driven_p, U_uniforms.pressure_floor);
     P.bx  = bc.driven_bx;
     P.by  = bc.driven_by;
     P.bz  = bc.driven_bz;
-    let cp = prim_to_cons_pair(P, U_uniforms.gamma);
+    let cp = prim_to_cons_pair(P, U_uniforms.gamma, U_uniforms.pressure_floor);
     return array<vec4<f32>, 2>(cp.U0, cp.U1);
 }
 

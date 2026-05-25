@@ -31,12 +31,14 @@ class PlasmaSim {
      * @param {GPUAdapter} adapter
      * @param {GPUDevice} device
      * @param {GPUTextureFormat} format
+     * @param {boolean} [hasTimestamp=false] adapter advertises 'timestamp-query'
      */
-    constructor(canvas, adapter, device, format) {
+    constructor(canvas, adapter, device, format, hasTimestamp = false) {
         this.canvas = canvas;
         this.adapter = adapter;
         this.device = device;
         this.format = format;
+        this.hasTimestamp = !!hasTimestamp;
 
         this.context = canvas.getContext('webgpu');
         this.context.configure({
@@ -45,7 +47,7 @@ class PlasmaSim {
             alphaMode: 'premultiplied',
         });
 
-        this.sim = new Sim(device, this.context, format);
+        this.sim = new Sim(device, this.context, format, { hasTimestamp: this.hasTimestamp });
         this.lastTime = 0;
         this.accumulator = 0;
         this.running = true;
@@ -145,15 +147,15 @@ async function main() {
         return;
     }
 
-    let adapter, device, format;
+    let adapter, device, format, hasTimestamp;
     try {
-        ({ adapter, device, format } = await initDevice());
+        ({ adapter, device, format, hasTimestamp } = await initDevice());
     } catch (e) {
         showNoWebGPU(e);
         return;
     }
 
-    const sim = new PlasmaSim(canvas, adapter, device, format);
+    const sim = new PlasmaSim(canvas, adapter, device, format, hasTimestamp);
     try {
         await sim.init();
     } catch (e) {
@@ -171,6 +173,11 @@ async function main() {
         console.warn('[plasma] UI setup failed:', e);
     }
 
+    // Tab-hide pause: visibilitychange flips `_hidden`, and `loop()` only
+    // reschedules an rAF when `!_hidden`. So one more frame runs after
+    // hide (the already-queued rAF), then the loop chain dies. On unhide
+    // we reset `lastTime` (so the accumulator doesn't see a huge dt) and
+    // restart the chain. Verified: physics + render stop on tab hide.
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
             sim._hidden = true;

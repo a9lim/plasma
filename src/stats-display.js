@@ -148,7 +148,8 @@ export class StatsDisplay {
         this.root.append(groupLabel('Clock'));
         const tStep = statRow('Step');
         const tCfl  = statRow('CFL');
-        this.root.append(tStep.row, tCfl.row);
+        const tGpu  = statRow('GPU step');
+        this.root.append(tStep.row, tCfl.row, tGpu.row);
 
         this._refs = {
             eTot: eTot.value, eKin: eKin.value, eMag: eMag.value,
@@ -156,7 +157,7 @@ export class StatsDisplay {
             bMean: bMean.value, bMin: bMin.value, bMax: bMax.value,
             maxB: maxB.value, maxV: maxV.value, maxJ: maxJ.value,
             divB: divB.value, rrate: rrate.value,
-            tStep: tStep.value, tCfl: tCfl.value,
+            tStep: tStep.value, tCfl: tCfl.value, tGpu: tGpu.value,
         };
     }
 
@@ -199,6 +200,13 @@ export class StatsDisplay {
             { buf: b.By_n, byteOffset: 0, byteSize: yfaceCells * F32 },
             { buf: b.dt,   byteOffset: 0, byteSize: F32 },
         ];
+        // Timestamp resolve buffer (2 × u64 = 16 B) when the device
+        // supports `timestamp-query`. Batched alongside the other reads so
+        // we keep one round-trip per cadence tick.
+        const tsIdx = (this.sim._tsResolve) ? specs.length : -1;
+        if (tsIdx >= 0) {
+            specs.push({ buf: this.sim._tsResolve, byteOffset: 0, byteSize: 16 });
+        }
 
         let bufs;
         try {
@@ -213,10 +221,29 @@ export class StatsDisplay {
         const Byf = new Float32Array(bufs[3]);
         const dtArr = new Float32Array(bufs[4]);
 
-        this._compute(U0, U1, Bxf, Byf, dtArr[0], n, nT);
+        // Decode the two 64-bit timestamps (ns since some device epoch) into
+        // a step time in ms. We read as two BigUint64s — the high bits of
+        // BigInt cap at 53-bit safe but the absolute timestamp values can
+        // exceed that; we subtract first as BigInt and only convert to
+        // Number after the diff fits.
+        let gpuMs = null;
+        if (tsIdx >= 0) {
+            try {
+                const ts = new BigUint64Array(bufs[tsIdx]);
+                const diffNs = ts[1] - ts[0];
+                gpuMs = Number(diffNs) / 1_000_000;
+                if (Number.isFinite(gpuMs) && gpuMs >= 0) {
+                    this.sim._tsLastMs = gpuMs;
+                }
+            } catch (e) {
+                // BigUint64Array might not be available; drop silently.
+            }
+        }
+
+        this._compute(U0, U1, Bxf, Byf, dtArr[0], n, nT, gpuMs);
     }
 
-    _compute(U0, U1, Bxf, Byf, dt, n, nT) {
+    _compute(U0, U1, Bxf, Byf, dt, n, nT, gpuMs) {
         const ghost = GHOST_WIDTH;
         const dx = this.sim.dx;
         const dxInv = 1 / dx;
@@ -347,6 +374,13 @@ export class StatsDisplay {
 
         this._refs.tStep.textContent = String(this.sim.stepCount);
         this._refs.tCfl.textContent  = dt.toExponential(3);
+        // GPU step time. When timestamp-query isn't supported, we never
+        // populate `gpuMs`; fall back to em-dash via the cached refs.
+        if (gpuMs != null && Number.isFinite(gpuMs)) {
+            this._refs.tGpu.textContent = gpuMs.toFixed(2) + ' ms';
+        } else if (this.sim._tsLastMs > 0) {
+            this._refs.tGpu.textContent = this.sim._tsLastMs.toFixed(2) + ' ms';
+        }
 
         // Update sparklines.
         pushSparkSample(this._sparkEnergy.hist, Etot);

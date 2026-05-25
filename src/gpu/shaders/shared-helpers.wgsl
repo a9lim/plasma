@@ -60,10 +60,14 @@
 //   Bx_face[i,j] += -(dt/dy) · (Ez_edge[i, j+1] - Ez_edge[i, j])
 //   By_face[i,j] += +(dt/dx) · (Ez_edge[i+1,j] - Ez_edge[i, j])
 // where the Ez differences are taken at the two endpoints of the
-// face. With Ez = arithmetic mean of the four neighbouring face fluxes
-// (Balsara-Spicer; see compute-emf.wgsl), discrete ∇·B is preserved
-// exactly to machine precision: corner contributions cancel in pairs
-// around every cell.
+// face. Ez_corner is computed by the Gardiner & Stone 2005 upwind CT
+// formula (see compute-emf.wgsl) — a Balsara-Spicer-style arithmetic
+// base at the four neighbouring face fluxes plus four upwind-biased
+// quarter-derivative corrections driven by the HLLD contact velocity.
+// Discrete ∇·B is preserved exactly to machine precision regardless of
+// the corner-Ez recipe: corner contributions cancel in pairs around
+// every cell whenever the same Ez_corner value is shared by all four
+// faces it touches (which the staggered update enforces).
 //
 // Face fluxes carry the SAME convention:
 //   flux_x[i, j] = flux through the LEFT face of cell (i, j) at i-½.
@@ -93,11 +97,11 @@
 // γ comes from the Uniforms; pressure & density floors match config.js.
 
 // Main physics-state Uniforms (64 B). Written when a physics parameter
-// changes (preset/eta/cfl/gamma/view_mode/resolution). Slots 5,6,7,14
-// are reserved (previously held LIC fields — now in a separate LicUniforms
-// buffer rewritten per render frame). Slot 11 is reserved (previously
-// held sweep_dir — now in a separate SweepDir buffer pair). Slot 12
-// holds the CFL number (was the unused step_parity slot).
+// changes (preset/eta/cfl/gamma/view_mode/resolution/pressure_floor). Slots
+// 5,6,7,14 are reserved (previously held LIC fields — now in a separate
+// LicUniforms buffer rewritten per render frame). Slot 11 holds the
+// pressure floor (was the dead _pad_sweep slot reclaimed for live UI).
+// Slot 12 holds the CFL number (was the unused step_parity slot).
 struct Uniforms {
     dx:            f32,
     gamma:         f32,
@@ -110,7 +114,7 @@ struct Uniforms {
     grid_n:        u32,  // INTERIOR grid resolution per axis
     grid_n_total:  u32,  // grid_n + 2*ghost_w (total storage width per axis)
     ghost_w:       u32,  // ghost-cell width per side (= 2 in Phase 4)
-    _pad_sweep:    u32,  // reserved (was sweep_dir — now in SweepDir uniform)
+    pressure_floor:f32,  // minimum p in cons→prim recovery (UI slider)
     cfl:           f32,  // hyperbolic CFL number — consumed by compute-dt
     view_mode:     u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
     _pad_lic_3:    f32,  // reserved (was lic_drift_y — now in LicUniforms)
@@ -167,7 +171,9 @@ struct BcUniforms {
     driven_p:   f32,
 };
 
-const PRESSURE_FLOOR: f32 = 1.0e-6;
+// PRESSURE_FLOOR is now live-controlled via U.pressure_floor (Uniforms
+// slot 11) — pass it explicitly to helpers below. The shader-side
+// default (matching config.js) is 1e-6.
 const DENSITY_FLOOR:  f32 = 1.0e-6;
 
 // ── Indexing helpers ────────────────────────────────────────────────
@@ -243,7 +249,7 @@ struct MhdCons {
     bz:   f32,
 };
 
-fn cons_to_prim_mhd(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32, gamma: f32) -> MhdPrim {
+fn cons_to_prim_mhd(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32, gamma: f32, p_floor: f32) -> MhdPrim {
     var P: MhdPrim;
     P.rho = max(U0.x, DENSITY_FLOOR);
     P.vx  = U0.y / P.rho;
@@ -254,14 +260,14 @@ fn cons_to_prim_mhd(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32, gamma: f
     P.bz  = U1.y;
     let ke = 0.5 * P.rho * (P.vx*P.vx + P.vy*P.vy + P.vz*P.vz);
     let mb = 0.5 * (P.bx*P.bx + P.by*P.by + P.bz*P.bz);
-    P.p   = max((gamma - 1.0) * (U1.x - ke - mb), PRESSURE_FLOOR);
+    P.p   = max((gamma - 1.0) * (U1.x - ke - mb), p_floor);
     return P;
 }
 
-fn fast_mag_speed(P: MhdPrim, gamma: f32, axis: u32) -> f32 {
+fn fast_mag_speed(P: MhdPrim, gamma: f32, axis: u32, p_floor: f32) -> f32 {
     // c_fast² = ½(c_s² + c_A²) + ½√((c_s² + c_A²)² − 4 c_s² c_An²)
     let rho = max(P.rho, DENSITY_FLOOR);
-    let p   = max(P.p,   PRESSURE_FLOOR);
+    let p   = max(P.p,   p_floor);
     let cs2 = gamma * p / rho;
     let b2  = P.bx*P.bx + P.by*P.by + P.bz*P.bz;
     let ca2 = b2 / rho;
@@ -282,9 +288,9 @@ struct MhdFlux {
     f_bt2: f32,
 };
 
-fn mhd_flux(P: MhdPrim, gamma: f32, axis: u32) -> MhdFlux {
+fn mhd_flux(P: MhdPrim, gamma: f32, axis: u32, p_floor: f32) -> MhdFlux {
     let rho = max(P.rho, DENSITY_FLOOR);
-    let p   = max(P.p,   PRESSURE_FLOOR);
+    let p   = max(P.p,   p_floor);
     let ke  = 0.5 * rho * (P.vx*P.vx + P.vy*P.vy + P.vz*P.vz);
     let mb  = 0.5 * (P.bx*P.bx + P.by*P.by + P.bz*P.bz);
     let E   = p / (gamma - 1.0) + ke + mb;
@@ -329,9 +335,9 @@ struct ConsPair {
     U1: vec4<f32>,
 };
 
-fn prim_to_cons_pair(P: MhdPrim, gamma: f32) -> ConsPair {
+fn prim_to_cons_pair(P: MhdPrim, gamma: f32, p_floor: f32) -> ConsPair {
     let rho = max(P.rho, DENSITY_FLOOR);
-    let p   = max(P.p,   PRESSURE_FLOOR);
+    let p   = max(P.p,   p_floor);
     let ke  = 0.5 * rho * (P.vx*P.vx + P.vy*P.vy + P.vz*P.vz);
     let mb  = 0.5 * (P.bx*P.bx + P.by*P.by + P.bz*P.bz);
     let E   = p / (gamma - 1.0) + ke + mb;

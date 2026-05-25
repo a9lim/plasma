@@ -22,7 +22,14 @@ const REQUIRED_LIMITS = {
 
 /**
  * Initialize WebGPU adapter + device.
- * @returns {Promise<{adapter: GPUAdapter, device: GPUDevice, format: GPUTextureFormat}>}
+ *
+ * Requests the `timestamp-query` feature opportunistically — when supported,
+ * the simulator wraps each RK3 step's compute pass with start/end timestamp
+ * writes and surfaces the wall-clock GPU time in the Stats tab. When the
+ * adapter doesn't advertise the feature, request is skipped and timing
+ * just stays unavailable; everything else works the same.
+ *
+ * @returns {Promise<{adapter: GPUAdapter, device: GPUDevice, format: GPUTextureFormat, hasTimestamp: boolean}>}
  * @throws {Error} if WebGPU is unavailable, adapter/device request fails, or
  *                 the adapter cannot satisfy the requested limits.
  */
@@ -48,11 +55,17 @@ export async function initDevice() {
         }
     }
 
-    const device = await adapter.requestDevice({ requiredLimits });
+    // Opt-in: `timestamp-query` is an optional WebGPU feature. We request it
+    // only if the adapter advertises it; absent the feature the sim still
+    // works, the Stats panel just shows "—" for GPU step time.
+    const hasTimestamp = !!adapter.features?.has?.('timestamp-query');
+    const requiredFeatures = hasTimestamp ? ['timestamp-query'] : [];
+
+    const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
     if (!device) {
         throw new Error('No WebGPU device returned');
     }
 
     const format = navigator.gpu.getPreferredCanvasFormat();
-    return { adapter, device, format };
+    return { adapter, device, format, hasTimestamp };
 }

@@ -63,7 +63,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let mb = 0.5 * (bx_c*bx_c + by_c*by_c + bz*bz);
     let ke = 0.5 * (mx*mx + my*my + mz*mz) / rho;
-    let E_min = ke + mb + PRESSURE_FLOOR / (U_uniforms.gamma - 1.0);
+    let E_min = ke + mb + U_uniforms.pressure_floor / (U_uniforms.gamma - 1.0);
     let E = clamp(u1.x, E_min, 1.0e30);
 
     U1_out[c] = vec4<f32>(E, bz, 0.0, 0.0);

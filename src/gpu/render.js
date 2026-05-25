@@ -116,8 +116,16 @@ export class PlasmaRenderer {
             // LIC advect — backward-traces along B-field, writes luminance.
             // Chained in the same compute pass; reads Bx_n / By_n (already
             // ghost-filled by apply-bcs at the end of the last step) and
-            // writes lic_out, which composite then samples.
+            // writes lic_out.
             this.lic.encode(pass);
+            // LIC contrast-stretch — reduce lic_out → global (min, max),
+            // then rewrite lic_out in-place via min/max normalization.
+            // Mirrors compute-dt's per-tile shared-atomic reduction. This
+            // pulls residual noise variation out into the full [0, 1]
+            // range in flat field-free regions while leaving strong-field
+            // regions essentially untouched, so composite samples a
+            // higher-contrast LIC texture.
+            this.lic.encodePost(pass);
             pass.end();
         }
 

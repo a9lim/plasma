@@ -52,7 +52,7 @@
 
 import {
     GRID_N, GHOST_WIDTH, UNIFORM_BUFFER_SIZE, BC_UNIFORM_BUFFER_SIZE,
-    VIEW_DENSITY, BC_PERIODIC, ETA_DEFAULT,
+    VIEW_DENSITY, BC_PERIODIC, ETA_DEFAULT, PRESSURE_FLOOR,
     LIC_NOISE_N, LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, LIC_NOISE_SEED,
 } from '../config.js';
 
@@ -298,10 +298,29 @@ export class PlasmaBuffers {
 
         // LIC output luminance — one f32 per cell, ghost-padded storage
         // for indexing parity with `field` / `colored`. Interior writes only.
+        // STORAGE | COPY_DST | COPY_SRC: lic-normalize reads-and-rewrites
+        // it after lic-reduce computes the global min/max. COPY_DST gives
+        // host-side clears a path; COPY_SRC mirrors the other ghost-padded
+        // outputs in case a future debug readback wants the raw luminance.
         this.lic_out = device.createBuffer({
             label: 'plasma.lic_out',
             size: cellsT * F32_BYTES,
-            usage: GPUBufferUsage.STORAGE,
+            usage: GPUBufferUsage.STORAGE
+                 | GPUBufferUsage.COPY_DST
+                 | GPUBufferUsage.COPY_SRC,
+        });
+
+        // LIC contrast-stretch global reduction target — 2 × u32 atomic
+        // (min_bits, max_bits), 8 B. Written by lic-reduce, read by
+        // lic-normalize. COPY_SRC is here purely for debug readback;
+        // lic-reduce's `reset` entry seeds the values, so no host writes
+        // are required at runtime.
+        this.lic_minmax = device.createBuffer({
+            label: 'plasma.lic_minmax',
+            size: 8,
+            usage: GPUBufferUsage.STORAGE
+                 | GPUBufferUsage.COPY_DST
+                 | GPUBufferUsage.COPY_SRC,
         });
 
         // LIC animation + intensity state (host-side; sim.js pushes via uniforms).
@@ -313,6 +332,10 @@ export class PlasmaBuffers {
         // Default eta — caller can override via pushUniforms.
         this._eta = ETA_DEFAULT;
         this._viewMode = VIEW_DENSITY;
+        // Default CFL / pressure floor — pushUniforms reads these as
+        // fallbacks if a particular slider hasn't fired yet.
+        this._cfl = undefined;
+        this._pressureFloor = PRESSURE_FLOOR;
     }
 
     /**
@@ -424,7 +447,8 @@ export class PlasmaBuffers {
      * Layout (matches `struct Uniforms` in shared-helpers.wgsl):
      *   slot 0..7   f32: dx, gamma, view_min, view_max, eta,
      *                    _pad_lic_0, _pad_lic_1, _pad_lic_2
-     *   slot 8..11  u32: grid_n, grid_n_total, ghost_w, _pad_sweep
+     *   slot 8..10  u32: grid_n, grid_n_total, ghost_w
+     *   slot 11     f32: pressure_floor (UI slider, was _pad_sweep)
      *   slot 12     f32: cfl
      *   slot 13     u32: view_mode
      *   slot 14     f32: _pad_lic_3
@@ -435,10 +459,11 @@ export class PlasmaBuffers {
      * other state).
      */
     pushUniforms({
-        dx, gamma, viewMin, viewMax, gridN, viewMode, eta, cfl,
+        dx, gamma, viewMin, viewMax, gridN, viewMode, eta, cfl, pressureFloor,
     } = {}) {
-        if (eta !== undefined) this._eta = eta;
-        if (cfl !== undefined) this._cfl = cfl;
+        if (eta           !== undefined) this._eta           = eta;
+        if (cfl           !== undefined) this._cfl           = cfl;
+        if (pressureFloor !== undefined) this._pressureFloor = pressureFloor;
         this.uniformF32[0] = dx;
         this.uniformF32[1] = gamma;
         this.uniformF32[2] = viewMin;
@@ -450,7 +475,7 @@ export class PlasmaBuffers {
         this.uniformU32[8]  = gridN >>> 0;
         this.uniformU32[9]  = (gridN + 2 * this.ghost) >>> 0;
         this.uniformU32[10] = this.ghost >>> 0;
-        this.uniformU32[11] = 0; // _pad_sweep
+        this.uniformF32[11] = (this._pressureFloor ?? PRESSURE_FLOOR); // pressure_floor as f32
         this.uniformF32[12] = (this._cfl ?? 0.4); // cfl as f32
         this.uniformU32[13] = (viewMode ?? this._viewMode) >>> 0;
         if (viewMode !== undefined) this._viewMode = viewMode;

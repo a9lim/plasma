@@ -80,7 +80,8 @@ export const EDGE_W = 3;  // left
 
 // Uniform-buffer layout (Round 2): see `Uniforms` struct in shared-helpers.wgsl.
 //   f32 dx, gamma, view_min, view_max, eta, _pad_lic_0, _pad_lic_1, _pad_lic_2
-//   u32 grid_n, grid_n_total, ghost_w, _pad_sweep
+//   u32 grid_n, grid_n_total, ghost_w
+//   f32 pressure_floor                       (slot 11, live via UI slider)
 //   f32 cfl                                  (slot 12)
 //   u32 view_mode                            (slot 13)
 //   f32 _pad_lic_3                           (slot 14)

@@ -28,6 +28,18 @@
 //
 // Degenerate-branch handling unchanged from Phase 3b.
 //
+// Flux output layout (per face, two vec4<f32>):
+//   flux_0 = (f_rho, f_mn, f_mt1, f_mt2)
+//   flux_1 = (f_E,   f_bt2/f_by-or-bx, fBt1=±Ez, SM_face)
+// The fourth component of flux_1 carries the HLLD contact-wave speed
+// S_M (M&K 2005 eq 38) — the face-normal contact velocity. Consumed by
+// compute-emf.wgsl as the upwind selector for the Gardiner-Stone 2005
+// CT EMF (eqns 41-45). Computed once up-front from rcL/rcR so every
+// branch (supersonic / HLL fallbacks / Branch A HLLC / full HLLD) can
+// stamp it into flux_1.w with a consistent definition. Downstream
+// update-conserved-weighted masks flux_1 with (1,1,0,0) so the SM
+// channel costs zero in the conserved update — it only feeds CT.
+//
 // Bindings:
 //   0 uniforms (uniform)
 //   1 U0_in     (ro)
@@ -71,13 +83,13 @@
 const HLLD_BX_EPS2: f32 = 1.0e-10;
 const HLLD_WS_TOL:  f32 = 1.0e-8;
 
-fn unpack_edge_prim(edge0: vec4<f32>, edge1: vec4<f32>, b_normal: f32, axis: u32) -> MhdPrim {
+fn unpack_edge_prim(edge0: vec4<f32>, edge1: vec4<f32>, b_normal: f32, axis: u32, p_floor: f32) -> MhdPrim {
     var Q: MhdPrim;
     Q.rho = max(edge0.x, DENSITY_FLOOR);
     Q.vx  = edge0.y;
     Q.vy  = edge0.z;
     Q.vz  = edge0.w;
-    Q.p   = max(edge1.x, PRESSURE_FLOOR);
+    Q.p   = max(edge1.x, p_floor);
     Q.bz  = edge1.z;
     if (axis == 0u) {
         Q.bx = b_normal;
@@ -199,8 +211,8 @@ fn hll_flux_mhd(in_: HllInputs, axis: u32, gamma: f32) -> HLLOut {
     }
 
     // Conservative pairs — not pre-computed by HLLD's AxisState path.
-    let CL = prim_to_cons_pair(in_.QL, gamma);
-    let CR = prim_to_cons_pair(in_.QR, gamma);
+    let CL = prim_to_cons_pair(in_.QL, gamma, U_uniforms.pressure_floor);
+    let CR = prim_to_cons_pair(in_.QR, gamma, U_uniforms.pressure_floor);
 
     // Build an AxisFlux for the HLL average, then route through
     // pack_flux to preserve the axis-dependent packing the call sites
@@ -290,18 +302,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         b_normal = By_face[by_face_idx(ix, iy, n_total)];
     }
 
-    let QL = unpack_edge_prim(edge_r_0[idx_l], edge_r_1[idx_l], b_normal, axis);
-    let QR = unpack_edge_prim(edge_l_0[idx_r], edge_l_1[idx_r], b_normal, axis);
+    let pf = U_uniforms.pressure_floor;
+    let QL = unpack_edge_prim(edge_r_0[idx_l], edge_r_1[idx_l], b_normal, axis, pf);
+    let QR = unpack_edge_prim(edge_l_0[idx_r], edge_l_1[idx_r], b_normal, axis, pf);
 
     let AL = prim_to_axis_state(QL, axis, g);
     let AR = prim_to_axis_state(QR, axis, g);
     let FL = axis_flux(AL);
     let FR = axis_flux(AR);
 
-    let cfL = fast_mag_speed(QL, g, axis);
-    let cfR = fast_mag_speed(QR, g, axis);
+    let cfL = fast_mag_speed(QL, g, axis, pf);
+    let cfR = fast_mag_speed(QR, g, axis, pf);
     let SL  = min(AL.un - cfL, AR.un - cfR);
     let SR  = max(AL.un + cfL, AR.un + cfR);
+
+    // ── Contact-wave speed S_M (M&K 2005 eq 38) ──────────────────────
+    // Computed up-front so every flux-write path can stash it into
+    // flux_1.w. compute-emf.wgsl uses this as the upwind selector for
+    // the Gardiner-Stone 2005 CT EMF — the sign of the contact velocity
+    // at each face determines which adjacent cell's Ez_cell is upwind.
+    //
+    // Formula is identical to the HLL contact-velocity estimate, so
+    // it's correct for HLL fallbacks (Branches B/C) as well as HLLD's
+    // main path. For supersonic faces (SL>=0 or SR<=0) the entire
+    // upstream is one side anyway; SM and the actual upstream velocity
+    // coincide in the limit of vanishing jump and differ only by a
+    // smooth fast-wave-speed correction otherwise — fine for the
+    // upwind selector since only sign matters in practice.
+    let rcL_pre = AL.rho * (SL - AL.un);
+    let rcR_pre = AR.rho * (SR - AR.un);
+    let SM_den_pre = rcR_pre - rcL_pre;
+    let SM_face = (rcR_pre * AR.un - rcL_pre * AL.un - AR.pT + AL.pT)
+                / select(SM_den_pre, sign(SM_den_pre) * 1.0e-12, abs(SM_den_pre) < 1.0e-30);
 
     // Cell index of the FACE itself (the left face of cell idx_r). flux
     // arrays use the same cell-centered indexing scheme; we write at
@@ -309,15 +341,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dst = idx_r;
 
     if (SL >= 0.0) {
-        let pf = pack_flux(FL, axis);
-        flux_0[dst] = pf.f0;
-        flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+        let pfL = pack_flux(FL, axis);
+        flux_0[dst] = pfL.f0;
+        flux_1[dst] = vec4<f32>(pfL.f1.x, pfL.f1.y, pfL.fBt1, SM_face);
         return;
     }
     if (SR <= 0.0) {
-        let pf = pack_flux(FR, axis);
-        flux_0[dst] = pf.f0;
-        flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+        let pfR = pack_flux(FR, axis);
+        flux_0[dst] = pfR.f0;
+        flux_1[dst] = vec4<f32>(pfR.f1.x, pfR.f1.y, pfR.fBt1, SM_face);
         return;
     }
 
@@ -330,20 +362,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         hin.SL = SL; hin.SR = SR;
         let h = hll_flux_mhd(hin, axis, g);
         flux_0[dst] = h.f0;
-        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
+        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, SM_face);
         return;
     }
 
-    let rcL = AL.rho * (SL - AL.un);
-    let rcR = AR.rho * (SR - AR.un);
-    let SM_num = rcR * AR.un - rcL * AL.un - AR.pT + AL.pT;
-    let SM_den = rcR - rcL;
-    let SM = SM_num / select(SM_den, sign(SM_den) * 1.0e-12, abs(SM_den) < 1.0e-30);
+    // Reuse the up-front SM_face (identical to M&K 2005 eq 38).
+    let SM = SM_face;
 
     let pT_star = AL.pT + AL.rho * (SL - AL.un) * (SM - AL.un);
 
     // Branch C: negative star pressure → HLL fallback.
-    if (pT_star <= PRESSURE_FLOOR) {
+    if (pT_star <= pf) {
         var hin: HllInputs;
         hin.QL = QL; hin.QR = QR;
         hin.AL = AL; hin.AR = AR;
@@ -351,7 +380,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         hin.SL = SL; hin.SR = SR;
         let h = hll_flux_mhd(hin, axis, g);
         flux_0[dst] = h.f0;
-        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
+        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, SM_face);
         return;
     }
 
@@ -390,9 +419,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             Fout.f_bt1 = FR.f_bt1 + SR * (AR.bt1 * (SR - AR.un)/(SR - SM) - AR.bt1);
             Fout.f_bt2 = FR.f_bt2 + SR * (AR.bt2 * (SR - AR.un)/(SR - SM) - AR.bt2);
         }
-        let pf = pack_flux(Fout, axis);
-        flux_0[dst] = pf.f0;
-        flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+        let pfA = pack_flux(Fout, axis);
+        flux_0[dst] = pfA.f0;
+        flux_1[dst] = vec4<f32>(pfA.f1.x, pfA.f1.y, pfA.fBt1, SM_face);
         return;
     }
 
@@ -497,7 +526,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Fout.f_bt2 = FR.f_bt2 + SR * (bt2_Rs               - AR.bt2);
     }
 
-    let pf = pack_flux(Fout, axis);
-    flux_0[dst] = pf.f0;
-    flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+    let pfH = pack_flux(Fout, axis);
+    flux_0[dst] = pfH.f0;
+    flux_1[dst] = vec4<f32>(pfH.f1.x, pfH.f1.y, pfH.fBt1, SM_face);
 }

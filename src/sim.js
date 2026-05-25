@@ -59,10 +59,11 @@ import {
 const WG = WORKGROUP;
 
 export class Sim {
-    constructor(device, context, format) {
+    constructor(device, context, format, opts = {}) {
         this.device  = device;
         this.context = context;
         this.format  = format;
+        this.hasTimestamp = !!opts.hasTimestamp;
 
         this.n        = GRID_N;
         this.ghost    = GHOST_WIDTH;
@@ -117,6 +118,29 @@ export class Sim {
         this.pipelines = await createPipelines(this.device, this.format);
         this.buffers   = new PlasmaBuffers(this.device, this.n);
         this.renderer  = new PlasmaRenderer(this.device, this.context, this.pipelines, this.buffers);
+
+        // GPU-step timing infrastructure. Allocated only when the adapter
+        // advertises `timestamp-query` (see device.js). The query set holds
+        // two 64-bit timestamps (start of stage 1 + end of stage 3 of the
+        // RK3 compute pass). `_tsResolve` is the buffer we resolve the
+        // query values into (16 B, QUERY_RESOLVE | COPY_SRC) — the readback
+        // staging buffer comes from StatsDisplay's ReadbackPool so we don't
+        // hold a second one here.
+        this._tsQuerySet = null;
+        this._tsResolve  = null;
+        this._tsLastMs   = 0;  // last successfully read GPU step time, in ms
+        if (this.hasTimestamp) {
+            this._tsQuerySet = this.device.createQuerySet({
+                label: 'plasma.timestampQuerySet',
+                type:  'timestamp',
+                count: 2,
+            });
+            this._tsResolve = this.device.createBuffer({
+                label: 'plasma.timestampResolve',
+                size:  16, // 2 × u64
+                usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+            });
+        }
 
         // Phase 4 default preset still Orszag-Tang for smoke check;
         // Phase 5 wires the dropdown for Harris/etc.
@@ -245,7 +269,7 @@ export class Sim {
 
     setCFL(cfl)         { this.cfl = cfl; this._pushUniforms(); }
     setGamma(g)         { this.gamma = g; this._pushUniforms(); }
-    setPressureFloor(p) { this.pressureFloor = p; /* shader floor is constant in WGSL; UI exposes for future use */ }
+    setPressureFloor(p) { this.pressureFloor = p; this._pushUniforms(); }
 
     setRunning(r)       { this.running = !!r; }
     setSpeedScale(s)    { this.speedScale = s; }
@@ -353,6 +377,7 @@ export class Sim {
             viewMode: this.viewMode,
             eta: this.eta,
             cfl: this.cfl,
+            pressureFloor: this.pressureFloor,
         });
     }
 
@@ -508,7 +533,13 @@ export class Sim {
         });
     }
 
-    _emfBG() {
+    // EMF bind group is now side- and stage-dependent — Gardiner-Stone
+    // 2005 upwind CT needs the cell-centered Ez at the four cells
+    // around each corner, computed from the SRC U0 and SRC face B
+    // (whichever buffer the current stage's PPM read from). Caller
+    // passes the stage's (U0_src, Bx_src, By_src) so the cache builds
+    // A/B variants per stage.
+    _emfBG(U0_src, Bx_src, By_src) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.emf.bg',
@@ -518,6 +549,9 @@ export class Sim {
                 { binding: 1, resource: { buffer: b.flux_x_1 } },
                 { binding: 2, resource: { buffer: b.flux_y_1 } },
                 { binding: 3, resource: { buffer: b.Ez_edge } },
+                { binding: 4, resource: { buffer: U0_src } },
+                { binding: 5, resource: { buffer: Bx_src } },
+                { binding: 6, resource: { buffer: By_src } },
             ],
         });
     }
@@ -635,7 +669,7 @@ export class Sim {
                 reconstructY:   this._reconstructBG(1, src.U0, src.U1, src.Bx, src.By),
                 riemannX:       this._riemannBG(0, src.U0, src.U1, src.Bx, src.By),
                 riemannY:       this._riemannBG(1, src.U0, src.U1, src.Bx, src.By),
-                emf:            this._emfBG(),
+                emf:            this._emfBG(src.U0, src.Bx, src.By),
                 updateU:        this._updateUBG(stageBuf,
                                                 h.U0_n, h.U1_n,
                                                 other.U0, other.U1,
@@ -817,8 +851,18 @@ export class Sim {
         // Pass 1: compute dt from U(n).
         this._encodeComputeDt(encoder);
 
-        // Pass 2: three RK3 SSP stages.
-        const pass = encoder.beginComputePass({ label: 'plasma.rk3' });
+        // Pass 2: three RK3 SSP stages. Optionally instrumented with two
+        // timestamp queries (start of stage 1, end of stage 3) when the
+        // adapter supports the `timestamp-query` feature.
+        const passDesc = { label: 'plasma.rk3' };
+        if (this._tsQuerySet) {
+            passDesc.timestampWrites = {
+                querySet: this._tsQuerySet,
+                beginningOfPassWriteIndex: 0,
+                endOfPassWriteIndex:       1,
+            };
+        }
+        const pass = encoder.beginComputePass(passDesc);
 
         // Stage 1: U(1) = U(n) + dt · L(U(n))
         this._encodeStage(pass, 1, side);
@@ -830,6 +874,15 @@ export class Sim {
         this._encodeStage(pass, 3, side);
 
         pass.end();
+
+        // Resolve the timestamp queries into the GPU-side resolve buffer.
+        // Readback (mapAsync) is owned by StatsDisplay so we don't block
+        // the hot path here; it's pull-driven at whatever cadence Stats
+        // is running.
+        if (this._tsQuerySet) {
+            encoder.resolveQuerySet(this._tsQuerySet, 0, 2, this._tsResolve, 0);
+        }
+
         device.queue.submit([encoder.finish()]);
 
         b.swap();

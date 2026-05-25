@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 8;
+const SHADER_VERSION = 12;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -102,11 +102,20 @@ function riemannHlldBGL(device) {
 }
 
 function emfBGL(device) {
+    // Gardiner-Stone 2005 upwind CT EMF needs the cell-centered Ez at
+    // the four cells around each corner (cf. compute-emf.wgsl). Cell Ez
+    // = vy·Bx - vx·By is computed inline from the cell U0 (for vx/vy)
+    // and the two adjacent face B values per axis. Adds 3 read-only
+    // storage bindings vs the BS-arithmetic-mean version; still under
+    // the 10-per-pipeline cap (6 storage bindings total here).
     return bgl(device, 'plasma.emf.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
         { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // flux_x_1
         { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // flux_y_1
         { binding: 3, visibility: COMPUTE, buffer: RW_STO },  // Ez_edge
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // U0 (for cell vx, vy)
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // Bx_face (for cell Bx avg)
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // By_face (for cell By avg)
     ]);
 }
 
@@ -216,6 +225,29 @@ function licAdvectBGL(device) {
     ]);
 }
 
+// LIC contrast-stretch reduction. Mirrors compute-dt's reduce shape:
+// per-tile atomicMin/Max into workgroup-shared u32s, top-level barrier,
+// thread 0 commits into the global lic_minmax. Two entry points
+// (reset + main) share the same BGL.
+function licReduceBGL(device) {
+    return bgl(device, 'plasma.licReduce.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // lic_out
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },  // lic_minmax (atomic)
+    ]);
+}
+
+// LIC contrast-stretch normalize. Per-invocation; reads the global
+// min/max produced by lic-reduce, rewrites lic_out in place. No
+// barriers / atomics / shared memory.
+function licNormalizeBGL(device) {
+    return bgl(device, 'plasma.licNormalize.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // lic_minmax
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },  // lic_out
+    ]);
+}
+
 // New in Round 2. Magnetic-pressure-aware energy floor. Runs between
 // update-conserved-weighted (step 7) and update-b-weighted (step 8) —
 // uses stage-input face B to bound E in the just-written U1. 4 storage
@@ -235,6 +267,7 @@ export async function createPipelines(device, format) {
         ppmModule, hlldModule, emfModule, updateUWModule, updateBWModule,
         applyBcsModule, applyResistivityModule, energyFloorModule,
         dtModule, viewModule, colormapModule, compositeModule, licAdvectModule,
+        licReduceModule, licNormalizeModule,
     ] = await Promise.all([
         makeModule(device, 'plasma.reconstruct-ppm',          'reconstruct-ppm.wgsl'),
         makeModule(device, 'plasma.riemann-hlld',             'riemann-hlld.wgsl'),
@@ -249,6 +282,8 @@ export async function createPipelines(device, format) {
         makeModule(device, 'plasma.colormap',                 'colormap.wgsl'),
         makeModule(device, 'plasma.composite',                'composite.wgsl'),
         makeModule(device, 'plasma.lic-advect',               'lic-advect.wgsl'),
+        makeModule(device, 'plasma.lic-reduce',               'lic-reduce.wgsl'),
+        makeModule(device, 'plasma.lic-normalize',            'lic-normalize.wgsl'),
     ]);
 
     const reconstructLayout = reconstructPpmBGL(device);
@@ -264,6 +299,8 @@ export async function createPipelines(device, format) {
     const colormapLayout    = colormapBGL(device);
     const compositeLayout   = compositeBGL(device);
     const licAdvectLayout   = licAdvectBGL(device);
+    const licReduceLayout   = licReduceBGL(device);
+    const licNormalizeLayout = licNormalizeBGL(device);
 
     const mkPipeLayout = (bgl) => device.createPipelineLayout({ bindGroupLayouts: [bgl] });
 
@@ -356,6 +393,23 @@ export async function createPipelines(device, format) {
         compute: { module: licAdvectModule, entryPoint: 'main' },
     });
 
+    const licReducePipeLayout = mkPipeLayout(licReduceLayout);
+    const licReduceReset = device.createComputePipeline({
+        label: 'plasma.lic-reduce.reset',
+        layout: licReducePipeLayout,
+        compute: { module: licReduceModule, entryPoint: 'reset' },
+    });
+    const licReduce = device.createComputePipeline({
+        label: 'plasma.lic-reduce',
+        layout: licReducePipeLayout,
+        compute: { module: licReduceModule, entryPoint: 'main' },
+    });
+    const licNormalize = device.createComputePipeline({
+        label: 'plasma.lic-normalize',
+        layout: mkPipeLayout(licNormalizeLayout),
+        compute: { module: licNormalizeModule, entryPoint: 'main' },
+    });
+
     return {
         layouts: {
             reconstruct: reconstructLayout,
@@ -371,6 +425,8 @@ export async function createPipelines(device, format) {
             colormap:    colormapLayout,
             composite:   compositeLayout,
             licAdvect:   licAdvectLayout,
+            licReduce:   licReduceLayout,
+            licNormalize: licNormalizeLayout,
         },
         pipelines: {
             reconstructPpm, riemannHlld, computeEmf,
@@ -379,6 +435,7 @@ export async function createPipelines(device, format) {
             energyFloor,
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite, licAdvect,
+            licReduceReset, licReduce, licNormalize,
         },
     };
 }

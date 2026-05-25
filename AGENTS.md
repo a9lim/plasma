@@ -20,9 +20,9 @@ Implementation plan (source of truth for design decisions):
 
 - **Physics**: resistive 2.5D ideal MHD — state `(ρ, v_x, v_y, v_z, B_x, B_y, B_z, p)`
 - **Riemann solver**: HLLD (Miyoshi & Kusano 2005) with HLLC and HLL fallbacks for degenerate branches
-- **Reconstruction**: PPM (Colella & Woodward 1984) with monotonicity limiter
+- **Reconstruction**: PPM (Colella & Woodward 1984) with characteristic-variable limiting (Stone+ 2008 §3.4.2 — Athena/Athena++ default for MHD)
 - **Time integration**: RK3 SSP, three stages, single-submit-per-step
-- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008), Balsara-Spicer EMF
+- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008), Gardiner-Stone 2005 upwind EMF (HLLD contact velocity as upwind selector)
 - **Resistivity**: explicit central differences, η ∇²B applied per RK3 stage after CT update (SSP-compatible by linearity)
 - **Boundaries**: per-edge selectable — periodic / outflow / reflecting / driven
 - **Default view**: J_z (out-of-plane current density)
@@ -63,7 +63,7 @@ plasma/
             ├── apply-bcs.wgsl                   ← ghost-cell fill (4 modes × 4 edges)
             ├── reconstruct-ppm.wgsl             ← per-direction PPM (CW 1984)
             ├── riemann-hlld.wgsl                ← HLLD (M&K 2005) + HLLC + HLL fallbacks
-            ├── compute-emf.wgsl                 ← Balsara-Spicer Ez at corners
+            ├── compute-emf.wgsl                 ← Gardiner-Stone 2005 upwind Ez at corners
             ├── update-conserved-weighted.wgsl   ← RK3 SSP weighted U update
             ├── update-b-weighted.wgsl           ← RK3 SSP weighted face-B update (CT)
             ├── apply-resistivity.wgsl           ← η ∇²B per stage (post-CT)
@@ -71,6 +71,8 @@ plasma/
             ├── view-field.wgsl                  ← scalar extract (ρ, p, |v|, |B|, J_z)
             ├── colormap.wgsl                    ← viridis LUT lookup (interior only)
             ├── lic-advect.wgsl                  ← backward-trace LIC along B (transpilable)
+            ├── lic-reduce.wgsl                  ← per-tile min/max reduce of lic_out (workgroup-shared atomics)
+            ├── lic-normalize.wgsl               ← in-place contrast stretch using lic_minmax
             └── composite.wgsl                   ← canvas blit, colormap × LIC luminance
 ```
 
@@ -78,14 +80,14 @@ plasma/
 
 | Piece               | Choice                                                |
 |---------------------|-------------------------------------------------------|
-| Reconstruction      | PPM (Colella & Woodward 1984)                         |
+| Reconstruction      | PPM (Colella & Woodward 1984) with characteristic-variable limiting (Stone+ 2008 §3.4.2); workgroup-shared primitive cache |
 | Riemann solver      | HLLD (Miyoshi & Kusano 2005) + HLLC + HLL fallbacks   |
 | Time integration    | RK3 SSP (Gottlieb-Shu 1998)                           |
-| Divergence-free B   | Constrained transport (Balsara-Spicer arithmetic EMF) |
+| Divergence-free B   | Constrained transport (Gardiner-Stone 2005 upwind EMF) |
 | Resistivity         | Explicit η ∇²B, central differences, post-CT          |
 | Boundaries          | Per-edge: periodic / outflow / reflecting / driven    |
 | Pressure floor      | 1e-6                                                  |
-| Default CFL         | 0.4 hyperbolic; 0.5 parabolic                         |
+| Default CFL         | 0.4 hyperbolic; 0.25 parabolic                        |
 
 ### HLLD degenerate branches
 
@@ -120,6 +122,44 @@ Stage weights live in 3 small uniform buffers (`stage_1`, `stage_2`,
 buffers (`uniform_x`, `uniform_y`) pre-written at preset load. **No
 `queue.writeBuffer` calls in the hot path** — the whole RK3 step
 encodes as one submit.
+
+### PPM workgroup-shared primitive cache
+
+`reconstruct-ppm` caches per-cell primitives in a 12×12 `MhdPrim`
+workgroup-shared tile (8×8 interior + 2-cell halo per side). Phase A:
+every thread loads its own center via `cons_to_prim_mhd`; threads in
+the outer rings (`lid.x < 2` / `lid.x >= 6`, same for `y`) additionally
+fill the corresponding halo cells (corners covered by combined
+conditions). All halo source indices are `clamp`ed to the storage
+range. Single top-level `workgroupBarrier()`. Phase B: PPM's 5-point
+stencil reads from the tile — one `cons_to_prim_mhd` per cell instead
+of five. Transpiler-compatible: matches the
+`testTwoDSharedTileHaloBarrier` smoke test pattern in
+`tests/wgsl-transpile/smoke.js`. The orthogonal-axis halo is unused by
+either single sweep but keeps the kernel sweep-axis-agnostic and
+matches the verified halo shape. Tile storage cost: 144 cells × 32 B
+(8 f32 fields) = 4.5 KB, well under WebGPU's 16 KB
+`maxComputeWorkgroupStorageSize` floor.
+
+### Characteristic-variable PPM limiting
+
+After the 4th-order primitive edge interpolants are computed (Phase B
+of `reconstruct-ppm`), the cell-to-face primitive differences `dL = w_c
+− w_{j-½}` and `dR = w_{j+½} − w_c` are projected onto the 7-wave MHD
+primitive eigenbasis at the center cell, limited per wave family with
+the standard CW 1984 monotonicity check, and projected back to
+primitive space before face-state recovery. The eigensystem (Stone+
+2008 Appendix A.1, eqs A10–A18, after Roe & Balsara 1996) carries the
+fast (u±c_f), Alfvén (u±c_a), slow (u±c_s), and entropy (u) waves;
+B_n is a parameter, not a wave. Sweep-axis permutation rotates the
+primitive state into `(ρ, v_n, v_t1, v_t2, B_t1, B_t2, p)` for the
+eigensystem; output face states are unpermuted to the existing
+`PrimPair` layout the downstream Riemann solver consumes. Degeneracy
+regularization follows Athena++'s 4-case branch on `(c_f²−c_s²)`,
+`(a²−c_s²)`, `(c_f²−a²)` for the α_f / α_s factors (Roe96 cases
+III/IV/V) and Brio-Wu 1988 eq 45 for the perpendicular B unit vectors
+(β_t1=1, β_t2=0 when |B_⊥|=0). See `reconstruct-ppm.wgsl` header for
+the full derivation.
 
 ## Ghost-cell convention
 
@@ -186,13 +226,31 @@ With `N = 256`, `ghost = 2`, `N_total = 260`, and workgroup 8×8:
 | update-b            | `(N + 1)²`             | 33²                    |
 | apply-resistivity   | `(N_total + 1)²`       | 33²                    |
 | compute-dt (reduce) | `N²`                   | 32²                    |
-| lic-advect (render) | `N²`                   | 32²                    |
 
 PPM at the outer dispatch cells (`i = ghost − 1` and `i = ghost + N`)
 lacks the full 5-point stencil; the kernel detects this (`stencil_ok`
 check) and falls back to piecewise-constant edges. Downstream Riemann
 then uses these lower-order edges at the boundary faces — acceptable
 because the BC-filled ghost is itself lower-order.
+
+### Per-frame render passes
+
+Render is decoupled from physics (runs once per displayed frame, not
+once per RK3 stage):
+
+| Pass                | Logical extent  | Workgroup count (256²) |
+|---------------------|-----------------|------------------------|
+| view-field          | `N²`            | 32²                    |
+| colormap            | `N²`            | 32²                    |
+| lic-advect          | `N²`            | 32²                    |
+| lic-reduce.reset    | 1×1             | 1×1                    |
+| lic-reduce.main     | `N²`            | 32²                    |
+| lic-normalize       | `N²`            | 32²                    |
+| composite (fragment)| canvas pixels   | (full-screen triangle) |
+
+The reduce + normalize chain implements a min/max contrast stretch on
+`lic_out` before composite samples it. See "LIC visualization" for the
+full chain.
 
 ## Boundary conditions
 
@@ -279,13 +337,30 @@ preset. UI must call `stats.bindBuffers(sim.buffers)` and
 
 Animated line integral convolution along B, decoupled from physics —
 runs once per displayed frame. Render chain:
-`view-field → colormap → lic-advect → composite`.
+`view-field → colormap → lic-advect → lic-reduce → lic-normalize → composite`.
 
 * `lic-advect.wgsl` — one invocation per interior cell. Backward-traces
   20 RK2 steps along the unit B-field (step size 0.5 cells, ~10 cells
   total). Samples a 1024×1024 white-noise base buffer with bilinear
   interpolation and a per-frame phase offset. Writes one f32
-  luminance per interior cell.
+  luminance per interior cell into `lic_out`.
+* `lic-reduce.wgsl` — two entry points (`reset` + `main`). Reduces the
+  interior of `lic_out` to a global `(min, max)` pair (`lic_minmax`,
+  2 × u32 bit-pattern). Mirrors `compute-dt`'s per-tile shared-atomic
+  pattern: each thread `atomicMin/Max`-es its cell's bit-pattern into
+  workgroup-shared `tile_min` / `tile_max`, top-level
+  `workgroupBarrier()`, thread 0 commits to global `lic_minmax`.
+  Bitcast trick works because lic-advect's averaging contract keeps
+  the luminance in `[0, 1]` (non-negative → u32 ordering preserved);
+  shader still defensively gates with `select`/`clamp` against
+  hypothetical NaN. `reset` (1×1) seeds `lic_minmax` to `(1.0, 0.0)`
+  every frame before `main` runs.
+* `lic-normalize.wgsl` — per-invocation; reads `lic_minmax`, rewrites
+  `lic_out[i] := clamp((lic_out[i] − min) / max(max − min, 1e-4), 0, 1)`
+  in place. Min/max stretch (research-grade vis default) over
+  mean/std — preserves the relative dominance of high-luminance LIC
+  bands at shock fronts and pulls residual variation out into the
+  full `[0, 1]` range in flat field-free regions.
 * `composite.wgsl` — `final.rgb = colored.rgb · mix(1, 0.5 + L, intensity)`.
   At intensity = 0 the colormap passes through unchanged; at
   intensity = 1 LIC modulates by ±50%; slider clamps at 2 for a
@@ -300,44 +375,74 @@ runs once per displayed frame. Render chain:
 
 ### LIC bind-group layout
 
-`lic-advect.wgsl` declares one bind group (group 0):
+Three compute pipelines, one bind group each (group 0):
 
-| Binding | Type      | Resource | Access     |
-|---------|-----------|----------|------------|
-| 0       | uniform   | Uniforms | read       |
-| 1       | storage   | Bx_face  | read       |
-| 2       | storage   | By_face  | read       |
-| 3       | storage   | noise    | read       |
-| 4       | storage   | lic_out  | read_write |
+`lic-advect.wgsl`:
 
-Dispatch: workgroups of 8×8, count `(N/8) × (N/8)`. No workgroup-shared
-memory, no atomics, no barriers — purely per-invocation.
+| Binding | Type      | Resource     | Access     |
+|---------|-----------|--------------|------------|
+| 0       | uniform   | Uniforms     | read       |
+| 1       | storage   | Bx_face      | read       |
+| 2       | storage   | By_face      | read       |
+| 3       | storage   | noise        | read       |
+| 4       | storage   | lic_out      | read_write |
+| 5       | uniform   | LicUniforms  | read       |
+
+`lic-reduce.wgsl` (entries `reset` + `main`):
+
+| Binding | Type      | Resource    | Access                 |
+|---------|-----------|-------------|------------------------|
+| 0       | uniform   | Uniforms    | read                   |
+| 1       | storage   | lic_out     | read                   |
+| 2       | storage   | lic_minmax  | read_write (atomic<u32>) |
+
+`lic-normalize.wgsl`:
+
+| Binding | Type      | Resource    | Access     |
+|---------|-----------|-------------|------------|
+| 0       | uniform   | Uniforms    | read       |
+| 1       | storage   | lic_minmax  | read       |
+| 2       | storage   | lic_out     | read_write |
+
+Dispatch shapes: lic-advect / lic-reduce.main / lic-normalize use
+workgroups of 8×8, count `(N/8) × (N/8)`. lic-reduce.reset is a
+single 1×1 invocation.
+
+`lic-reduce` uses one workgroup-shared `atomic<u32>` per reduction
+direction (`tile_min`, `tile_max`) with a single top-level
+`workgroupBarrier()` between the per-cell phase and the global commit
+— same shape as `compute-dt.reduce` (transpiler-verified by the
+`testTwoDSharedTileHaloBarrier` smoke pattern). `lic-advect` and
+`lic-normalize` are purely per-invocation (no shared memory, no
+atomics, no barriers).
 
 ## Uniforms (64 bytes)
 
-| Slot | Type | Field           | Notes                                          |
-|------|------|-----------------|------------------------------------------------|
-| 0    | f32  | `dx`            | Cell size in domain units                      |
-| 1    | f32  | `gamma`         | Adiabatic index                                |
-| 2    | f32  | `view_min`      | Per-preset visualization clamp                 |
-| 3    | f32  | `view_max`      | Per-preset visualization clamp                 |
-| 4    | f32  | `eta`           | Resistivity                                    |
-| 5    | f32  | `lic_phase`     | Wall-clock seconds since first render          |
-| 6    | f32  | `lic_intensity` | 0–2, slider-controlled                         |
-| 7    | f32  | `lic_drift_x`   | Noise-pixels per second, default 0.5           |
-| 8    | u32  | `grid_n`        | Interior grid extent                           |
-| 9    | u32  | `grid_n_total`  | Ghost-padded grid extent                       |
-| 10   | u32  | `ghost_w`       | Ghost width (= 2)                              |
-| 11   | u32  | `sweep_dir`     | 0 = x-sweep, 1 = y-sweep                       |
-| 12   | u32  | `step_parity`   | Informational; not consumed by any shader (see HANDOFF) |
-| 13   | u32  | `view_mode`     | View enum from config.js VIEW_*                |
-| 14   | f32  | `lic_drift_y`   | Noise-pixels per second, default 0.0           |
-| 15   | u32  | `noise_n`       | Side length of noise buffer (= 1024)           |
+| Slot | Type | Field            | Notes                                                          |
+|------|------|------------------|----------------------------------------------------------------|
+| 0    | f32  | `dx`             | Cell size in domain units                                      |
+| 1    | f32  | `gamma`          | Adiabatic index                                                |
+| 2    | f32  | `view_min`       | Per-preset visualization clamp                                 |
+| 3    | f32  | `view_max`       | Per-preset visualization clamp                                 |
+| 4    | f32  | `eta`            | Resistivity                                                    |
+| 5    | f32  | `_pad_lic_0`     | Reserved (was lic_phase — moved to LicUniforms)                |
+| 6    | f32  | `_pad_lic_1`     | Reserved (was lic_intensity — moved to LicUniforms)            |
+| 7    | f32  | `_pad_lic_2`     | Reserved (was lic_drift_x — moved to LicUniforms)              |
+| 8    | u32  | `grid_n`         | Interior grid extent                                           |
+| 9    | u32  | `grid_n_total`   | Ghost-padded grid extent                                       |
+| 10   | u32  | `ghost_w`        | Ghost width (= 2)                                              |
+| 11   | f32  | `pressure_floor` | Live UI slider; minimum p in cons→prim recovery                |
+| 12   | f32  | `cfl`            | Hyperbolic CFL number — consumed by compute-dt                 |
+| 13   | u32  | `view_mode`      | View enum from config.js VIEW_*                                |
+| 14   | f32  | `_pad_lic_3`     | Reserved (was lic_drift_y — moved to LicUniforms)              |
+| 15   | u32  | `noise_n`        | Side length of noise buffer (= 1024)                           |
 
-`Uniforms` is held in two pre-written buffers (`uniform_x`, `uniform_y`)
-— sweep direction is the only field that varies between them. Stage
-weights live in 3 separate uniform buffers (`stage_1` / `stage_2` /
-`stage_3`).
+`Uniforms` is held in a single 64 B buffer. Sweep direction lives in two
+static 16 B uniforms (`sweepDir_x` = 0u, `sweepDir_y` = 1u) bound only by
+reconstruct-ppm and riemann-hlld. LIC render-pace state (phase, intensity,
+drift) lives in a separate 16 B `LicUniforms` buffer rewritten per render
+frame. Stage weights live in 3 separate uniform buffers (`stage_1` /
+`stage_2` / `stage_3`).
 
 ## Transpiler contract
 
@@ -348,14 +453,20 @@ repo's `shared-wgsl-transpile.js`:
   constants.
 * No subgroup ops, no matrices, no textures, no samplers, no
   atomics-on-floats.
-* `bitcast` confined to `compute-dt` (f32 ↔ u32 for atomicMax
-  reduction).
+* `bitcast` used by `compute-dt` (f32 ↔ u32 for atomicMax reduction)
+  and the LIC contrast-stretch pair `lic-reduce` / `lic-normalize`
+  (same f32 ↔ u32 trick on the [0, 1] luminance range).
 * `workgroupBarrier()` only at top level — never inside `if` / `for` /
   `while`.
-* Workgroup-shared memory only in `compute-dt` (per-tile max
-  reduction).
-* All other kernels are purely per-invocation: read neighbors via
-  direct indexing, write own cell, no cross-invocation communication.
+* Workgroup-shared memory: allowed broadly as long as barriers stay
+  at top level. Used by `compute-dt` (per-tile max reduction),
+  `lic-reduce` (per-tile min/max reduction of `lic_out`), and
+  `reconstruct-ppm` (per-tile primitive cache; see the dedicated
+  section above). The transpiler's 2D shared-tile + halo + top-level
+  barrier pattern is verified by `testTwoDSharedTileHaloBarrier` in
+  `tests/wgsl-transpile/smoke.js`.
+* Other kernels are purely per-invocation: read neighbors via direct
+  indexing, write own cell, no cross-invocation communication.
 * `apply-bcs` uses a `switch`-on-mode pattern — trivially
   CPU-emulatable.
 

@@ -57,9 +57,10 @@ fn reduce(
         let by = 0.5 * (By_face[by_face_down_idx(ix, iy, n_total)]
                       + By_face[by_face_up_idx(ix, iy, n_total)]);
         let idx = cell_idx_total(ix, iy, n_total);
-        let P  = cons_to_prim_mhd(U0_in[idx], U1_in[idx], bx, by, U_uniforms.gamma);
-        let cfx = fast_mag_speed(P, U_uniforms.gamma, 0u);
-        let cfy = fast_mag_speed(P, U_uniforms.gamma, 1u);
+        let pf  = U_uniforms.pressure_floor;
+        let P  = cons_to_prim_mhd(U0_in[idx], U1_in[idx], bx, by, U_uniforms.gamma, pf);
+        let cfx = fast_mag_speed(P, U_uniforms.gamma, 0u, pf);
+        let cfy = fast_mag_speed(P, U_uniforms.gamma, 1u, pf);
         let sx = abs(P.vx) + cfx;
         let sy = abs(P.vy) + cfy;
         let s  = max(sx, sy);

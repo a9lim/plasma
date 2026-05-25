@@ -127,7 +127,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Energy: must be at least KE + p_floor/(γ−1). We can't add the
     // magnetic contribution here (Bx/By live on faces, not in U), but
     // the downstream cons_to_prim floor catches the residual slop.
-    let E_min = ke + PRESSURE_FLOOR / (U_uniforms.gamma - 1.0);
+    let E_min = ke + U_uniforms.pressure_floor / (U_uniforms.gamma - 1.0);
     let E = clamp(u1_raw.x, E_min, 1.0e30);
 
     // Bz: zero if non-finite.
