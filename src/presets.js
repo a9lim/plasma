@@ -250,6 +250,23 @@ export function makeOrszagTangPreset(n = GRID_N) {
         },
         data: { U0, U1, Bx_face, By_face },
         viewMin: 1.0, viewMax: 6.0, verifyTime: 0.5,
+        // η floor coefficient — see sim.getEtaMin(). Set to 0: the
+        // engine's defensive layer (apply-resistivity snapshot,
+        // HLLD_BX_EPS2 = 1e-10, conserved-state sanitization in
+        // update-conserved-weighted) handles thin-sheet NaN cascades
+        // gracefully without needing an explicit grid Reynolds floor.
+        //
+        // Calibration data (post-fixes):
+        //   N=256  critical η ≈ 8e-4   (dx ≈ 2.45e-2)
+        //   N=1024 critical η ≈ 1e-4   (dx ≈ 6.14e-3, sim lasted long
+        //                               before NaN — degrades gracefully)
+        // Implied empirical coeff (C·v_char) ≈ 0.03 at N=256, ~0.016 at
+        // N=1024 — i.e., super-linear scaling because OT concentrates
+        // energy faster at finer grids. A static coeff would be wrong
+        // at one end or the other; the defensive layer obviates the
+        // tradeoff. If a future preset has worse degradation
+        // characteristics, set a nonzero coeff here.
+        etaFloorCoeff: 0,
     };
 }
 

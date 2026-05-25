@@ -21,58 +21,171 @@ what's left to do and what to watch for.
 | 4     | Resistivity + per-edge BCs                 | done     |
 | 5     | UI scaffolding (sidebar, topbar, tabs)     | done     |
 | 6     | Animated LIC visualization                 | done     |
-| 7     | Polish (content, perturbation, JSON-LD, OG)| **todo** |
+| 7     | Polish (content, perturbation, JSON-LD, OG)| **partial** |
 | 8     | Parent-repo wiring                         | **todo** |
 
-**Acid tests not yet performed (live verification)**: Sod / Brio-Wu /
-Orszag-Tang / Harris all verified by static trace only. No physics
-output has been visually confirmed. **The verification gap is the
-first order of business in Phase 7.**
+**Verification status**: OT live-verified at N=256 and N=1024 — runs
+indefinitely with gorgeous current-sheet structure. Sod / Brio-Wu /
+Harris not yet retested after the Session 2 fixes (should be safe —
+fixes are general — but worth a smoke test). N=512 also not directly
+verified.
+
+## Session 2 — Verification + engine bug fixes
+
+First live verification attempt hit a WebGPU storage-buffer-limit
+error, then a series of cascading NaN problems that turned out to be
+**five distinct bugs** of varying severity. All now fixed. Documenting
+because the lessons matter:
+
+### 1. Storage buffer limit overflow
+
+`update-conserved-weighted` had 11 storage bindings; the M-series
+adapter caps at 10. Fix: bump `maxStorageBuffersPerShaderStage` to 10
+in `device.js` (matches geon's pattern) + flip `dt_buf` from storage
+to uniform binding in `update-conserved-weighted.wgsl` (it's a single
+f32, naturally a uniform). The shader now wraps it in a `DtUniform`
+struct since uniforms can't be raw arrays in WGSL.
+
+**Lesson**: count storage bindings per pipeline against the adapter's
+`maxStorageBuffersPerShaderStage` (typically 10 on desktop, 8 baseline)
+at build time, not at first dispatch. Per-pipeline budget is tight.
+
+### 2. dt buffer missing COPY_SRC (latent pre-existing bug)
+
+The stats-display readback path was silently returning zero for dt
+because the `plasma.dt` buffer didn't have `COPY_SRC` usage. WebGPU
+validation errored on the copy but the rest of the batch went through,
+so the symptom was just "dt always reads as 0." Fix: add `COPY_SRC` to
+the dt buffer's usage flags in `buffers.js`.
+
+**This is probably why HANDOFF reported the `simTime` ratchet was
+broken** — simTime itself is fine via the stats-display workaround,
+but that workaround was reading zero. The Phase 6 agent's fix #1
+should be reassessed against this.
+
+### 3. apply-resistivity race condition
+
+The shader did an in-place 5-point Laplacian on `read_write` storage
+and asserted (in a confidently-wrong comment) that neighbor reads
+return pre-dispatch values. **WebGPU has NO such guarantee.** Neighbor
+reads at workgroup-tile boundaries pick up post-write values from
+already-executed tiles. Manifested as regular-spacing "blebs" of
+artifact J_z at high η (8×8 workgroups → ~8-cell artifact stride);
+below noise floor at low η, undetected by static review. Fix: double-
+buffer via a `snapshot` entry point that copies dst→snap (per-cell,
+no neighbors, race-free), then `main` reads snap and writes dst. Added
+3 snapshot buffers (`Bx_res_snap` / `By_res_snap` / `U1_res_snap`).
+BGL grew to 9 bindings (7 storage, under cap).
+
+**Lesson**: in-place RMW + neighbor reads on storage buffers is
+ALWAYS a race in WebGPU, even when it appears to work on most hardware.
+The shader's old "we rely on this" comment was the smoking gun — that
+phrase should be a code smell. HANDOFF flagged this for CPU emulation
+but the same constraint applies to GPU dispatch.
+
+### 4. HLLD_BX_EPS2 too conservative
+
+Was 1e-24 — basically "exactly machine zero." At thin current sheets
+with |Bn|~1e-5, the full HLLD 5-wave path runs with tiny `bn²` and
+tiny `g_L = ρ(S-u)² - bn²` denominators. The 1e-20 `safeDL` guard
+inflates `bt_Ls = bt·g_L/safeDL` to ~1e20 → NaN cascade. Bumped to
+1e-10: falls back to HLLC whenever |Bn| < ~1e-5·√ρ — robust at near-
+degeneracies, no visible effect on bulk physics. HANDOFF explicitly
+flagged this as conservative; following its own advice.
+
+### 5. No defensive sanitization on conserved state
+
+Once any cell went non-finite for any reason, it poisoned compute-dt's
+wavespeed atomicMax reduction (NaN bits → huge u32 → corrupt
+wavespeed), which made dt useless, which cascaded NaN to the whole
+field within ~5 steps. Added IEEE-clean sanitization at the end of
+`update-conserved-weighted.wgsl`:
+- `clamp(ρ, FLOOR, 1e30)` — NaN → FLOOR via IEEE maxNum semantics
+- `select(0, m, m == m)` for momentum — NaN → 0
+- `clamp(E, KE + p_floor/(γ−1), 1e30)` — NaN → minimum p≥floor value
+- `select(0, Bz, Bz == Bz)` — NaN → 0
+
+This is the breaker that finally let OT survive indefinitely. The
+sanitization is conservative-state-only (no access to Bx_face/By_face
+here), so the magnetic-pressure contribution to the p-floor check is
+omitted — downstream `cons_to_prim`'s pressure floor catches the slop.
+
+**Lesson**: any solver with an atomicMax wavespeed reduce needs
+conserved-state sanitization at the write site. Otherwise a single
+bad cell → bad dt → cascade. This is true regardless of which Riemann
+solver / reconstruction / time integrator you choose.
+
+### Bonus: η floor mechanism (kept as latent infrastructure)
+
+Built `sim.getEtaMin()` returning `etaFloorCoeff · dx` (grid magnetic
+Reynolds criterion η_min ≳ C·v_char·dx), with slider dynamic-min,
+dynamic hint text, refresh on preset/resolution change. Calibrated
+empirically against OT critical η: N=256 ≈ 8e-4, N=1024 ≈ 1e-4. The
+empirical C·v_char product **scales super-linearly with N** (OT
+concentrates energy faster at finer grids), so a single coefficient
+is wrong somewhere. After fix #5 the floor was unnecessary — sim
+survives gracefully at η=0 thanks to sanitization. OT's preset sets
+`etaFloorCoeff: 0`. Mechanism kept available for future presets that
+genuinely need it.
+
+### What this means for HANDOFF's prior assumptions
+
+- "Most likely failure modes" 1–4 from Phase 7 Step 1: #1 was real
+  (HLLD eps), #2 (CT indexing) was NOT triggered, #3 (uniform field
+  writes) was NOT triggered, #4 (flux convention mismatch) was NOT
+  triggered. Whole new bug class found: WebGPU race conditions in
+  same-buffer RMW kernels.
+- Phase 6 agent's `simTime` ratchet flag: the ratchet itself is still
+  technically broken (Sim.step doesn't read dt back) but its
+  observable consequence was being driven by bug #2 above. Verify by
+  watching the stats panel's dt value.
+- "Resolution change is destructive" note: still applies, working as
+  documented.
+- HLLD_BX_EPS2 note: nudged upward as recommended (1e-24 → 1e-10).
+
+### Slider widening
+
+For calibration we widened the η slider's HTML `max` from `-1`
+(η=0.1) to `0` (η=1.0). Left it widened — gives users more range for
+experimentation, no downside.
 
 ## Phase 7 — Polish
 
 Estimated: 2 days. In recommended order:
 
-### 1. Verify live (~0.5 day)
+### 1. Verify live (partially done — see Session 2)
 
-Before adding more content, confirm the engine actually works.
+OT verified at N=256 and N=1024. Remaining:
 
-* Run `./dev.sh` from `/Users/a9lim/Work/a9lim.github.io`. Load
-  `http://localhost:8787/plasma`. Confirm Orszag-Tang renders with
-  the expected vortex structure.
-* Confirm each preset (Sod, Brio-Wu, OT, Harris) loads and runs.
-  Cycle view modes; confirm J_z view shows current sheets in Harris.
-* Stress-test resolution selector at 512² and 1024². Confirm
-  pipeline doesn't crash on resize.
-* Confirm LIC visibly traces field topology in OT. Tune
+* Sod / Brio-Wu / Harris — confirm each loads and runs without
+  regressions from the Session 2 sanitization changes. Cycle view
+  modes; confirm J_z view shows current sheets in Harris.
+* N=512 resolution selector smoke test (jump in between the two
+  verified resolutions to confirm no surprises at the missing point).
+* Confirm LIC visibly traces field topology across all presets. Tune
   intensity/drift if the default values are too subtle or too loud.
-* Confirm stats and probe readbacks are sensible. Walk through the
-  reconnection rate display in Harris.
+* Confirm stats and probe readbacks are sensible for Harris. Walk
+  through the reconnection rate display.
 * Confirm save/load round-trips parameters correctly.
 
-If any acid test fails, fix before proceeding. Most likely failure
-modes (in order of likelihood):
-
-1. A shader bug in HLLD's degenerate branches showing up as NaN
-   propagation.
-2. A CT face-indexing off-by-one showing up as ∇·B growth (the L2
-   norm in the Stats tab is the canary).
-3. A missing uniform-buffer field write (one of the recent additions:
-   `lic_phase`, `lic_intensity`, `lic_drift_x/y`, `noise_n`).
-4. The unsplit CT face-flux indexing convention mismatch between
-   Riemann's write and EMF's read (the packed-flux `.z = f_bt1`
-   convention from Phase 3a).
+If a regression shows up, the Session 2 fixes are the first place to
+look — particularly sanitization (could over-clamp legitimate physics
+in a shocked region) and the apply-resistivity snapshot pass (adds
+synchronization that could interact with other passes oddly).
 
 ### 2. Engine fixes flagged by Phase 6 agent
 
 Five small things worth doing in polish, before or after content
 writing (any order):
 
-1. **`simTime` ratchet is broken.** `Sim.step()` submits but never
-   reads back `b.dt`, so `simTime` stays at 0. Stats panel works
-   around it by doing its own readback. Fix: maintain a host-side dt
-   cache, advance `simTime += dt_cached` per step, reseed cache from
-   stats-display's existing readback path.
+1. **`simTime` ratchet is broken** (still applies, but downstream cause
+   was masked). `Sim.step()` submits but never reads back `b.dt`, so
+   `simTime` stays at 0. Stats panel works around it by doing its own
+   readback. Session 2 fix #2 (dt buffer COPY_SRC) was a related
+   latent bug — verify the stats dt readback is now correct before
+   working around it again. If stats now shows a real dt, the simpler
+   fix is to consume that value into `simTime` rather than build a
+   second readback path.
 
 2. **`step_parity` uniform slot is dead.** No shader reads it. Either
    reclaim the slot for something useful (LIC drift_z? perturbation
@@ -293,9 +406,10 @@ context) can plug in:
   API endpoints documented there. Don't generate identifiers from
   memory.
 
-* **`HLLD_BX_EPS2 = 1e-24`** is conservative; if you see the
-  degenerate-Alfvén branch triggering often (debug logs would
-  help), nudge upward. Branch B (slow/fast wave coincidence) is
+* **`HLLD_BX_EPS2` is now `1e-10`** (was 1e-24). See Session 2 #4.
+  If you see the degenerate-Alfvén branch triggering often (debug
+  logs would help), it's now expected at thin sheets and that's
+  desirable behavior. Branch B (slow/fast wave coincidence) is
   extremely rare — if you see it firing in normal operation,
   something else is wrong.
 

@@ -216,6 +216,8 @@ function wireSettings(ctx) {
         stats.updatePresetVisibility(presetSel.value);
         // Push current BC dropdowns back to match the preset's BCs.
         syncBCDropdowns();
+        // Preset switch may change the η floor (OT has one; others don't).
+        ctx._refreshEtaSlider?.();
         toast(`Loaded ${presetSel.value}`);
     });
 
@@ -226,21 +228,44 @@ function wireSettings(ctx) {
         sim.setViewMode(parseInt(viewSel.value, 10));
     });
 
-    // η slider (log scale, snap-to-0)
+    // η slider (log scale; snap-to-0 only when the active preset has no
+    // grid-Reynolds floor — when it does, the slider's lower bound moves
+    // up to log10(etaMin) and the hint reflects the floor.)
     const etaSlider = root.querySelector('#ctrl-eta');
     const etaLabel  = root.querySelector('#ctrl-eta-val');
+    const etaHint   = root.querySelector('#ctrl-eta-hint');
+    const SLIDER_MIN_FLOOR = -6.5;   // matches HTML's default min (snap-to-0)
     const etaFromSlider = (v) => {
         if (v <= -6.05) return 0;        // snap-to-0 below 1e-6
         return Math.pow(10, v);
     };
-    const etaToSlider = (eta) => (eta <= 0 ? -6.5 : Math.log10(eta));
-    etaSlider.value = String(etaToSlider(sim.eta));
-    etaLabel.textContent = sim.eta === 0 ? '0' : sim.eta.toExponential(2);
+    const etaToSlider = (eta) => (eta <= 0 ? SLIDER_MIN_FLOOR : Math.log10(eta));
+
+    // Refresh slider geometry + label + hint based on sim's current floor.
+    // Called on init and whenever preset or resolution changes (both
+    // affect getEtaMin: preset selects the coefficient, resolution sets dx).
+    function refreshEtaSlider() {
+        const etaMin = sim.getEtaMin();
+        if (etaMin > 0) {
+            etaSlider.min = String(Math.log10(etaMin));
+            etaHint.textContent =
+                `Min η = ${etaMin.toExponential(2)} ` +
+                `(grid Reynolds limit — prevents NaN cascade from sub-grid current sheets).`;
+        } else {
+            etaSlider.min = String(SLIDER_MIN_FLOOR);
+            etaHint.textContent = 'Below 1e-6 snaps to 0 (ideal MHD).';
+        }
+        etaSlider.value = String(etaToSlider(sim.eta));
+        etaLabel.textContent = sim.eta === 0 ? '0' : sim.eta.toExponential(2);
+    }
+    refreshEtaSlider();
     _forms.bindSlider(etaSlider, null, (v) => {
-        const eta = etaFromSlider(v);
-        sim.setEta(eta);
-        etaLabel.textContent = eta === 0 ? '0' : eta.toExponential(2);
+        sim.setEta(etaFromSlider(v));
+        // sim.setEta may clamp upward — reflect the actual value back.
+        etaLabel.textContent = sim.eta === 0 ? '0' : sim.eta.toExponential(2);
     });
+    // Expose to the preset / resolution handlers below.
+    ctx._refreshEtaSlider = refreshEtaSlider;
 
     // Resolution mode group
     const resGroup = root.querySelector('#ctrl-res-toggles');
@@ -253,6 +278,8 @@ function wireSettings(ctx) {
         // sim.setResolution; the simShell still holds the original
         // sim object so further calls into sim.render() use the new
         // renderer through sim.renderer.
+        // Resolution change scales dx → η floor scales inversely with N.
+        ctx._refreshEtaSlider?.();
         toast(`Resolution ${n}²`);
     });
 
