@@ -1,10 +1,14 @@
 /**
- * @fileoverview plasma — Phase 1 entry point.
+ * @fileoverview plasma — Phase 2 entry point.
  *
- * Initializes WebGPU, sets up a single fullscreen-quad render pipeline
- * that paints the brand red, runs a rAF loop with a fixed-timestep
- * accumulator (no physics yet — `step()` is a no-op that just drains
- * the accumulator), and pauses on tab hide via `visibilitychange`.
+ * Initializes WebGPU, builds the Phase-2 compute graph (PLM + HLL +
+ * forward Euler with dimensional splitting), runs a rAF loop with a
+ * fixed-timestep accumulator that delegates each substep to
+ * `sim.step()`, and pauses on tab hide via `visibilitychange`.
+ *
+ * Per substep we run compute_dt internally — PHYSICS_DT here is the
+ * accumulator pacing, not the physics dt the sweep sees. The sim's
+ * own CFL-derived dt is what actually advances the state.
  *
  * On any WebGPU failure (no adapter, no device, no nav.gpu) the
  * `#no-webgpu` landing element is unhidden and we bail before
@@ -12,6 +16,7 @@
  */
 
 import { initDevice } from './src/gpu/device.js';
+import { Sim } from './src/sim.js';
 
 // ── Fixed-timestep config (mirrors geon's accumulator pattern) ──
 const PHYSICS_DT     = 1 / 128;   // seconds per physics substep
@@ -39,7 +44,7 @@ class PlasmaSim {
             alphaMode: 'premultiplied',
         });
 
-        this.pipeline = null;          // set in init()
+        this.sim = new Sim(device, this.context, format);
         this.lastTime = 0;
         this.accumulator = 0;
         this.running = true;
@@ -61,49 +66,24 @@ class PlasmaSim {
     }
 
     /**
-     * Build the fullscreen-quad render pipeline. Vertex shader emits
-     * three vertices from `vertex_index`, no vertex buffer.
+     * Async init — defers to the Sim orchestrator for pipelines,
+     * buffers, initial preset, LUT upload, and uniforms.
      */
     async init() {
-        const wgslResponse = await fetch(new URL('./src/gpu/shaders/clear.wgsl', import.meta.url));
-        if (!wgslResponse.ok) {
-            throw new Error(`Failed to fetch clear.wgsl: ${wgslResponse.status}`);
-        }
-        const wgsl = await wgslResponse.text();
-
-        const module = this.device.createShaderModule({ code: wgsl, label: 'plasma.clear' });
-        this.pipeline = this.device.createRenderPipeline({
-            label: 'plasma.clear.pipeline',
-            layout: 'auto',
-            vertex:   { module, entryPoint: 'vsMain' },
-            fragment: { module, entryPoint: 'fsMain', targets: [{ format: this.format }] },
-            primitive: { topology: 'triangle-list' },
-        });
+        await this.sim.init();
     }
 
     /**
-     * Phase-1 no-op physics step. Drains the accumulator so the frame
-     * loop reads correctly; real RHS lands in Phase 2.
+     * One physics substep. dt is the rAF-driven pacing budget; the
+     * actual GPU-side dt is CFL-derived inside `sim.step()`.
      */
-    step(_dt) { /* no-op until Phase 2 */ }
+    step(_dt) {
+        this.sim.step();
+    }
 
-    /** Encode one fullscreen-quad pass and submit. */
+    /** Encode and submit the render chain. */
     render() {
-        const encoder = this.device.createCommandEncoder({ label: 'plasma.frame' });
-        const view = this.context.getCurrentTexture().createView();
-        const pass = encoder.beginRenderPass({
-            label: 'plasma.clearPass',
-            colorAttachments: [{
-                view,
-                clearValue: { r: 0, g: 0, b: 0, a: 1 },
-                loadOp: 'clear',
-                storeOp: 'store',
-            }],
-        });
-        pass.setPipeline(this.pipeline);
-        pass.draw(3, 1, 0, 0);
-        pass.end();
-        this.device.queue.submit([encoder.finish()]);
+        this.sim.render();
     }
 
     /** rAF entry point — wraps `_loopBody` in try/catch and re-schedules. */
