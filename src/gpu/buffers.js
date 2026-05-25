@@ -16,6 +16,15 @@
  *     8-float driven inflow primitive state (ρ, vx, vy, vz, Bx, By, Bz, p).
  *   • Uniforms struct extended: adds `eta`, `grid_n_total`, `ghost_w`.
  *
+ * Uniform consolidation (Round 2): a single shared `uniform` buffer
+ * (64 B) replaces the legacy `uniform_x` / `uniform_y` pair. Sweep
+ * direction is now in two tiny static buffers (`sweepDir_x`,
+ * `sweepDir_y`, 16 B each) — only reconstruct-ppm and riemann-hlld
+ * bind them. LIC render-pace fields (phase / intensity / drift) live
+ * in a separate 16 B `licUniform` buffer rewritten per render frame
+ * via `pushLicUniforms()`; the main `pushUniforms()` writes only on
+ * physics-state changes.
+ *
  * The face-ownership convention also changed (LEFT/DOWN owner instead of
  * RIGHT/UP). See shared-helpers.wgsl header for the full convention.
  *
@@ -159,22 +168,54 @@ export class PlasmaBuffers {
                  | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
 
-        // ── Uniforms: two sweep-direction buffers ──────────────────
+        // ── Uniforms: single physics-state buffer ──────────────────
+        // Sweep direction lives in two small SweepDir buffers; LIC
+        // render-pace state lives in a separate licUniform buffer. The
+        // main Uniforms buffer is rewritten only when a physics-state
+        // parameter changes (preset/eta/cfl/gamma/view_mode/resolution).
         this.uniformHost = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
         this.uniformF32  = new Float32Array(this.uniformHost);
         this.uniformU32  = new Uint32Array(this.uniformHost);
-        this.uniform_x = device.createBuffer({
-            label: 'plasma.uniform_x',
+        this.uniform = device.createBuffer({
+            label: 'plasma.uniform',
             size: UNIFORM_BUFFER_SIZE,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        this.uniform_y = device.createBuffer({
-            label: 'plasma.uniform_y',
-            size: UNIFORM_BUFFER_SIZE,
+
+        // ── SweepDir uniforms (16 B each, written once) ────────────
+        // reconstruct-ppm and riemann-hlld are the only shaders that
+        // read this; they bind one or the other based on sweep axis.
+        const SWEEP_BUFFER_SIZE = 16;
+        this.sweepDir_x = device.createBuffer({
+            label: 'plasma.sweepDir_x',
+            size: SWEEP_BUFFER_SIZE,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        // Legacy alias.
-        this.uniform = this.uniform_x;
+        this.sweepDir_y = device.createBuffer({
+            label: 'plasma.sweepDir_y',
+            size: SWEEP_BUFFER_SIZE,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        {
+            const sweepBuf = new ArrayBuffer(SWEEP_BUFFER_SIZE);
+            const sweepU32 = new Uint32Array(sweepBuf);
+            sweepU32[0] = 0; // x
+            device.queue.writeBuffer(this.sweepDir_x, 0, sweepBuf);
+            sweepU32[0] = 1; // y
+            device.queue.writeBuffer(this.sweepDir_y, 0, sweepBuf);
+        }
+
+        // ── LicUniforms (16 B, rewritten per render frame) ────────
+        // Holds lic_phase / lic_intensity / lic_drift_{x,y}. Bound by
+        // lic-advect (compute) and composite (fragment).
+        const LIC_UNIFORM_SIZE = 16;
+        this.licUniformHost = new ArrayBuffer(LIC_UNIFORM_SIZE);
+        this.licUniformF32  = new Float32Array(this.licUniformHost);
+        this.licUniform = device.createBuffer({
+            label: 'plasma.licUniform',
+            size: LIC_UNIFORM_SIZE,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
 
         // ── BC uniforms ────────────────────────────────────────────
         // Single storage buffer with per-edge mode IDs + driven state.
@@ -375,51 +416,64 @@ export class PlasmaBuffers {
     }
 
     /**
-     * Push the host uniform struct to GPU — writes BOTH sweep-direction
-     * uniform buffers. Layout (matches `struct Uniforms` in
-     * shared-helpers.wgsl):
-     *   slot 0..7  f32: dx, gamma, view_min, view_max, eta,
-     *                    lic_phase, lic_intensity, lic_drift_x
-     *   slot 8..13 u32: grid_n, grid_n_total, ghost_w, sweep_dir,
-     *                    step_parity, view_mode
-     *   slot 14    f32: lic_drift_y
-     *   slot 15    u32: noise_n
+     * Push the host physics-state uniform struct to GPU. LIC render-pace
+     * fields (phase, intensity, drift) are owned by `pushLicUniforms`
+     * — this method does not touch them. Sweep direction is owned by
+     * the static `sweepDir_x` / `sweepDir_y` buffers.
+     *
+     * Layout (matches `struct Uniforms` in shared-helpers.wgsl):
+     *   slot 0..7   f32: dx, gamma, view_min, view_max, eta,
+     *                    _pad_lic_0, _pad_lic_1, _pad_lic_2
+     *   slot 8..11  u32: grid_n, grid_n_total, ghost_w, _pad_sweep
+     *   slot 12     f32: cfl
+     *   slot 13     u32: view_mode
+     *   slot 14     f32: _pad_lic_3
+     *   slot 15     u32: noise_n
      *
      * Any field not passed in the args object falls back to the host-side
-     * cache (so callers that only know about a subset don't clobber LIC
-     * state).
+     * cache (so callers that only know about a subset don't clobber
+     * other state).
      */
     pushUniforms({
-        dx, gamma, viewMin, viewMax, gridN, stepParity, viewMode, eta,
-        licPhase, licIntensity, licDriftX, licDriftY,
+        dx, gamma, viewMin, viewMax, gridN, viewMode, eta, cfl,
     } = {}) {
-        if (eta          !== undefined) this._eta          = eta;
-        if (licPhase     !== undefined) this._licPhase     = licPhase;
-        if (licIntensity !== undefined) this._licIntensity = licIntensity;
-        if (licDriftX    !== undefined) this._licDriftX    = licDriftX;
-        if (licDriftY    !== undefined) this._licDriftY    = licDriftY;
+        if (eta !== undefined) this._eta = eta;
+        if (cfl !== undefined) this._cfl = cfl;
         this.uniformF32[0] = dx;
         this.uniformF32[1] = gamma;
         this.uniformF32[2] = viewMin;
         this.uniformF32[3] = viewMax;
         this.uniformF32[4] = this._eta;
-        this.uniformF32[5] = this._licPhase;
-        this.uniformF32[6] = this._licIntensity;
-        this.uniformF32[7] = this._licDriftX;
+        this.uniformF32[5] = 0; // _pad_lic_0
+        this.uniformF32[6] = 0; // _pad_lic_1
+        this.uniformF32[7] = 0; // _pad_lic_2
         this.uniformU32[8]  = gridN >>> 0;
         this.uniformU32[9]  = (gridN + 2 * this.ghost) >>> 0;
         this.uniformU32[10] = this.ghost >>> 0;
-        this.uniformU32[11] = 0; // sweep_dir = 0 for x
-        this.uniformU32[12] = stepParity >>> 0;
+        this.uniformU32[11] = 0; // _pad_sweep
+        this.uniformF32[12] = (this._cfl ?? 0.4); // cfl as f32
         this.uniformU32[13] = (viewMode ?? this._viewMode) >>> 0;
         if (viewMode !== undefined) this._viewMode = viewMode;
-        this.uniformF32[14] = this._licDriftY;
+        this.uniformF32[14] = 0; // _pad_lic_3
         this.uniformU32[15] = this.noise_n >>> 0;
-        this.device.queue.writeBuffer(this.uniform_x, 0, this.uniformHost);
+        this.device.queue.writeBuffer(this.uniform, 0, this.uniformHost);
+    }
 
-        // y-sweep variant.
-        this.uniformU32[11] = 1;
-        this.device.queue.writeBuffer(this.uniform_y, 0, this.uniformHost);
+    /**
+     * Push the host LIC render-pace uniform struct to GPU. Called every
+     * render frame (sim.render); writes only 16 bytes. Fields not passed
+     * fall back to the host-side cache.
+     */
+    pushLicUniforms({ licPhase, licIntensity, licDriftX, licDriftY } = {}) {
+        if (licPhase     !== undefined) this._licPhase     = licPhase;
+        if (licIntensity !== undefined) this._licIntensity = licIntensity;
+        if (licDriftX    !== undefined) this._licDriftX    = licDriftX;
+        if (licDriftY    !== undefined) this._licDriftY    = licDriftY;
+        this.licUniformF32[0] = this._licPhase;
+        this.licUniformF32[1] = this._licIntensity;
+        this.licUniformF32[2] = this._licDriftX;
+        this.licUniformF32[3] = this._licDriftY;
+        this.device.queue.writeBuffer(this.licUniform, 0, this.licUniformHost);
     }
 
     /**

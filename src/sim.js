@@ -127,7 +127,13 @@ export class Sim {
         this.device.queue.writeBuffer(this.buffers.dt, 0, seed.buffer);
 
         this._pushUniforms();
+        this._pushLicUniforms();
         this.buffers.pushBC(this.bcConfig);
+
+        // Pre-bake all step/render bind groups against the current
+        // PlasmaBuffers identity. Rebuilt by setResolution() when buffers
+        // are re-instantiated.
+        this._buildBindGroupCache();
     }
 
     loadPreset(preset) {
@@ -237,7 +243,7 @@ export class Sim {
         this._pushUniforms();
     }
 
-    setCFL(cfl)         { this.cfl = cfl; /* used by compute-dt via uniforms in a later wiring */ }
+    setCFL(cfl)         { this.cfl = cfl; this._pushUniforms(); }
     setGamma(g)         { this.gamma = g; this._pushUniforms(); }
     setPressureFloor(p) { this.pressureFloor = p; /* shader floor is constant in WGSL; UI exposes for future use */ }
 
@@ -250,14 +256,14 @@ export class Sim {
      */
     setLicIntensity(v) {
         this.licIntensity = Math.max(0, Math.min(2, +v || 0));
-        this._pushUniforms();
+        this._pushLicUniforms();
     }
 
     /** Drift speed in noise-pixels/sec — drift_x, drift_y are direction × speed. */
     setLicDrift(dx, dy) {
         this.licDriftX = +dx || 0;
         this.licDriftY = +dy || 0;
-        this._pushUniforms();
+        this._pushLicUniforms();
     }
 
     /**
@@ -284,8 +290,12 @@ export class Sim {
         const seed = new Float32Array([1e-4]);
         this.device.queue.writeBuffer(this.buffers.dt, 0, seed.buffer);
         this._pushUniforms();
+        this._pushLicUniforms();
         // Re-load whichever preset is current.
         this.setPreset(this.presetName);
+        // All GPU buffers changed identity — rebuild the bind-group cache
+        // (and via _buildBindGroupCache, the renderer/LIC side caches).
+        this._buildBindGroupCache();
     }
 
     /**
@@ -340,9 +350,19 @@ export class Sim {
             viewMin: this.viewMin,
             viewMax: this.viewMax,
             gridN: this.n,
-            stepParity: this.stepCount & 1,
             viewMode: this.viewMode,
             eta: this.eta,
+            cfl: this.cfl,
+        });
+    }
+
+    /**
+     * Push render-pace LIC state (phase / intensity / drift). Called
+     * every render frame and on intensity / drift slider changes. The
+     * main physics-state uniform buffer is NOT touched.
+     */
+    _pushLicUniforms() {
+        this.buffers.pushLicUniforms({
             licPhase:     this.licPhase,
             licIntensity: this.licIntensity,
             licDriftX:    this.licDriftX,
@@ -351,18 +371,30 @@ export class Sim {
     }
 
     // ── Bind-group builders ─────────────────────────────────────────
+    //
+    // Side-naming convention: when a builder name says "Side", it means
+    // the bind group references at least one of the four ping-pong
+    // handles (U0_n, U1_n, Bx_n, By_n) or their twin (U0_next, U1_next,
+    // Bx_next, By_next). The cache keeps two copies (a/b) for each such
+    // bind group, indexed by the value of `buffers._side` AT THE TIME
+    // the bind group is consumed. Side-independent bind groups live as
+    // single entries.
+    //
+    // All builders take explicit buffer args (no implicit `this.buffers`
+    // reads) so the cache builder can pin them to the A-side or B-side
+    // handles deterministically.
 
-    _dtBG() {
+    _dtBG(U0_n, U1_n, Bx_n, By_n) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.computeDt.bg',
             layout: this.pipelines.layouts.dt,
             entries: [
-                { binding: 0, resource: { buffer: b.uniform_x } },
-                { binding: 1, resource: { buffer: b.U0_n } },
-                { binding: 2, resource: { buffer: b.U1_n } },
-                { binding: 3, resource: { buffer: b.Bx_n } },
-                { binding: 4, resource: { buffer: b.By_n } },
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0_n } },
+                { binding: 2, resource: { buffer: U1_n } },
+                { binding: 3, resource: { buffer: Bx_n } },
+                { binding: 4, resource: { buffer: By_n } },
                 { binding: 5, resource: { buffer: b.wavespeed } },
                 { binding: 6, resource: { buffer: b.dt } },
             ],
@@ -375,7 +407,7 @@ export class Sim {
             label: 'plasma.applyBcs.bg',
             layout: this.pipelines.layouts.applyBcs,
             entries: [
-                { binding: 0, resource: { buffer: b.uniform_x } },
+                { binding: 0, resource: { buffer: b.uniform } },
                 { binding: 1, resource: { buffer: b.bc_uniforms } },
                 { binding: 2, resource: { buffer: U0 } },
                 { binding: 3, resource: { buffer: U1 } },
@@ -391,7 +423,7 @@ export class Sim {
             label: 'plasma.applyRes.bg',
             layout: this.pipelines.layouts.applyRes,
             entries: [
-                { binding: 0, resource: { buffer: b.uniform_x } },
+                { binding: 0, resource: { buffer: b.uniform } },
                 { binding: 1, resource: { buffer: stageBuf } },
                 { binding: 2, resource: { buffer: Bx } },
                 { binding: 3, resource: { buffer: By } },
@@ -407,9 +439,24 @@ export class Sim {
         });
     }
 
+    _energyFloorBG(U0_out, U1_out, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.energyFloor.bg',
+            layout: this.pipelines.layouts.energyFloor,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0_out } },
+                { binding: 2, resource: { buffer: U1_out } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+            ],
+        });
+    }
+
     _reconstructBG(axis, U0, U1, Bx, By) {
         const b = this.buffers;
-        const uniBuf = (axis === 0) ? b.uniform_x : b.uniform_y;
+        const sweepBuf = (axis === 0) ? b.sweepDir_x : b.sweepDir_y;
         const eL0 = (axis === 0) ? b.edge_l_x_0 : b.edge_l_y_0;
         const eL1 = (axis === 0) ? b.edge_l_x_1 : b.edge_l_y_1;
         const eR0 = (axis === 0) ? b.edge_r_x_0 : b.edge_r_y_0;
@@ -418,7 +465,7 @@ export class Sim {
             label: `plasma.reconstruct.axis${axis}.bg`,
             layout: this.pipelines.layouts.reconstruct,
             entries: [
-                { binding: 0, resource: { buffer: uniBuf } },
+                { binding: 0, resource: { buffer: b.uniform } },
                 { binding: 1, resource: { buffer: U0 } },
                 { binding: 2, resource: { buffer: U1 } },
                 { binding: 3, resource: { buffer: Bx } },
@@ -427,13 +474,14 @@ export class Sim {
                 { binding: 6, resource: { buffer: eL1 } },
                 { binding: 7, resource: { buffer: eR0 } },
                 { binding: 8, resource: { buffer: eR1 } },
+                { binding: 9, resource: { buffer: sweepBuf } },
             ],
         });
     }
 
     _riemannBG(axis, U0, U1, Bx, By) {
         const b = this.buffers;
-        const uniBuf = (axis === 0) ? b.uniform_x : b.uniform_y;
+        const sweepBuf = (axis === 0) ? b.sweepDir_x : b.sweepDir_y;
         const eL0 = (axis === 0) ? b.edge_l_x_0 : b.edge_l_y_0;
         const eL1 = (axis === 0) ? b.edge_l_x_1 : b.edge_l_y_1;
         const eR0 = (axis === 0) ? b.edge_r_x_0 : b.edge_r_y_0;
@@ -444,7 +492,7 @@ export class Sim {
             label: `plasma.riemann.axis${axis}.bg`,
             layout: this.pipelines.layouts.riemann,
             entries: [
-                { binding: 0,  resource: { buffer: uniBuf } },
+                { binding: 0,  resource: { buffer: b.uniform } },
                 { binding: 1,  resource: { buffer: U0 } },
                 { binding: 2,  resource: { buffer: U1 } },
                 { binding: 3,  resource: { buffer: Bx } },
@@ -455,6 +503,7 @@ export class Sim {
                 { binding: 8,  resource: { buffer: eR1 } },
                 { binding: 9,  resource: { buffer: f0 } },
                 { binding: 10, resource: { buffer: f1 } },
+                { binding: 11, resource: { buffer: sweepBuf } },
             ],
         });
     }
@@ -465,7 +514,7 @@ export class Sim {
             label: 'plasma.emf.bg',
             layout: this.pipelines.layouts.emf,
             entries: [
-                { binding: 0, resource: { buffer: b.uniform_x } },
+                { binding: 0, resource: { buffer: b.uniform } },
                 { binding: 1, resource: { buffer: b.flux_x_1 } },
                 { binding: 2, resource: { buffer: b.flux_y_1 } },
                 { binding: 3, resource: { buffer: b.Ez_edge } },
@@ -473,16 +522,16 @@ export class Sim {
         });
     }
 
-    _updateUBG(stageBuf, U0_other, U1_other, U0_out, U1_out) {
+    _updateUBG(stageBuf, U0_n, U1_n, U0_other, U1_other, U0_out, U1_out) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.updateU.bg',
             layout: this.pipelines.layouts.updateU,
             entries: [
-                { binding: 0,  resource: { buffer: b.uniform_x } },
+                { binding: 0,  resource: { buffer: b.uniform } },
                 { binding: 1,  resource: { buffer: stageBuf } },
-                { binding: 2,  resource: { buffer: b.U0_n } },
-                { binding: 3,  resource: { buffer: b.U1_n } },
+                { binding: 2,  resource: { buffer: U0_n } },
+                { binding: 3,  resource: { buffer: U1_n } },
                 { binding: 4,  resource: { buffer: U0_other } },
                 { binding: 5,  resource: { buffer: U1_other } },
                 { binding: 6,  resource: { buffer: b.flux_x_0 } },
@@ -496,16 +545,16 @@ export class Sim {
         });
     }
 
-    _updateBBG(stageBuf, Bx_other, By_other, Bx_out, By_out) {
+    _updateBBG(stageBuf, Bx_n, By_n, Bx_other, By_other, Bx_out, By_out) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.updateB.bg',
             layout: this.pipelines.layouts.updateB,
             entries: [
-                { binding: 0, resource: { buffer: b.uniform_x } },
+                { binding: 0, resource: { buffer: b.uniform } },
                 { binding: 1, resource: { buffer: stageBuf } },
-                { binding: 2, resource: { buffer: b.Bx_n } },
-                { binding: 3, resource: { buffer: b.By_n } },
+                { binding: 2, resource: { buffer: Bx_n } },
+                { binding: 3, resource: { buffer: By_n } },
                 { binding: 4, resource: { buffer: Bx_other } },
                 { binding: 5, resource: { buffer: By_other } },
                 { binding: 6, resource: { buffer: b.Ez_edge } },
@@ -516,10 +565,116 @@ export class Sim {
         });
     }
 
+    /**
+     * Pre-bake every bind group used by `step()` and `_encodeComputeDt`.
+     * Called from `init()` and `setResolution()` — anywhere `this.buffers`
+     * or the renderers change identity. The cache holds one entry per
+     * (stage × kernel × side); side-independent kernels use a single
+     * entry under `entry.bg`, side-dependent kernels use `entry.a`/`b`.
+     *
+     * Side semantics: A means `_side === 'a'` (U0_n = U0_a, U0_next = U0_b).
+     * B is the opposite. `swap()` flips `_side` after each step, so
+     * lookups happen against the CURRENT side at encode time.
+     *
+     * What flips per side:
+     *   - The four primary handles: U0_n, U1_n, Bx_n, By_n.
+     *   - The four destination handles: U0_next, U1_next, Bx_next, By_next.
+     * Everything else (U0_1, U1_1, U0_2, U1_2, fluxes, edges, Bx_{1,2},
+     * By_{1,2}, snap buffers, dt, uniforms, sweepDir, licUniform, LUT,
+     * noise, field, colored, lic_out) is identity-stable across swaps.
+     *
+     * Subtlety the audit caught: update-conserved/update-b ALWAYS bind
+     * U_n / Bx_n / By_n (the SSP "blend-against-U(n)" reference), even
+     * in stages 2 and 3 where the src state has moved on to U_1 / U_2.
+     * So updateU and updateB at EVERY stage are side-dependent. Same
+     * for compute-dt (reads U_n).
+     */
+    _buildBindGroupCache() {
+        const b = this.buffers;
+        // Helper: build per-side handles for a hypothetical "_side = which"
+        // configuration without mutating buffers._side. Mirrors the swap
+        // logic but returns a struct.
+        const handles = (which) => (which === 'a')
+            ? {
+                U0_n: b.U0_a, U1_n: b.U1_a, Bx_n: b.Bx_a, By_n: b.By_a,
+                U0_next: b.U0_b, U1_next: b.U1_b, Bx_next: b.Bx_b, By_next: b.By_b,
+            }
+            : {
+                U0_n: b.U0_b, U1_n: b.U1_b, Bx_n: b.Bx_b, By_n: b.By_b,
+                U0_next: b.U0_a, U1_next: b.U1_a, Bx_next: b.Bx_a, By_next: b.By_a,
+            };
+        const sides = { a: handles('a'), b: handles('b') };
+
+        // Build a stage's bind groups for ONE side. Caller invokes twice
+        // (a/b) and stores both. Side-INDEPENDENT entries are duplicated
+        // (cheap — same handles either way) so the lookup can be uniform.
+        const buildStage = (stageIdx, h) => {
+            // stage_1: src = U_n, other = U_n, dst = U_1
+            // stage_2: src = U_1, other = U_1, dst = U_2
+            // stage_3: src = U_2, other = U_2, dst = U_next
+            let src, other, dst, stageBuf;
+            if (stageIdx === 1) {
+                src   = { U0: h.U0_n, U1: h.U1_n, Bx: h.Bx_n, By: h.By_n };
+                other = { U0: h.U0_n, U1: h.U1_n, Bx: h.Bx_n, By: h.By_n };
+                dst   = { U0: b.U0_1, U1: b.U1_1, Bx: b.Bx_1, By: b.By_1 };
+                stageBuf = b.stage_1;
+            } else if (stageIdx === 2) {
+                src   = { U0: b.U0_1, U1: b.U1_1, Bx: b.Bx_1, By: b.By_1 };
+                other = { U0: b.U0_1, U1: b.U1_1, Bx: b.Bx_1, By: b.By_1 };
+                dst   = { U0: b.U0_2, U1: b.U1_2, Bx: b.Bx_2, By: b.By_2 };
+                stageBuf = b.stage_2;
+            } else {
+                src   = { U0: b.U0_2,    U1: b.U1_2,    Bx: b.Bx_2,    By: b.By_2    };
+                other = { U0: b.U0_2,    U1: b.U1_2,    Bx: b.Bx_2,    By: b.By_2    };
+                dst   = { U0: h.U0_next, U1: h.U1_next, Bx: h.Bx_next, By: h.By_next };
+                stageBuf = b.stage_3;
+            }
+            return {
+                applyBcsSrc:    this._applyBcsBG(src.U0, src.U1, src.Bx, src.By),
+                reconstructX:   this._reconstructBG(0, src.U0, src.U1, src.Bx, src.By),
+                reconstructY:   this._reconstructBG(1, src.U0, src.U1, src.Bx, src.By),
+                riemannX:       this._riemannBG(0, src.U0, src.U1, src.Bx, src.By),
+                riemannY:       this._riemannBG(1, src.U0, src.U1, src.Bx, src.By),
+                emf:            this._emfBG(),
+                updateU:        this._updateUBG(stageBuf,
+                                                h.U0_n, h.U1_n,
+                                                other.U0, other.U1,
+                                                dst.U0, dst.U1),
+                energyFloor:    this._energyFloorBG(dst.U0, dst.U1, src.Bx, src.By),
+                updateB:        this._updateBBG(stageBuf,
+                                                h.Bx_n, h.By_n,
+                                                other.Bx, other.By,
+                                                dst.Bx, dst.By),
+                applyBcsDst:    this._applyBcsBG(dst.U0, dst.U1, dst.Bx, dst.By),
+                applyRes:       this._applyResBG(stageBuf, dst.Bx, dst.By, dst.U1),
+            };
+        };
+
+        // For each stage, build a/b variants. The variants share most
+        // entries (only the side-dependent ones differ) but we build the
+        // full struct twice for lookup uniformity. The overhead is ~50 µs
+        // × 22 = ~1.1 ms one-time at startup — negligible.
+        this._bgCache = {
+            dt: {
+                a: this._dtBG(sides.a.U0_n, sides.a.U1_n, sides.a.Bx_n, sides.a.By_n),
+                b: this._dtBG(sides.b.U0_n, sides.b.U1_n, sides.b.Bx_n, sides.b.By_n),
+            },
+            stage1: { a: buildStage(1, sides.a), b: buildStage(1, sides.b) },
+            stage2: { a: buildStage(2, sides.a), b: buildStage(2, sides.b) },
+            stage3: { a: buildStage(3, sides.a), b: buildStage(3, sides.b) },
+        };
+
+        // Renderer / LIC bind groups also depend on the primary handles
+        // (view-field reads U_n + face B; lic-advect reads face B). Have
+        // the renderer rebuild its A/B cache against the new buffers.
+        if (this.renderer)        this.renderer.rebuildSideCache();
+        if (this.renderer && this.renderer.lic) this.renderer.lic.rebuildSideCache();
+    }
+
     _encodeComputeDt(encoder) {
         const { pipelines } = this;
         const groupsInterior = Math.ceil(this.n / WG);
-        const bg = this._dtBG();
+        const bg = this._bgCache.dt[this.buffers._side];
 
         const pass = encoder.beginComputePass({ label: 'plasma.computeDt' });
         pass.setBindGroup(0, bg);
@@ -533,92 +688,129 @@ export class Sim {
     }
 
     /**
-     * Encode one RK3 stage. The stage's source-state slot (srcU0/...) is
-     * where apply-bcs writes ghosts; reconstruct-ppm + Riemann read from
-     * the same slot; update writes to dstU0/.../dstBy. After the CT
-     * update, apply-resistivity adds η∇²B in-place on the destination
-     * face/cell buffers.
+     * Encode one RK3 stage from the pre-baked bind-group cache.
+     *
+     * `stageIdx` ∈ {1, 2, 3}; `side` ∈ {'a', 'b'}. The encoder also
+     * branches on `this.eta` to skip the resistive triad (9a/9b/9c) at
+     * ideal MHD (Change #7) and to skip the leading apply-bcs in stages
+     * 2 and 3 when η > 0, since stage k's 9a already filled stage k+1's
+     * src-ghosts (Change #6).
+     *
+     * Asymmetry between paths:
+     *   η = 0: every stage runs step 1 (PPM ghosts) + the 7-pass core,
+     *          no resistive triad. Stage k+1's step 1 is the only place
+     *          stage k+1's src-ghosts get filled.
+     *   η > 0: stage 1 runs step 1 (fills U_n's ghosts before PPM). 9a
+     *          at the end of stages 1 and 2 fills the dst-ghosts, which
+     *          ARE the next stage's src-ghosts (dst_k === src_{k+1} for
+     *          k = 1, 2). So stages 2 and 3 skip step 1. Stage 3's own
+     *          9a is still needed (for its 9b/9c) but its ghost output
+     *          is discarded at the next step's step 1.
      */
-    _encodeStage(pass, srcU0, srcU1, srcBx, srcBy,
-                 otherU0, otherU1, otherBx, otherBy,
-                 dstU0, dstU1, dstBx, dstBy, stageBuf) {
+    _encodeStage(pass, stageIdx, side) {
         const { pipelines } = this;
         const N         = this.n;
-        const N2        = N + 2;
-        const N1        = N + 1;
-        const Ntotal    = this.n_total;
         const gInterior = Math.ceil(N / WG);
-        const gN1       = Math.ceil(N1 / WG);
-        const gN2       = Math.ceil(N2 / WG);
-        const gTotalP1  = Math.ceil((Ntotal + 1) / WG);
+        const gN1       = Math.ceil((N + 1) / WG);
+        const gN2       = Math.ceil((N + 2) / WG);
+        // apply-bcs covers (N_total+1)² (all ghost strips + boundary faces).
+        const gTotalP1  = Math.ceil((this.n_total + 1) / WG);
+        // apply-resistivity now dispatches over the Laplacian read footprint
+        // (interior + 1-cell ghost margin + extra face index) = (N+3)².
+        // Shader shifts the index by (ghost - 1u) — see Change #10 in this
+        // round and the snapshot/main entry-point comments.
+        const gResis    = Math.ceil((N + 3) / WG);
 
-        // 1. apply-bcs (fills ghosts in srcU0/srcU1/srcBx/srcBy).
-        pass.setPipeline(pipelines.pipelines.applyBcs);
-        pass.setBindGroup(0, this._applyBcsBG(srcU0, srcU1, srcBx, srcBy));
-        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+        const bgs = this._bgCache[`stage${stageIdx}`][side];
+
+        // 1. apply-bcs on src — fills ghosts for the upcoming PPM stencil.
+        //    Skipped in stages 2 and 3 when η > 0: stage k's 9a fed the
+        //    dst-ghosts (which alias stage k+1's src-ghosts for k=1,2).
+        if (this.eta <= 0 || stageIdx === 1) {
+            pass.setPipeline(pipelines.pipelines.applyBcs);
+            pass.setBindGroup(0, bgs.applyBcsSrc);
+            pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+        }
 
         // 2-5. PPM + Riemann, both axes.
         pass.setPipeline(pipelines.pipelines.reconstructPpm);
-        pass.setBindGroup(0, this._reconstructBG(0, srcU0, srcU1, srcBx, srcBy));
+        pass.setBindGroup(0, bgs.reconstructX);
         pass.dispatchWorkgroups(gN2, gN2, 1);
 
         pass.setPipeline(pipelines.pipelines.riemannHlld);
-        pass.setBindGroup(0, this._riemannBG(0, srcU0, srcU1, srcBx, srcBy));
+        pass.setBindGroup(0, bgs.riemannX);
         pass.dispatchWorkgroups(gN1, gN2, 1);   // (N+1) × (N+2) for x-sweep
 
         pass.setPipeline(pipelines.pipelines.reconstructPpm);
-        pass.setBindGroup(0, this._reconstructBG(1, srcU0, srcU1, srcBx, srcBy));
+        pass.setBindGroup(0, bgs.reconstructY);
         pass.dispatchWorkgroups(gN2, gN2, 1);
 
         pass.setPipeline(pipelines.pipelines.riemannHlld);
-        pass.setBindGroup(0, this._riemannBG(1, srcU0, srcU1, srcBx, srcBy));
+        pass.setBindGroup(0, bgs.riemannY);
         pass.dispatchWorkgroups(gN2, gN1, 1);   // (N+2) × (N+1) for y-sweep
 
         // 6. CT EMF at corners.
         pass.setPipeline(pipelines.pipelines.computeEmf);
-        pass.setBindGroup(0, this._emfBG());
+        pass.setBindGroup(0, bgs.emf);
         pass.dispatchWorkgroups(gN1, gN1, 1);   // (N+1)²
 
         // 7. Weighted update for cell-centered state — interior only.
         pass.setPipeline(pipelines.pipelines.updateConservedWeighted);
-        pass.setBindGroup(0, this._updateUBG(stageBuf, otherU0, otherU1, dstU0, dstU1));
+        pass.setBindGroup(0, bgs.updateU);
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
+
+        // 7.5 Energy floor with magnetic-pressure correction. Uses the
+        // SOURCE face B (srcBx/srcBy) — at this point update-b hasn't
+        // written dstBx/dstBy for this stage yet. The floor is
+        // E_min = KE + ½|B|² + p_floor/(γ−1); without the ½|B|² term
+        // (omitted by update-conserved due to its 10-binding cap) thin
+        // current sheets can clamp E below the magnetic-pressure
+        // contribution. Reads U0_out, Bx/By; clamps U1_out.E in place.
+        pass.setPipeline(pipelines.pipelines.energyFloor);
+        pass.setBindGroup(0, bgs.energyFloor);
         pass.dispatchWorkgroups(gInterior, gInterior, 1);
 
         // 8. Weighted update for face-centered B — covers (N+1)² combined.
         pass.setPipeline(pipelines.pipelines.updateBWeighted);
-        pass.setBindGroup(0, this._updateBBG(stageBuf, otherBx, otherBy, dstBx, dstBy));
+        pass.setBindGroup(0, bgs.updateB);
         pass.dispatchWorkgroups(gN1, gN1, 1);
 
-        // 9a. Re-fill ghost cells on the DESTINATION buffer so the
-        // resistive Laplacian stencil sees BC-consistent values. The
-        // update-conserved/update-b kernels only wrote interior cells/
-        // faces; without this refill, the dst-buffer ghosts would carry
-        // stale data from previous steps (the buffer ping-pongs).
-        pass.setPipeline(pipelines.pipelines.applyBcs);
-        pass.setBindGroup(0, this._applyBcsBG(dstU0, dstU1, dstBx, dstBy));
-        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+        // 9a/9b/9c — resistivity triad. Skipped entirely at η = 0
+        // (Change #7): the shaders no-op internally but we avoid issuing
+        // 6 dispatches per step on every ideal-MHD preset.
+        if (this.eta > 0) {
+            // 9a. Re-fill ghost cells on the DESTINATION buffer so the
+            // resistive Laplacian stencil sees BC-consistent values. The
+            // update-conserved/update-b kernels only wrote interior
+            // cells/faces; without this refill, the dst-buffer ghosts
+            // would carry stale data from previous steps.
+            pass.setPipeline(pipelines.pipelines.applyBcs);
+            pass.setBindGroup(0, bgs.applyBcsDst);
+            pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
 
-        // 9b. Snapshot dst → snap. Race-free per-cell copy; required
-        // because the next pass's 5-point Laplacian reads neighbours,
-        // and WebGPU has no cross-invocation memory ordering inside a
-        // dispatch — so reading from the same buffer being written
-        // racily picks up post-write values at workgroup-tile bounds.
-        // The snapshot decouples reads from writes (dispatches within
-        // a pass ARE sequenced, so main below sees snapshot's writes).
-        const resBg = this._applyResBG(stageBuf, dstBx, dstBy, dstU1);
-        pass.setPipeline(pipelines.pipelines.applyResSnapshot);
-        pass.setBindGroup(0, resBg);
-        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+            // 9b. Snapshot dst → snap. Race-free per-cell copy; required
+            // because the next pass's 5-point Laplacian reads neighbours,
+            // and WebGPU has no cross-invocation memory ordering inside
+            // a dispatch — so reading from the same buffer being written
+            // racily picks up post-write values at workgroup-tile bounds.
+            // Dispatched over (N+3)² with (ghost-1) shift (Change #10).
+            pass.setPipeline(pipelines.pipelines.applyResSnapshot);
+            pass.setBindGroup(0, bgs.applyRes);
+            pass.dispatchWorkgroups(gResis, gResis, 1);
 
-        // 9c. Resistivity (η ∇²B) — reads snap, writes dst.
-        pass.setPipeline(pipelines.pipelines.applyResistivity);
-        pass.setBindGroup(0, resBg);
-        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+            // 9c. Resistivity (η ∇²B) — reads snap, writes dst. Same
+            // dispatch shape as 9b; interior-bounds checks inside the
+            // shader filter writes to interior cells/faces only.
+            pass.setPipeline(pipelines.pipelines.applyResistivity);
+            pass.setBindGroup(0, bgs.applyRes);
+            pass.dispatchWorkgroups(gResis, gResis, 1);
+        }
     }
 
     step() {
         const { device } = this;
         const b = this.buffers;
+        const side = b._side;  // pinned for this step's encoding
 
         const encoder = device.createCommandEncoder({ label: 'plasma.step.enc' });
 
@@ -629,25 +821,13 @@ export class Sim {
         const pass = encoder.beginComputePass({ label: 'plasma.rk3' });
 
         // Stage 1: U(1) = U(n) + dt · L(U(n))
-        this._encodeStage(pass,
-            b.U0_n, b.U1_n, b.Bx_n, b.By_n,
-            b.U0_n, b.U1_n, b.Bx_n, b.By_n,
-            b.U0_1, b.U1_1, b.Bx_1, b.By_1,
-            b.stage_1);
+        this._encodeStage(pass, 1, side);
 
         // Stage 2: U(2) = 3/4 U(n) + 1/4 U(1) + 1/4 dt · L(U(1))
-        this._encodeStage(pass,
-            b.U0_1, b.U1_1, b.Bx_1, b.By_1,
-            b.U0_1, b.U1_1, b.Bx_1, b.By_1,
-            b.U0_2, b.U1_2, b.Bx_2, b.By_2,
-            b.stage_2);
+        this._encodeStage(pass, 2, side);
 
         // Stage 3: U(n+1) = 1/3 U(n) + 2/3 U(2) + 2/3 dt · L(U(2))
-        this._encodeStage(pass,
-            b.U0_2,    b.U1_2,    b.Bx_2,    b.By_2,
-            b.U0_2,    b.U1_2,    b.Bx_2,    b.By_2,
-            b.U0_next, b.U1_next, b.Bx_next, b.By_next,
-            b.stage_3);
+        this._encodeStage(pass, 3, side);
 
         pass.end();
         device.queue.submit([encoder.finish()]);
@@ -672,7 +852,10 @@ export class Sim {
             this.licPhase += dt;
         }
         this._lastRenderTime = now;
-        this._pushUniforms();
+        // Only the small (16 B) LIC uniform changes per frame now; the
+        // main 64 B physics uniform is rewritten only on parameter
+        // changes (setEta / setCFL / setViewMode / setGamma / loadPreset).
+        this._pushLicUniforms();
         this.renderer.render();
     }
 }

@@ -3,8 +3,8 @@
 // uses the fast magnetosonic speed (hyperbolic CFL). Phase 4 also folds
 // in the resistive parabolic CFL:
 //
-//   dt_hyp  = CFL · dx / max(|v|+c_fast)
-//   dt_res  = 0.5 · dx² / η                              (η > 0)
+//   dt_hyp  = CFL · dx / max(|v|+c_fast)    (CFL from U_uniforms.cfl)
+//   dt_res  = 0.25 · dx² / η                             (η > 0)
 //   dt      = min(dt_hyp, dt_res), clamped to [DT_MIN, DT_MAX]
 //
 // If η == 0, the resistive contribution is treated as infinite (no
@@ -27,7 +27,6 @@
 @group(0) @binding(5) var<storage, read_write>     wavespeed:   atomic<u32>;
 @group(0) @binding(6) var<storage, read_write>     dt_buf:      array<f32, 1>;
 
-const CFL_NUMBER: f32 = 0.4;
 const DT_MIN: f32 = 1.0e-8;
 const DT_MAX: f32 = 1.0e-2;
 
@@ -64,7 +63,8 @@ fn reduce(
         let sx = abs(P.vx) + cfx;
         let sy = abs(P.vy) + cfy;
         let s  = max(sx, sy);
-        atomicMax(&tile_max, bitcast<u32>(s));
+        let s_safe = select(0.0, s, s >= 0.0 && s == s);
+        atomicMax(&tile_max, bitcast<u32>(s_safe));
     }
 
     workgroupBarrier();
@@ -80,10 +80,13 @@ fn finalize() {
     let s = max(bitcast<f32>(s_bits), 1.0e-12);
     let dx = U_uniforms.dx;
     let eta = U_uniforms.eta;
-    var dt_hyp = CFL_NUMBER * dx / s;
+    // Slider-controlled CFL with a tiny epsilon floor — a slider at zero
+    // would produce dt=0 → no progress → frozen sim.
+    let cfl_safe = max(U_uniforms.cfl, 1.0e-6);
+    var dt_hyp = cfl_safe * dx / s;
     var dt_res: f32;
     if (eta > 0.0) {
-        dt_res = 0.5 * dx * dx / eta;
+        dt_res = 0.25 * dx * dx / eta;
     } else {
         dt_res = 1.0e30;   // effectively infinite
     }

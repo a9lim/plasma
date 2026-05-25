@@ -20,6 +20,7 @@
 //   0: Uniforms       (vertex + fragment)
 //   1: colored        (fragment, read storage)
 //   2: lic_out        (fragment, read storage)
+//   3: LicUniforms    (fragment, uniform) — render-pace lic_intensity etc.
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -29,6 +30,7 @@ struct VertexOutput {
 @group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> colored: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> lic_out: array<f32>;
+@group(0) @binding(3) var<uniform>       lic_u:   LicUniforms;
 
 @vertex
 fn vsMain(@builtin(vertex_index) vid: u32) -> VertexOutput {
@@ -45,7 +47,7 @@ fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
     let n_interior = U_uniforms.grid_n;
     let n_total    = U_uniforms.grid_n_total;
     let ghost      = U_uniforms.ghost_w;
-    let intensity  = U_uniforms.lic_intensity;
+    let intensity  = lic_u.lic_intensity;
     let nf = f32(n_interior);
     let ix_int = u32(clamp(floor(in.uv.x * nf), 0.0, nf - 1.0));
     let iy_int = u32(clamp(floor(in.uv.y * nf), 0.0, nf - 1.0));

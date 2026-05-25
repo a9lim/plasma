@@ -282,7 +282,7 @@ runs once per displayed frame. Render chain:
 `view-field → colormap → lic-advect → composite`.
 
 * `lic-advect.wgsl` — one invocation per interior cell. Backward-traces
-  30 RK2 steps along the unit B-field (step size 0.5 cells, ~15 cells
+  20 RK2 steps along the unit B-field (step size 0.5 cells, ~10 cells
   total). Samples a 1024×1024 white-noise base buffer with bilinear
   interpolation and a per-frame phase offset. Writes one f32
   luminance per interior cell.

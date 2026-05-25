@@ -36,6 +36,7 @@
 //   6 edge_l_1 (rw)
 //   7 edge_r_0 (rw)
 //   8 edge_r_1 (rw)
+//   9 sweep   (uniform SweepDir) — sweep_dir = 0 (x) or 1 (y)
 
 @group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read>       U0_in:     array<vec4<f32>>;
@@ -46,6 +47,7 @@
 @group(0) @binding(6) var<storage, read_write> edge_l_1:  array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> edge_r_0:  array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> edge_r_1:  array<vec4<f32>>;
+@group(0) @binding(9) var<uniform>             sweep:     SweepDir;
 
 // Pack one cell's primitive state into the two vec4 we feed to PPM.
 //   p0 = (ρ, vx, vy, vz)
@@ -115,7 +117,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ix = gid.x + ghost - 1u;
     let iy = gid.y + ghost - 1u;
 
-    let axis = U_uniforms.sweep_dir;
+    let axis = sweep.sweep_dir;
     let g    = U_uniforms.gamma;
     let idx  = cell_idx_total(ix, iy, n_total);
 

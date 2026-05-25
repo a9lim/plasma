@@ -58,19 +58,27 @@ struct StageParamsResis {
 @group(0) @binding(8) var<storage, read_write> U1_snap:  array<vec4<f32>>;
 
 // Per-cell copy dst → snap. Race-free: each invocation touches only its
-// own buffer cell, no neighbor reads. Dispatched over (N_total+1)² with
-// bounds checks per buffer shape (Bx is (N_total+1) × N_total, By is
-// N_total × (N_total+1), U1 is N_total × N_total).
+// own buffer cell, no neighbor reads. Dispatched over (N+3)² so that
+// the snapshotted region covers exactly the Laplacian's read footprint:
+// interior cells [ghost, ghost+N) plus one ghost-cell margin on every
+// side (the 5-point stencil reads (i±1, j) and (i, j±1)). Bx_face and
+// By_face have one extra index along their normal axis, so the N+3 wide
+// dispatch covers them too. Indices are shifted by (ghost − 1) inside
+// the shader.
 @compute @workgroup_size(8, 8, 1)
 fn snapshot(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_total = U_uniforms.grid_n_total;
+    let ghost   = U_uniforms.ghost_w;
     let eta     = U_uniforms.eta;
     // Skip the copy entirely when ideal MHD is active — main will also
     // early-out, so the snapshots are never consumed.
     if (eta == 0.0) { return; }
 
-    let ix = gid.x;
-    let iy = gid.y;
+    // Shift dispatch index into [ghost-1, ghost+N+2). Covers interior +
+    // 1-cell ghost margin (Laplacian footprint) + the extra face index
+    // along the normal axis (high-end bound below picks this up).
+    let ix = gid.x + ghost - 1u;
+    let iy = gid.y + ghost - 1u;
 
     // U1: N_total × N_total
     if (ix < n_total && iy < n_total) {
@@ -103,8 +111,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // dispatch above also no-op'd, so reads from snap would be stale).
     if (eta == 0.0) { return; }
 
-    let ix = gid.x;
-    let iy = gid.y;
+    // Same dispatch shape as `snapshot` — (N+3)² with a (ghost-1) shift.
+    // The main pass only writes interior cells/faces; the dispatch is
+    // sized to match the snapshot's so a single workgroup count suffices
+    // for both. The interior-bounds checks below filter the extras out.
+    let ix = gid.x + ghost - 1u;
+    let iy = gid.y + ghost - 1u;
 
     // ── Bz diffusion (cell-centered, U1.y) ──────────────────────────
     if (ix >= ghost && ix < ghost + n_interior &&

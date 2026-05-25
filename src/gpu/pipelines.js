@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 6;
+const SHADER_VERSION = 8;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -80,6 +80,7 @@ function reconstructPpmBGL(device) {
         { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // edge_l_1
         { binding: 7, visibility: COMPUTE, buffer: RW_STO },  // edge_r_0
         { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // edge_r_1
+        { binding: 9, visibility: COMPUTE, buffer: UNIFORM }, // SweepDir
     ]);
 }
 
@@ -96,6 +97,7 @@ function riemannHlldBGL(device) {
         { binding: 8, visibility: COMPUTE, buffer: RO_STO },  // edge_r_1
         { binding: 9, visibility: COMPUTE, buffer: RW_STO },  // flux_0
         { binding: 10, visibility: COMPUTE, buffer: RW_STO }, // flux_1
+        { binding: 11, visibility: COMPUTE, buffer: UNIFORM }, // SweepDir
     ]);
 }
 
@@ -196,6 +198,7 @@ function compositeBGL(device) {
         { binding: 0, visibility: VERTEX | FRAGMENT, buffer: UNIFORM },
         { binding: 1, visibility: FRAGMENT,          buffer: RO_STO },  // colored
         { binding: 2, visibility: FRAGMENT,          buffer: RO_STO },  // lic_out
+        { binding: 3, visibility: FRAGMENT,          buffer: UNIFORM }, // LicUniforms
     ]);
 }
 
@@ -209,13 +212,28 @@ function licAdvectBGL(device) {
         { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // By_face
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // noise
         { binding: 4, visibility: COMPUTE, buffer: RW_STO },  // lic_out
+        { binding: 5, visibility: COMPUTE, buffer: UNIFORM }, // LicUniforms
+    ]);
+}
+
+// New in Round 2. Magnetic-pressure-aware energy floor. Runs between
+// update-conserved-weighted (step 7) and update-b-weighted (step 8) —
+// uses stage-input face B to bound E in the just-written U1. 4 storage
+// bindings (well under the 10-per-stage cap).
+function energyFloorBGL(device) {
+    return bgl(device, 'plasma.energyFloor.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },   // U0_out
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },   // U1_out
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },   // Bx_face (stage input)
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },   // By_face (stage input)
     ]);
 }
 
 export async function createPipelines(device, format) {
     const [
         ppmModule, hlldModule, emfModule, updateUWModule, updateBWModule,
-        applyBcsModule, applyResistivityModule,
+        applyBcsModule, applyResistivityModule, energyFloorModule,
         dtModule, viewModule, colormapModule, compositeModule, licAdvectModule,
     ] = await Promise.all([
         makeModule(device, 'plasma.reconstruct-ppm',          'reconstruct-ppm.wgsl'),
@@ -225,6 +243,7 @@ export async function createPipelines(device, format) {
         makeModule(device, 'plasma.update-b-weighted',         'update-b-weighted.wgsl'),
         makeModule(device, 'plasma.apply-bcs',                 'apply-bcs.wgsl'),
         makeModule(device, 'plasma.apply-resistivity',         'apply-resistivity.wgsl'),
+        makeModule(device, 'plasma.energy-floor',              'energy-floor.wgsl'),
         makeModule(device, 'plasma.compute-dt',               'compute-dt.wgsl'),
         makeModule(device, 'plasma.view-field',               'view-field.wgsl'),
         makeModule(device, 'plasma.colormap',                 'colormap.wgsl'),
@@ -239,6 +258,7 @@ export async function createPipelines(device, format) {
     const updateBLayout     = updateBWeightedBGL(device);
     const applyBcsLayout    = applyBcsBGL(device);
     const applyResLayout    = applyResistivityBGL(device);
+    const energyFloorLayout = energyFloorBGL(device);
     const dtLayout          = dtBGL(device);
     const viewLayout        = viewBGL(device);
     const colormapLayout    = colormapBGL(device);
@@ -286,6 +306,11 @@ export async function createPipelines(device, format) {
         label: 'plasma.apply-resistivity.snapshot',
         layout: mkPipeLayout(applyResLayout),
         compute: { module: applyResistivityModule, entryPoint: 'snapshot' },
+    });
+    const energyFloor = device.createComputePipeline({
+        label: 'plasma.energy-floor',
+        layout: mkPipeLayout(energyFloorLayout),
+        compute: { module: energyFloorModule, entryPoint: 'main' },
     });
 
     const dtPipeLayout = mkPipeLayout(dtLayout);
@@ -340,6 +365,7 @@ export async function createPipelines(device, format) {
             updateB:     updateBLayout,
             applyBcs:    applyBcsLayout,
             applyRes:    applyResLayout,
+            energyFloor: energyFloorLayout,
             dt:          dtLayout,
             view:        viewLayout,
             colormap:    colormapLayout,
@@ -350,6 +376,7 @@ export async function createPipelines(device, format) {
             reconstructPpm, riemannHlld, computeEmf,
             updateConservedWeighted, updateBWeighted,
             applyBcs, applyResistivity, applyResSnapshot,
+            energyFloor,
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite, licAdvect,
         },

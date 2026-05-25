@@ -78,12 +78,19 @@ export const EDGE_S = 1;  // bottom
 export const EDGE_E = 2;  // right
 export const EDGE_W = 3;  // left
 
-// Uniform-buffer layout (Phase 6): see `Uniforms` struct in shared-helpers.wgsl.
-//   f32 dx, gamma, view_min, view_max, eta, lic_phase, lic_intensity, lic_drift_x
-//   u32 grid_n, grid_n_total, ghost_w, sweep_dir, step_parity, view_mode
-//   f32 lic_drift_y
-//   u32 noise_n
+// Uniform-buffer layout (Round 2): see `Uniforms` struct in shared-helpers.wgsl.
+//   f32 dx, gamma, view_min, view_max, eta, _pad_lic_0, _pad_lic_1, _pad_lic_2
+//   u32 grid_n, grid_n_total, ghost_w, _pad_sweep
+//   f32 cfl                                  (slot 12)
+//   u32 view_mode                            (slot 13)
+//   f32 _pad_lic_3                           (slot 14)
+//   u32 noise_n                              (slot 15)
 // 16 × 4B = 64B.
+//
+// Sweep direction is in two static SweepDir uniform buffers (16 B each)
+// bound by reconstruct-ppm + riemann-hlld. LIC render-pace state
+// (phase, intensity, drift_x, drift_y) is in a separate 16 B
+// LicUniforms buffer rewritten per render frame.
 export const UNIFORM_BUFFER_SIZE = 64;
 
 // bc_uniforms storage-buffer layout:
@@ -104,10 +111,10 @@ export const LIC_NOISE_N = 1024;
 // build to be reproducible. (Mulberry32 PRNG, see buffers.js.)
 export const LIC_NOISE_SEED = 0xC0FFEE;
 
-// Number of backward-trace steps per pixel. 30 × 0.5 cells = ~15 cells
+// Number of backward-trace steps per pixel. 20 × 0.5 cells = ~10 cells
 // of trace length — long enough to resolve magnetic islands and short
 // enough to stay performant at 1024².
-export const LIC_STEPS = 30;
+export const LIC_STEPS = 20;
 
 // Backward-trace step length in cell widths. RK2 midpoint integration.
 export const LIC_STEP_SIZE = 0.5;

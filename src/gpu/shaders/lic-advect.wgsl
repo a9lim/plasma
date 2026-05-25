@@ -26,12 +26,13 @@
 //
 // ── Bind-group layout (transpiler contract) ────────────────────────
 //   group(0) binding(0): Uniforms                    (uniform)
-//                        — uses ghost_w, grid_n, grid_n_total,
-//                          lic_phase, lic_drift_x, lic_drift_y, noise_n.
+//                        — uses ghost_w, grid_n, grid_n_total, noise_n.
 //   group(0) binding(1): Bx_face                     (storage, read)
 //   group(0) binding(2): By_face                     (storage, read)
 //   group(0) binding(3): noise (1024² f32)           (storage, read)
 //   group(0) binding(4): lic_out (interior-padded f32) (storage, read_write)
+//   group(0) binding(5): LicUniforms                 (uniform)
+//                        — render-pace phase + drift (rewritten per frame).
 //
 // ── Transpiler audit ───────────────────────────────────────────────
 //   • Vanilla compute entry point; one workgroup_size(8,8,1).
@@ -43,10 +44,10 @@
 //   • Conditional logic uses plain `if` (no `switch`).
 //   • Loop is a plain `for` over a u32 counter; no nested barriers.
 //
-// All constants below mirror config.js values (LIC_STEPS = 30,
+// All constants below mirror config.js values (LIC_STEPS = 20,
 // LIC_STEP_SIZE = 0.5, LIC_B_EPS = 1e-8).
 
-const LIC_STEPS:     u32 = 30u;
+const LIC_STEPS:     u32 = 20u;
 const LIC_STEP_SIZE: f32 = 0.5;
 const LIC_B_EPS:     f32 = 1.0e-8;
 
@@ -55,6 +56,7 @@ const LIC_B_EPS:     f32 = 1.0e-8;
 @group(0) @binding(2) var<storage, read>       By_face: array<f32>;
 @group(0) @binding(3) var<storage, read>       noise:   array<f32>;
 @group(0) @binding(4) var<storage, read_write> lic_out: array<f32>;
+@group(0) @binding(5) var<uniform>             lic_u:   LicUniforms;
 
 // Sample the noise buffer with bilinear interpolation at fractional
 // position (px, py), wrapping into [0, noise_n). Cheap modulo wrap.
@@ -148,9 +150,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_total    = U_uniforms.grid_n_total;
     let ghost      = U_uniforms.ghost_w;
     let noise_n    = U_uniforms.noise_n;
-    let phase      = U_uniforms.lic_phase;
-    let drift_x    = U_uniforms.lic_drift_x;
-    let drift_y    = U_uniforms.lic_drift_y;
+    let phase      = lic_u.lic_phase;
+    let drift_x    = lic_u.lic_drift_x;
+    let drift_y    = lic_u.lic_drift_y;
 
     if (gid.x >= n_interior || gid.y >= n_interior) { return; }
 

@@ -40,6 +40,7 @@
 //   8 edge_r_1  (ro)
 //   9 flux_0    (rw)
 //  10 flux_1    (rw)
+//  11 sweep     (uniform SweepDir) — sweep_dir = 0 (x) or 1 (y)
 
 @group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read>       U0_in:     array<vec4<f32>>;
@@ -52,15 +53,21 @@
 @group(0) @binding(8) var<storage, read>       edge_r_1:  array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read_write> flux_0:    array<vec4<f32>>;
 @group(0) @binding(10) var<storage, read_write> flux_1:   array<vec4<f32>>;
+@group(0) @binding(11) var<uniform>             sweep:    SweepDir;
 
-// Threshold below which the normal-B² triggers HLLD's Alfvén-degenerate
-// fallback to HLLC. Originally 1e-24 (essentially "exactly machine zero"),
-// but HANDOFF flagged that as too conservative: at thin current sheets,
-// |Bn| ~ 1e-5 is small enough that the full 5-wave HLLD path has tiny
-// denominators (rho·(S-u)² - bn² and S-S*), and the 1e-20 denominator
-// guards inflate bt_Ls = bt·g/safeDL into huge values that NaN-cascade.
-// 1e-10 means fall back to HLLC whenever |Bn| < ~1e-5·√ρ — robust at
-// near-degenerate sheets, no visible effect on bulk physics.
+// Dimensionless threshold below which the normal-B² triggers HLLD's
+// Alfvén-degenerate fallback to HLLC. The test now reads
+//   bn² < HLLD_BX_EPS2 · ρ_avg · ((SR - SL)/2)²
+// where (SR-SL)/2 is the Davis-style fast-magnetosonic speed estimate
+// from the wavespeed extrema. Both sides have units of (ρ · c²), so
+// HLLD_BX_EPS2 is a pure dimensionless smallness parameter — the value
+// 1e-10 means "fall back to HLLC whenever |Bn| is below ~1e-5 of the
+// local Alfvén-equivalent magnetic field strength". HANDOFF Session 2
+// #4 calibrated 1e-10 against the dimensionally-inconsistent form
+// (bn² < ε² · ρ_avg), which absorbed an implicit c²-like factor — the
+// trigger band may shift slightly under the corrected form, especially
+// for Orszag-Tang and Harris-sheet runs. Smoke-test OT N=256/1024
+// after this change.
 const HLLD_BX_EPS2: f32 = 1.0e-10;
 const HLLD_WS_TOL:  f32 = 1.0e-8;
 
@@ -88,39 +95,6 @@ struct HLLOut {
     fBt1: f32,
     fBt2: f32,
 };
-
-fn hll_flux_mhd(QL: MhdPrim, QR: MhdPrim, axis: u32, gamma: f32) -> HLLOut {
-    let cfL = fast_mag_speed(QL, gamma, axis);
-    let cfR = fast_mag_speed(QR, gamma, axis);
-    let uL  = normal_velocity_mhd(QL, axis);
-    let uR  = normal_velocity_mhd(QR, axis);
-    let SL  = min(uL - cfL, uR - cfR);
-    let SR  = max(uL + cfL, uR + cfR);
-
-    let FL = mhd_flux(QL, gamma, axis);
-    let FR = mhd_flux(QR, gamma, axis);
-
-    let CL = prim_to_cons_pair(QL, gamma);
-    let CR = prim_to_cons_pair(QR, gamma);
-
-    var out: HLLOut;
-    if (SL >= 0.0) {
-        out.f0 = FL.f0; out.f1 = FL.f1;
-        out.fBt1 = FL.f_bt1; out.fBt2 = FL.f_bt2;
-    } else if (SR <= 0.0) {
-        out.f0 = FR.f0; out.f1 = FR.f1;
-        out.fBt1 = FR.f_bt1; out.fBt2 = FR.f_bt2;
-    } else {
-        let denom = max(SR - SL, 1.0e-12);
-        out.f0 = (SR * FL.f0 - SL * FR.f0 + SL * SR * (CR.U0 - CL.U0)) / denom;
-        out.f1 = (SR * FL.f1 - SL * FR.f1 + SL * SR * (CR.U1 - CL.U1)) / denom;
-        let bt1L = select(QL.by, QL.bx, axis == 1u);
-        let bt1R = select(QR.by, QR.bx, axis == 1u);
-        out.fBt1 = (SR * FL.f_bt1 - SL * FR.f_bt1 + SL * SR * (bt1R - bt1L)) / denom;
-        out.fBt2 = (SR * FL.f_bt2 - SL * FR.f_bt2 + SL * SR * (QR.bz - QL.bz)) / denom;
-    }
-    return out;
-}
 
 struct AxisState {
     rho: f32, un:  f32, ut1: f32, ut2: f32,
@@ -187,12 +161,86 @@ fn pack_flux(F: AxisFlux, axis: u32) -> PackedFlux {
     return P;
 }
 
+// Carries values the HLLD main path has already produced, so the HLL
+// fallback can skip re-running fast_mag_speed / normal_velocity_mhd /
+// mhd_flux. CL/CR (conservative pairs) and the tangential-B components
+// used for the bt1/bt2 averaging are NOT pre-computed in AxisState form
+// — hll_flux_mhd derives them from QL/QR/AL/AR inside, which is cheap
+// compared to the cf / S / F recomputation we're skipping.
+struct HllInputs {
+    QL: MhdPrim,
+    QR: MhdPrim,
+    AL: AxisState,
+    AR: AxisState,
+    FL: AxisFlux,
+    FR: AxisFlux,
+    SL: f32,
+    SR: f32,
+};
+
+fn hll_flux_mhd(in_: HllInputs, axis: u32, gamma: f32) -> HLLOut {
+    let SL = in_.SL;
+    let SR = in_.SR;
+    let FL = in_.FL;
+    let FR = in_.FR;
+
+    var out: HLLOut;
+    if (SL >= 0.0) {
+        let pf = pack_flux(FL, axis);
+        out.f0 = pf.f0; out.f1 = pf.f1;
+        out.fBt1 = pf.fBt1; out.fBt2 = pf.fBt2;
+        return out;
+    }
+    if (SR <= 0.0) {
+        let pf = pack_flux(FR, axis);
+        out.f0 = pf.f0; out.f1 = pf.f1;
+        out.fBt1 = pf.fBt1; out.fBt2 = pf.fBt2;
+        return out;
+    }
+
+    // Conservative pairs — not pre-computed by HLLD's AxisState path.
+    let CL = prim_to_cons_pair(in_.QL, gamma);
+    let CR = prim_to_cons_pair(in_.QR, gamma);
+
+    // Build an AxisFlux for the HLL average, then route through
+    // pack_flux to preserve the axis-dependent packing the call sites
+    // expect. AL.bt1 / AL.bt2 already equal the select(QL.by, QL.bx,
+    // axis==1u) / QL.bz components the old MhdFlux-based code used —
+    // see prim_to_axis_state.
+    let denom = max(SR - SL, 1.0e-12);
+    let inv = 1.0 / denom;
+    let dU0 = CR.U0 - CL.U0;
+    let dU1 = CR.U1 - CL.U1;
+    var Favg: AxisFlux;
+    // CL.U0 = (rho, rho*vx, rho*vy, rho*vz). Map momentum components
+    // back to axis-aligned (un, ut1, ut2):
+    //   axis = 0 (x-sweep): mn = mx (dU0.y), mt1 = my (dU0.z), mt2 = mz (dU0.w)
+    //   axis = 1 (y-sweep): mn = my (dU0.z), mt1 = mx (dU0.y), mt2 = mz (dU0.w)
+    let dMn  = select(dU0.z, dU0.y, axis == 0u);
+    let dMt1 = select(dU0.y, dU0.z, axis == 0u);
+    let dMt2 = dU0.w;
+    Favg.f_rho = (SR * FL.f_rho - SL * FR.f_rho + SL * SR * dU0.x) * inv;
+    Favg.f_mn  = (SR * FL.f_mn  - SL * FR.f_mn  + SL * SR * dMn ) * inv;
+    Favg.f_mt1 = (SR * FL.f_mt1 - SL * FR.f_mt1 + SL * SR * dMt1) * inv;
+    Favg.f_mt2 = (SR * FL.f_mt2 - SL * FR.f_mt2 + SL * SR * dMt2) * inv;
+    Favg.f_E   = (SR * FL.f_E   - SL * FR.f_E   + SL * SR * dU1.x) * inv;
+    // bt1 in AxisState terms is AL.bt1 / AR.bt1 (= select(by, bx, axis==1u)).
+    // bt2 is AL.bt2 / AR.bt2 (= bz on both axes).
+    Favg.f_bt1 = (SR * FL.f_bt1 - SL * FR.f_bt1 + SL * SR * (in_.AR.bt1 - in_.AL.bt1)) * inv;
+    Favg.f_bt2 = (SR * FL.f_bt2 - SL * FR.f_bt2 + SL * SR * (in_.AR.bt2 - in_.AL.bt2)) * inv;
+
+    let pf = pack_flux(Favg, axis);
+    out.f0 = pf.f0; out.f1 = pf.f1;
+    out.fBt1 = pf.fBt1; out.fBt2 = pf.fBt2;
+    return out;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_interior = U_uniforms.grid_n;
     let n_total    = U_uniforms.grid_n_total;
     let ghost      = U_uniforms.ghost_w;
-    let axis       = U_uniforms.sweep_dir;
+    let axis       = sweep.sweep_dir;
     let g          = U_uniforms.gamma;
 
     // Dispatch shape: extended by one row/col on the transverse axis so
@@ -275,7 +323,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Branch B: degenerate wave-speed coincidence → HLL fallback.
     if (SR - SL < HLLD_WS_TOL * (abs(SR) + abs(SL) + 1.0e-12)) {
-        let h = hll_flux_mhd(QL, QR, axis, g);
+        var hin: HllInputs;
+        hin.QL = QL; hin.QR = QR;
+        hin.AL = AL; hin.AR = AR;
+        hin.FL = FL; hin.FR = FR;
+        hin.SL = SL; hin.SR = SR;
+        let h = hll_flux_mhd(hin, axis, g);
         flux_0[dst] = h.f0;
         flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
         return;
@@ -291,16 +344,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Branch C: negative star pressure → HLL fallback.
     if (pT_star <= PRESSURE_FLOOR) {
-        let h = hll_flux_mhd(QL, QR, axis, g);
+        var hin: HllInputs;
+        hin.QL = QL; hin.QR = QR;
+        hin.AL = AL; hin.AR = AR;
+        hin.FL = FL; hin.FR = FR;
+        hin.SL = SL; hin.SR = SR;
+        let h = hll_flux_mhd(hin, axis, g);
         flux_0[dst] = h.f0;
         flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
         return;
     }
 
-    // Branch A: Bx² < ε² · ρ → Alfvén waves degenerate, HLLC.
+    // Branch A: bn² < ε² · ρ_avg · ((SR-SL)/2)² → Alfvén waves degenerate, HLLC.
+    // (SR-SL)/2 stands in for a representative fast-magnetosonic speed;
+    // multiplying by ρ_avg gives the test the same units as bn² (energy
+    // density), so HLLD_BX_EPS2 is dimensionless. See constant comment.
     let bn2 = b_normal * b_normal;
     let rho_scale = max(0.5 * (AL.rho + AR.rho), DENSITY_FLOOR);
-    let branchA = bn2 < HLLD_BX_EPS2 * rho_scale;
+    let half_dS = 0.5 * (SR - SL);
+    let branchA = bn2 < HLLD_BX_EPS2 * rho_scale * half_dS * half_dS;
 
     if (branchA) {
         let denom_L = min(SL - SM, -1.0e-20);

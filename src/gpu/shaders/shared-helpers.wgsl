@@ -71,11 +71,15 @@
 //
 // ── Bind-group layouts (transpiler reads these as nested-loop kernels) ─
 // All compute pipelines use one bind group (group 0) shaped as:
-//   binding 0: uniform Uniforms        (per sweep direction)
+//   binding 0: uniform Uniforms        (single shared physics-state uniform)
 //   binding 1..N: storage buffers      (read-only or read-write)
 // Weighted-update pipelines add an additional uniform StageParams at
 // binding 1. The BC shader uses one extra storage buffer `bc_uniforms`
-// to branch over per-edge modes + driven inflow state.
+// to branch over per-edge modes + driven inflow state. Per-axis sweeps
+// (reconstruct-ppm, riemann-hlld) take an extra uniform SweepDir at the
+// highest binding index — the only field that varies between x and
+// y sweeps. Render-pace LIC parameters (phase, intensity, drift) live
+// in a separate LicUniforms buffer pushed per frame.
 //
 // ── State layout ────────────────────────────────────────────────────
 // Cell-centered conserved state, packed as TWO vec4<f32> arrays per
@@ -88,23 +92,49 @@
 // ── γ & floors ──────────────────────────────────────────────────────
 // γ comes from the Uniforms; pressure & density floors match config.js.
 
+// Main physics-state Uniforms (64 B). Written when a physics parameter
+// changes (preset/eta/cfl/gamma/view_mode/resolution). Slots 5,6,7,14
+// are reserved (previously held LIC fields — now in a separate LicUniforms
+// buffer rewritten per render frame). Slot 11 is reserved (previously
+// held sweep_dir — now in a separate SweepDir buffer pair). Slot 12
+// holds the CFL number (was the unused step_parity slot).
 struct Uniforms {
     dx:            f32,
     gamma:         f32,
     view_min:      f32,
     view_max:      f32,
     eta:           f32,
-    lic_phase:     f32,  // animated noise-sample phase offset (cells)
-    lic_intensity: f32,  // 0 = no LIC modulation, 1 = full strength
-    lic_drift_x:   f32,  // noise drift direction (cells/sec)
+    _pad_lic_0:    f32,  // reserved (was lic_phase — now in LicUniforms)
+    _pad_lic_1:    f32,  // reserved (was lic_intensity — now in LicUniforms)
+    _pad_lic_2:    f32,  // reserved (was lic_drift_x — now in LicUniforms)
     grid_n:        u32,  // INTERIOR grid resolution per axis
     grid_n_total:  u32,  // grid_n + 2*ghost_w (total storage width per axis)
     ghost_w:       u32,  // ghost-cell width per side (= 2 in Phase 4)
-    sweep_dir:     u32,  // 0 = x-sweep / x-face shaders, 1 = y-sweep / y-face shaders
-    step_parity:   u32,  // 0 = even, 1 = odd — informational
+    _pad_sweep:    u32,  // reserved (was sweep_dir — now in SweepDir uniform)
+    cfl:           f32,  // hyperbolic CFL number — consumed by compute-dt
     view_mode:     u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
-    lic_drift_y:   f32,  // noise drift direction y (cells/sec)
+    _pad_lic_3:    f32,  // reserved (was lic_drift_y — now in LicUniforms)
     noise_n:       u32,  // noise-buffer side length (square, default 1024)
+};
+
+// Sweep-direction uniform — 16 B. Two of these (sweepDir_x = 0u,
+// sweepDir_y = 1u) are pre-written at construction; reconstruct-ppm and
+// riemann-hlld are the only shaders that read this.
+struct SweepDir {
+    sweep_dir: u32,    // 0 = x-sweep, 1 = y-sweep
+    _pad0:     u32,
+    _pad1:     u32,
+    _pad2:     u32,
+};
+
+// LIC render-pace parameters — 16 B. Rewritten by the host every render
+// frame (per-frame phase advance + slider-controlled intensity/drift).
+// Bound by lic-advect (compute) and composite (fragment).
+struct LicUniforms {
+    lic_phase:     f32,  // animated noise-sample phase offset (seconds)
+    lic_intensity: f32,  // 0 = no LIC modulation, 1 = full strength (2 = doubled)
+    lic_drift_x:   f32,  // noise drift x (noise-pixels/sec)
+    lic_drift_y:   f32,  // noise drift y (noise-pixels/sec)
 };
 
 // BC modes — match config.js / enum values.
