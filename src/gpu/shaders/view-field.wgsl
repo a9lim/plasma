@@ -1,15 +1,10 @@
 // ─── view-field.wgsl ─────────────────────────────────────────────────
 // Extract a scalar field from MHD state into a flat f32 buffer for
-// downstream colormapping. View mode set via Uniforms.view_mode:
-//   0 = ρ           (default)
-//   1 = p           (gas pressure)
-//   2 = |v|         (kinetic speed magnitude)
-//   3 = |B|         (magnetic field magnitude — uses face averages)
-//   4 = Jz          (out-of-plane current density at cell center)
+// downstream colormapping. View mode set via Uniforms.view_mode.
 //
-// Jz uses central differences on cell-centered B components (each itself
-// the average of the two owning faces). This is well-defined under
-// periodic wrap and lines up with the |B| mode's averaging.
+// Phase 4: reads from ghost-padded buffers; dispatches over interior
+// cells only. The field buffer is sized (N+4)² for indexing compat
+// with cell-centered storage; only interior cells are written.
 //
 // Bindings:
 //   0 uniforms (uniform)
@@ -26,25 +21,28 @@
 @group(0) @binding(4) var<storage, read>       By_face:  array<f32>;
 @group(0) @binding(5) var<storage, read_write> field:    array<f32>;
 
-fn bx_at(ix: u32, iy: u32, n: u32) -> f32 {
-    return 0.5 * (Bx_face[bx_face_left_index(ix, iy, n)] + Bx_face[bx_face_right_index(ix, iy, n)]);
+fn bx_at(ix: u32, iy: u32, n_total: u32) -> f32 {
+    return 0.5 * (Bx_face[bx_face_left_idx(ix, iy, n_total)]
+                + Bx_face[bx_face_right_idx(ix, iy, n_total)]);
 }
-fn by_at(ix: u32, iy: u32, n: u32) -> f32 {
-    return 0.5 * (By_face[by_face_down_index(ix, iy, n)] + By_face[by_face_up_index(ix, iy, n)]);
+fn by_at(ix: u32, iy: u32, n_total: u32) -> f32 {
+    return 0.5 * (By_face[by_face_down_idx(ix, iy, n_total)]
+                + By_face[by_face_up_idx(ix, iy, n_total)]);
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let n = U_uniforms.grid_n;
-    if (gid.x >= n || gid.y >= n) { return; }
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
 
-    let n_i = i32(n);
-    let i   = i32(gid.x);
-    let j   = i32(gid.y);
+    if (gid.x >= n_interior || gid.y >= n_interior) { return; }
+    let ix = gid.x + ghost;
+    let iy = gid.y + ghost;
 
-    let idx_c = cell_index(gid.x, gid.y, n);
-    let bx_c  = bx_at(gid.x, gid.y, n);
-    let by_c  = by_at(gid.x, gid.y, n);
+    let idx_c = cell_idx_total(ix, iy, n_total);
+    let bx_c  = bx_at(ix, iy, n_total);
+    let by_c  = by_at(ix, iy, n_total);
 
     let U0 = U0_in[idx_c];
     let U1 = U1_in[idx_c];
@@ -69,14 +67,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (mode == 3u) {
         v = sqrt(bx_c*bx_c + by_c*by_c + U1.y*U1.y);                  // |B|
     } else {
-        let ix_r = wrap_idx(i + 1, n_i);
-        let ix_l = wrap_idx(i - 1, n_i);
-        let iy_u = wrap_idx(j + 1, n_i);
-        let iy_d = wrap_idx(j - 1, n_i);
-        let by_cR = by_at(ix_r, gid.y, n);
-        let by_cL = by_at(ix_l, gid.y, n);
-        let bx_cU = bx_at(gid.x, iy_u, n);
-        let bx_cD = bx_at(gid.x, iy_d, n);
+        // Jz = ∂By/∂x - ∂Bx/∂y via central differences. Ghost cells
+        // adjacent to interior are filled by apply-bcs, so these
+        // neighbour reads are always in-range.
+        let by_cR = by_at(ix + 1u, iy,      n_total);
+        let by_cL = by_at(ix - 1u, iy,      n_total);
+        let bx_cU = bx_at(ix,      iy + 1u, n_total);
+        let bx_cD = bx_at(ix,      iy - 1u, n_total);
         let dby_dx = (by_cR - by_cL) / (2.0 * U_uniforms.dx);
         let dbx_dy = (bx_cU - bx_cD) / (2.0 * U_uniforms.dx);
         v = dby_dx - dbx_dy;                                           // Jz

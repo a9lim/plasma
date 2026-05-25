@@ -1,51 +1,48 @@
 /**
- * @fileoverview Phase 3b orchestrator — RK3 SSP + HLLD + PPM + CT.
+ * @fileoverview Phase 4 orchestrator — RK3 SSP + HLLD + PPM + CT
+ *                + per-edge BCs + explicit resistivity.
  *
  * RK3 SSP scheme (Gottlieb-Shu 1998):
  *     U(1)   = U(n) + dt · L(U(n))
  *     U(2)   = (3/4)U(n) + (1/4)U(1) + (1/4)dt · L(U(1))
  *     U(n+1) = (1/3)U(n) + (2/3)U(2) + (2/3)dt · L(U(2))
  *
- * Applied in lockstep to:
- *     U_cell        (ρ, ρv, E, Bz)
- *     Bx_face       (face-centered)
- *     By_face       (face-centered)
+ * Per RK3 stage we run, in order:
+ *     1.  apply-bcs               (fill ghost cells from BC modes)
+ *     2.  reconstruct-ppm (x)     (PPM L/R edge states, x-sweep)
+ *     3.  riemann-hlld    (x)
+ *     4.  reconstruct-ppm (y)
+ *     5.  riemann-hlld    (y)
+ *     6.  compute-emf            (CT corner-Ez from face fluxes)
+ *     7.  update-conserved-weighted (cell-centered SSP update)
+ *     8.  update-b-weighted      (face-B SSP update)
+ *     9.  apply-resistivity      (η ∇²B per stage, linear → SSP)
  *
- * dt is computed ONCE at the start of the timestep from U(n)'s state and
- * reused across all three stages — required for SSP. L(U) = -∇·F(U) with
- * F via PPM reconstruction → HLLD Riemann → CT-EMF for the face B field.
+ * The BC fill at the START of each stage refreshes ghost cells from the
+ * CURRENT input state (which differs per stage: U_n / U_1 / U_2). The
+ * resistive step at the END uses ghost cells filled BEFORE the stage,
+ * which is correct because they haven't been overwritten by the stage's
+ * interior writes (only interior indices are touched by the CT and
+ * conserved updates).
+ *
+ * dt is computed ONCE at the start of the step (from U(n)) and reused
+ * across all three stages — required for SSP. We include the parabolic
+ * resistive CFL inside compute-dt (dt_res = 0.5·dx²/η; min'd with dt_hyp).
  *
  * Submit structure (ONE submit per physics step, two compute passes):
- *   pass 1: compute_dt on U(n) (writes dt_buf).
- *   pass 2: all three RK3 stages chained.
+ *   pass 1: compute_dt on U(n).
+ *   pass 2: three RK3 stages chained, each with the 9 sub-steps above.
  *
- * Encoder layout (pass 2):
- *   Stage 1 (input U_n; writes U_1):
- *     PPM_x → HLLD_x → PPM_y → HLLD_y → EMF → update_U(w=1) → update_B(w=1)
- *   Stage 2 (input U_1; writes U_2 with U_n combined in):
- *     PPM_x → HLLD_x → PPM_y → HLLD_y → EMF → update_U(w=3/4,1/4,1/4) → update_B
- *   Stage 3 (input U_2; writes U_next with U_n combined in):
- *     PPM_x → HLLD_x → PPM_y → HLLD_y → EMF → update_U(w=1/3,2/3,2/3) → update_B
- *
- * After submit 2, slot_next holds U(n+1). buffers.swap() flips the
- * (slot_n, slot_next) handles so render and the next step's compute_dt
- * see the new state. We need 4 storage slots (A/B for n/n+1 ping-pong,
- * C/D for stage 1/2 scratch) because stage 3's update reads U_n as RO
- * while writing U_out as RW — WebGPU forbids aliasing those.
- *
- * Bind-group rebuild: rebuilt at the start of each step (cheap; <50µs
- * each) because the per-stage "input" slot for L(U) shifts (n→1→2).
- *
- * Single-submit guarantee: writeBuffer for the per-stage parameters is
- * skipped entirely — stage_1/2/3 uniform buffers are pre-populated at
- * init. sweep_dir lives in two separate uniform buffers (uniform_x,
- * uniform_y) also pre-populated. Only dt_buf changes during the encoder,
- * and it's written GPU-side by compute_dt.
- *
- * Transpiler-friendly notes: every dispatch is a straight nested loop
- * over (i,j) cells with no shared-memory dependencies inside the
- * workgroup beyond the standard workgroup-barrier pattern used in
- * compute_dt's reduce.
+ * Dispatch shapes (interior grid N×N, ghost = 2, n_total = N+4):
+ *   apply-bcs:          (n_total+1) × (n_total+1)        — covers Bx/By extra row/col
+ *   reconstruct-ppm:    (N+2) × (N+2)                    — extended dispatch
+ *   riemann-hlld (x):   (N+1) × (N+2)
+ *   riemann-hlld (y):   (N+2) × (N+1)
+ *   compute-emf:        (N+1) × (N+1)
+ *   update-conserved:   N × N
+ *   update-b:           (N+1) × (N+1)                    — covers Bx/By interior
+ *   apply-resistivity:  (n_total+1) × (n_total+1)        — covers all face axes
+ *   compute-dt reduce:  N × N                            — interior only
  */
 
 import { PlasmaBuffers } from './gpu/buffers.js';
@@ -53,7 +50,10 @@ import { createPipelines } from './gpu/pipelines.js';
 import { PlasmaRenderer } from './gpu/render.js';
 import { makeOrszagTangPreset } from './presets.js';
 import { VIRIDIS } from './colormaps.js';
-import { GRID_N, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP, VIEW_DENSITY } from './config.js';
+import {
+    GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP,
+    VIEW_DENSITY, ETA_DEFAULT, BC_PERIODIC,
+} from './config.js';
 
 const WG = WORKGROUP;
 
@@ -63,18 +63,28 @@ export class Sim {
         this.context = context;
         this.format  = format;
 
-        this.n  = GRID_N;
-        this.dx = DOMAIN_LENGTH / this.n;
-        this.gamma   = GAMMA_DEFAULT;
-        this.viewMin = 0.05;
-        this.viewMax = 1.10;
+        this.n        = GRID_N;
+        this.ghost    = GHOST_WIDTH;
+        this.n_total  = this.n + 2 * this.ghost;
+        this.dx       = DOMAIN_LENGTH / this.n;
+        this.gamma    = GAMMA_DEFAULT;
+        this.viewMin  = 0.05;
+        this.viewMax  = 1.10;
         this.viewMode = VIEW_DENSITY;
+        this.eta      = ETA_DEFAULT;
 
         this.stepCount = 0;
 
         this.buffers   = null;
         this.pipelines = null;
         this.renderer  = null;
+
+        // Default BC state: all periodic, neutral driven state.
+        this.bcConfig = {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+            driven: { rho: 1, vx: 0, vy: 0, vz: 0, bx: 0, by: 0, bz: 0, p: 1 },
+        };
     }
 
     async init() {
@@ -82,7 +92,8 @@ export class Sim {
         this.buffers   = new PlasmaBuffers(this.device, this.n);
         this.renderer  = new PlasmaRenderer(this.device, this.context, this.pipelines, this.buffers);
 
-        // Phase 3b default preset: Orszag-Tang vortex (the canonical 2D MHD test).
+        // Phase 4 default preset still Orszag-Tang for smoke check;
+        // Phase 5 wires the dropdown for Harris/etc.
         this.loadPreset(makeOrszagTangPreset(this.n));
         this.buffers.uploadLUT(VIRIDIS);
 
@@ -90,16 +101,22 @@ export class Sim {
         this.device.queue.writeBuffer(this.buffers.dt, 0, seed.buffer);
 
         this._pushUniforms();
+        this.buffers.pushBC(this.bcConfig);
     }
 
     loadPreset(preset) {
         this.gamma   = preset.gamma   ?? this.gamma;
         this.viewMin = preset.viewMin ?? this.viewMin;
         this.viewMax = preset.viewMax ?? this.viewMax;
+        this.eta     = preset.eta     ?? this.eta;
         if (preset.domainLength) this.dx = preset.domainLength / this.n;
+        if (preset.bc) {
+            this.bcConfig = { ...this.bcConfig, ...preset.bc };
+        }
         this.buffers.uploadInitialState(preset.data);
         this.stepCount = 0;
         this._pushUniforms();
+        this.buffers.pushBC(this.bcConfig);
     }
 
     _pushUniforms() {
@@ -111,12 +128,11 @@ export class Sim {
             gridN: this.n,
             stepParity: this.stepCount & 1,
             viewMode: this.viewMode,
+            eta: this.eta,
         });
     }
 
     // ── Bind-group builders ─────────────────────────────────────────
-    // All bind groups are rebuilt per step. WebGPU bind-group creation
-    // is cheap (< 50 µs each on a typical adapter).
 
     _dtBG() {
         const b = this.buffers;
@@ -135,10 +151,38 @@ export class Sim {
         });
     }
 
-    /**
-     * Build a PPM-reconstruction bind group for sweep direction `axis`,
-     * reading from the given (U0, U1, Bx, By) slot.
-     */
+    _applyBcsBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyBcs.bg',
+            layout: this.pipelines.layouts.applyBcs,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform_x } },
+                { binding: 1, resource: { buffer: b.bc_uniforms } },
+                { binding: 2, resource: { buffer: U0 } },
+                { binding: 3, resource: { buffer: U1 } },
+                { binding: 4, resource: { buffer: Bx } },
+                { binding: 5, resource: { buffer: By } },
+            ],
+        });
+    }
+
+    _applyResBG(stageBuf, Bx, By, U1_out) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyRes.bg',
+            layout: this.pipelines.layouts.applyRes,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform_x } },
+                { binding: 1, resource: { buffer: stageBuf } },
+                { binding: 2, resource: { buffer: Bx } },
+                { binding: 3, resource: { buffer: By } },
+                { binding: 4, resource: { buffer: U1_out } },
+                { binding: 5, resource: { buffer: b.dt } },
+            ],
+        });
+    }
+
     _reconstructBG(axis, U0, U1, Bx, By) {
         const b = this.buffers;
         const uniBuf = (axis === 0) ? b.uniform_x : b.uniform_y;
@@ -205,13 +249,6 @@ export class Sim {
         });
     }
 
-    /**
-     * Build the weighted-update bind group for a stage.
-     *   stageBuf  : uniform buffer with (a0, a1, dt_w, _)
-     *   U0_other  : second source state for the linear combination
-     *   U1_other  : .
-     *   U0_out, U1_out : destination
-     */
     _updateUBG(stageBuf, U0_other, U1_other, U0_out, U1_out) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -255,16 +292,9 @@ export class Sim {
         });
     }
 
-    /**
-     * Encode the dt computation into an open compute pass. compute_dt is
-     * a separate pass (vs. inline in the RK3 pass) because dtReset uses
-     * @workgroup_size(1) which differs from the 8×8 used by the RK3
-     * substages — but more importantly, this keeps the wavespeed atomic
-     * isolated from the rest of the pipeline state.
-     */
     _encodeComputeDt(encoder) {
         const { pipelines } = this;
-        const groups = Math.ceil(this.n / WG);
+        const groupsInterior = Math.ceil(this.n / WG);
         const bg = this._dtBG();
 
         const pass = encoder.beginComputePass({ label: 'plasma.computeDt' });
@@ -272,121 +302,125 @@ export class Sim {
         pass.setPipeline(pipelines.pipelines.dtReset);
         pass.dispatchWorkgroups(1, 1, 1);
         pass.setPipeline(pipelines.pipelines.dtReduce);
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(groupsInterior, groupsInterior, 1);
         pass.setPipeline(pipelines.pipelines.dtFinalize);
         pass.dispatchWorkgroups(1, 1, 1);
         pass.end();
     }
 
     /**
-     * Encode one RK3 stage: PPM_x → HLLD_x → PPM_y → HLLD_y → EMF
-     *                       → update_U → update_B
-     *
-     * @param pass       open compute pass to append into
-     * @param srcU0      U0 source for L(U) eval
-     * @param srcU1      U1 source for L(U) eval
-     * @param srcBx      Bx source for L(U) eval (also used in update for n-stage's a0 weight via stageBuf)
-     * @param srcBy      By source for L(U) eval
-     * @param otherU0    U0 "other" buffer for the linear combination
-     * @param otherU1    U1 "other" buffer
-     * @param otherBx    Bx "other" buffer
-     * @param otherBy    By "other" buffer
-     * @param dstU0      destination
-     * @param dstU1      destination
-     * @param dstBx      destination
-     * @param dstBy      destination
-     * @param stageBuf   stage_params uniform buffer (a0, a1, dt_w, _)
+     * Encode one RK3 stage. The stage's source-state slot (srcU0/...) is
+     * where apply-bcs writes ghosts; reconstruct-ppm + Riemann read from
+     * the same slot; update writes to dstU0/.../dstBy. After the CT
+     * update, apply-resistivity adds η∇²B in-place on the destination
+     * face/cell buffers.
      */
     _encodeStage(pass, srcU0, srcU1, srcBx, srcBy,
                  otherU0, otherU1, otherBx, otherBy,
                  dstU0, dstU1, dstBx, dstBy, stageBuf) {
         const { pipelines } = this;
-        const groups = Math.ceil(this.n / WG);
+        const N         = this.n;
+        const N2        = N + 2;
+        const N1        = N + 1;
+        const Ntotal    = this.n_total;
+        const gInterior = Math.ceil(N / WG);
+        const gN1       = Math.ceil(N1 / WG);
+        const gN2       = Math.ceil(N2 / WG);
+        const gTotalP1  = Math.ceil((Ntotal + 1) / WG);
 
-        // x-sweep: reconstruct + Riemann
+        // 1. apply-bcs (fills ghosts in srcU0/srcU1/srcBx/srcBy).
+        pass.setPipeline(pipelines.pipelines.applyBcs);
+        pass.setBindGroup(0, this._applyBcsBG(srcU0, srcU1, srcBx, srcBy));
+        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+
+        // 2-5. PPM + Riemann, both axes.
         pass.setPipeline(pipelines.pipelines.reconstructPpm);
         pass.setBindGroup(0, this._reconstructBG(0, srcU0, srcU1, srcBx, srcBy));
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(gN2, gN2, 1);
 
         pass.setPipeline(pipelines.pipelines.riemannHlld);
         pass.setBindGroup(0, this._riemannBG(0, srcU0, srcU1, srcBx, srcBy));
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(gN1, gN2, 1);   // (N+1) × (N+2) for x-sweep
 
-        // y-sweep: reconstruct + Riemann
         pass.setPipeline(pipelines.pipelines.reconstructPpm);
         pass.setBindGroup(0, this._reconstructBG(1, srcU0, srcU1, srcBx, srcBy));
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(gN2, gN2, 1);
 
         pass.setPipeline(pipelines.pipelines.riemannHlld);
         pass.setBindGroup(0, this._riemannBG(1, srcU0, srcU1, srcBx, srcBy));
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(gN2, gN1, 1);   // (N+2) × (N+1) for y-sweep
 
-        // CT EMF at corners from x/y face fluxes
+        // 6. CT EMF at corners.
         pass.setPipeline(pipelines.pipelines.computeEmf);
         pass.setBindGroup(0, this._emfBG());
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(gN1, gN1, 1);   // (N+1)²
 
-        // Weighted update for cell-centered state
+        // 7. Weighted update for cell-centered state — interior only.
         pass.setPipeline(pipelines.pipelines.updateConservedWeighted);
         pass.setBindGroup(0, this._updateUBG(stageBuf, otherU0, otherU1, dstU0, dstU1));
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
 
-        // Weighted update for face-centered B
+        // 8. Weighted update for face-centered B — covers (N+1)² combined.
         pass.setPipeline(pipelines.pipelines.updateBWeighted);
         pass.setBindGroup(0, this._updateBBG(stageBuf, otherBx, otherBy, dstBx, dstBy));
-        pass.dispatchWorkgroups(groups, groups, 1);
+        pass.dispatchWorkgroups(gN1, gN1, 1);
+
+        // 9a. Re-fill ghost cells on the DESTINATION buffer so the
+        // resistive Laplacian stencil sees BC-consistent values. The
+        // update-conserved/update-b kernels only wrote interior cells/
+        // faces; without this refill, the dst-buffer ghosts would carry
+        // stale data from previous steps (the buffer ping-pongs).
+        pass.setPipeline(pipelines.pipelines.applyBcs);
+        pass.setBindGroup(0, this._applyBcsBG(dstU0, dstU1, dstBx, dstBy));
+        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+
+        // 9b. Resistivity (η ∇²B) — adds in-place to dstBx, dstBy, and
+        // the Bz component of dstU1. Reads neighbours from the same
+        // buffers; within a single dispatch, neighbour reads return
+        // pre-write values (WebGPU has no cross-invocation memory
+        // ordering inside a dispatch), which gives the correct
+        // explicit-Euler diffusion semantics.
+        pass.setPipeline(pipelines.pipelines.applyResistivity);
+        pass.setBindGroup(0, this._applyResBG(stageBuf, dstBx, dstBy, dstU1));
+        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
     }
 
-    /**
-     * One physics step — single submit:
-     *   pass 1: compute_dt (reads U_n, writes dt_buf).
-     *   pass 2: three RK3 SSP stages chained.
-     *
-     * Storage-buffer writes from earlier passes in the same encoder are
-     * visible to later passes by WebGPU's implicit barriers — so dt_buf
-     * written by compute_dt is readable by stage 1's update kernels.
-     */
     step() {
         const { device } = this;
         const b = this.buffers;
 
         const encoder = device.createCommandEncoder({ label: 'plasma.step.enc' });
 
-        // Pass 1: compute the timestep from U(n).
+        // Pass 1: compute dt from U(n).
         this._encodeComputeDt(encoder);
 
         // Pass 2: three RK3 SSP stages.
         const pass = encoder.beginComputePass({ label: 'plasma.rk3' });
 
         // Stage 1: U(1) = U(n) + dt · L(U(n))
-        // Weights: a0=1, a1=0, dt_w=1. otherU = U_n itself (a1=0 so unused).
         this._encodeStage(pass,
-            b.U0_n, b.U1_n, b.Bx_n, b.By_n,           // source for L(U)
-            b.U0_n, b.U1_n, b.Bx_n, b.By_n,           // "other" — unused since a1=0
-            b.U0_1, b.U1_1, b.Bx_1, b.By_1,           // destination
+            b.U0_n, b.U1_n, b.Bx_n, b.By_n,
+            b.U0_n, b.U1_n, b.Bx_n, b.By_n,
+            b.U0_1, b.U1_1, b.Bx_1, b.By_1,
             b.stage_1);
 
         // Stage 2: U(2) = 3/4 U(n) + 1/4 U(1) + 1/4 dt · L(U(1))
         this._encodeStage(pass,
-            b.U0_1, b.U1_1, b.Bx_1, b.By_1,           // source for L(U)
-            b.U0_1, b.U1_1, b.Bx_1, b.By_1,           // "other" = U(1)
-            b.U0_2, b.U1_2, b.Bx_2, b.By_2,           // destination
+            b.U0_1, b.U1_1, b.Bx_1, b.By_1,
+            b.U0_1, b.U1_1, b.Bx_1, b.By_1,
+            b.U0_2, b.U1_2, b.Bx_2, b.By_2,
             b.stage_2);
 
         // Stage 3: U(n+1) = 1/3 U(n) + 2/3 U(2) + 2/3 dt · L(U(2))
-        // Destination MUST be a distinct buffer from slot_n (the shader
-        // reads U_n as RO and writes U_out as RW; WebGPU forbids aliasing
-        // those in one bind group). We write to slot_next and swap.
         this._encodeStage(pass,
-            b.U0_2,    b.U1_2,    b.Bx_2,    b.By_2,        // source for L(U)
-            b.U0_2,    b.U1_2,    b.Bx_2,    b.By_2,        // "other" = U(2)
-            b.U0_next, b.U1_next, b.Bx_next, b.By_next,     // destination — slot next
+            b.U0_2,    b.U1_2,    b.Bx_2,    b.By_2,
+            b.U0_2,    b.U1_2,    b.Bx_2,    b.By_2,
+            b.U0_next, b.U1_next, b.Bx_next, b.By_next,
             b.stage_3);
 
         pass.end();
         device.queue.submit([encoder.finish()]);
 
-        // Promote slot_next to slot_n for the next step.
         b.swap();
         this.stepCount += 1;
     }

@@ -1,11 +1,15 @@
 /**
- * @fileoverview Compute / render pipeline factory (Phase 3b).
+ * @fileoverview Compute / render pipeline factory (Phase 4).
  *
- * Phase 3b swaps:
- *   reconstruct-plm.wgsl   → reconstruct-ppm.wgsl   (8 edge buffers, not 4 slope)
- *   riemann-hll.wgsl       → riemann-hlld.wgsl     (reads l/r edge states)
- *   update-conserved.wgsl  → update-conserved-weighted.wgsl  (+stage_params)
- *   update-b.wgsl          → update-b-weighted.wgsl          (+stage_params)
+ * Phase 4 additions:
+ *   apply-bcs.wgsl        — ghost-cell fill (one shader, 4 modes × 4 edges)
+ *   apply-resistivity.wgsl — η ∇²B per RK3 stage after CT update
+ *
+ * Phase 4 changes vs Phase 3b:
+ *   - Uniforms struct extended (eta, grid_n_total, ghost_w) — handled
+ *     transparently in buffers.js.
+ *   - Riemann/PPM dispatch ranges no longer mirror grid_n exactly;
+ *     sim.js owns the dispatch counts.
  *
  * Bind-group layouts kept vanilla for the upcoming WebGPU→CPU transpiler
  * contract:
@@ -18,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 4;
+const SHADER_VERSION = 5;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -137,6 +141,30 @@ function updateBWeightedBGL(device) {
     ]);
 }
 
+// New in Phase 4. Ghost-cell fill kernel.
+function applyBcsBGL(device) {
+    return bgl(device, 'plasma.applyBcs.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },   // bc_uniforms (storage)
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },   // U0
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },   // U1
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },   // Bx_face
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },   // By_face
+    ]);
+}
+
+// New in Phase 4. Explicit resistive diffusion.
+function applyResistivityBGL(device) {
+    return bgl(device, 'plasma.applyResistivity.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: UNIFORM },   // stage_params
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },    // Bx_face
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },    // By_face
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },    // U1_out (Bz lives in .y)
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },    // dt_buf
+    ]);
+}
+
 function viewBGL(device) {
     return bgl(device, 'plasma.viewField.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
@@ -167,6 +195,7 @@ function compositeBGL(device) {
 export async function createPipelines(device, format) {
     const [
         ppmModule, hlldModule, emfModule, updateUWModule, updateBWModule,
+        applyBcsModule, applyResistivityModule,
         dtModule, viewModule, colormapModule, compositeModule,
     ] = await Promise.all([
         makeModule(device, 'plasma.reconstruct-ppm',          'reconstruct-ppm.wgsl'),
@@ -174,6 +203,8 @@ export async function createPipelines(device, format) {
         makeModule(device, 'plasma.compute-emf',              'compute-emf.wgsl'),
         makeModule(device, 'plasma.update-conserved-weighted', 'update-conserved-weighted.wgsl'),
         makeModule(device, 'plasma.update-b-weighted',         'update-b-weighted.wgsl'),
+        makeModule(device, 'plasma.apply-bcs',                 'apply-bcs.wgsl'),
+        makeModule(device, 'plasma.apply-resistivity',         'apply-resistivity.wgsl'),
         makeModule(device, 'plasma.compute-dt',               'compute-dt.wgsl'),
         makeModule(device, 'plasma.view-field',               'view-field.wgsl'),
         makeModule(device, 'plasma.colormap',                 'colormap.wgsl'),
@@ -185,6 +216,8 @@ export async function createPipelines(device, format) {
     const emfLayout         = emfBGL(device);
     const updateULayout     = updateConservedWeightedBGL(device);
     const updateBLayout     = updateBWeightedBGL(device);
+    const applyBcsLayout    = applyBcsBGL(device);
+    const applyResLayout    = applyResistivityBGL(device);
     const dtLayout          = dtBGL(device);
     const viewLayout        = viewBGL(device);
     const colormapLayout    = colormapBGL(device);
@@ -216,6 +249,16 @@ export async function createPipelines(device, format) {
         label: 'plasma.update-b-weighted',
         layout: mkPipeLayout(updateBLayout),
         compute: { module: updateBWModule, entryPoint: 'main' },
+    });
+    const applyBcs = device.createComputePipeline({
+        label: 'plasma.apply-bcs',
+        layout: mkPipeLayout(applyBcsLayout),
+        compute: { module: applyBcsModule, entryPoint: 'main' },
+    });
+    const applyResistivity = device.createComputePipeline({
+        label: 'plasma.apply-resistivity',
+        layout: mkPipeLayout(applyResLayout),
+        compute: { module: applyResistivityModule, entryPoint: 'main' },
     });
 
     const dtPipeLayout = mkPipeLayout(dtLayout);
@@ -262,6 +305,8 @@ export async function createPipelines(device, format) {
             emf:         emfLayout,
             updateU:     updateULayout,
             updateB:     updateBLayout,
+            applyBcs:    applyBcsLayout,
+            applyRes:    applyResLayout,
             dt:          dtLayout,
             view:        viewLayout,
             colormap:    colormapLayout,
@@ -270,6 +315,7 @@ export async function createPipelines(device, format) {
         pipelines: {
             reconstructPpm, riemannHlld, computeEmf,
             updateConservedWeighted, updateBWeighted,
+            applyBcs, applyResistivity,
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite,
         },

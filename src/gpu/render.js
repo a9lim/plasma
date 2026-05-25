@@ -77,12 +77,15 @@ export class PlasmaRenderer {
      */
     render() {
         const { device, pipelines } = this;
+        // Both view-field and colormap dispatch over interior cells only.
+        // Buffers are ghost-padded; the shaders take ghost-w and grid_n
+        // from the uniform struct and write at the correct interior
+        // offsets.
         const n = this.buffers.n;
         const groups = Math.ceil(n / WG);
 
         const encoder = device.createCommandEncoder({ label: 'plasma.render' });
 
-        // 1+2: view-field then colormap. Both run grid-sized compute.
         {
             const pass = encoder.beginComputePass({ label: 'plasma.render.compute' });
             pass.setPipeline(pipelines.pipelines.viewField);

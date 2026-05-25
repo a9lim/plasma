@@ -3,17 +3,30 @@
 // via constrained transport.
 //
 //   Bx_out[i,j] = a0·Bx_n[i,j] + a1·Bx_other[i,j]
-//               - dt_w·(dt/dy)·(Ez[i,j] - Ez[i,j-1])
+//               - dt_w·(dt/dy)·(Ez[i, j+1] - Ez[i, j])
 //   By_out[i,j] = a0·By_n[i,j] + a1·By_other[i,j]
-//               + dt_w·(dt/dx)·(Ez[i,j] - Ez[i-1,j])
+//               + dt_w·(dt/dx)·(Ez[i+1, j] - Ez[i, j])
 //
-// Ez is the edge-EMF computed from the fluxes of U_other (matching the
-// L(U_other) operator that drives U_cell). Weights identical to
-// update-conserved-weighted.
+// Ez is the edge-EMF at corners (LEFT/DOWN face owner convention):
+//   Ez_edge[i, j] sits at the BOTTOM-LEFT corner of cell (i, j).
+//   So x-face Bx_face[i, j] (left face of cell (i, j)) has its bottom
+//   corner at Ez_edge[i, j] and top corner at Ez_edge[i, j+1].
+//   Similarly y-face By_face[i, j] has left corner at Ez_edge[i, j] and
+//   right corner at Ez_edge[i+1, j].
+//
+// Dispatch ranges (per axis):
+//   Bx_face interior faces:  ix ∈ [ghost, ghost+N+1), iy ∈ [ghost, ghost+N)
+//                            — N+1 cols × N rows
+//   By_face interior faces:  ix ∈ [ghost, ghost+N),  iy ∈ [ghost, ghost+N+1)
+//                            — N cols × N+1 rows
+//
+// The two dispatches use different extents per axis. We compress into
+// one kernel by dispatching over (N+1)×(N+1) and branching on which face
+// axis the index is valid for; this matches the apply-bcs.wgsl pattern.
 //
 // Bindings:
 //   0 uniforms       (uniform)
-//   1 stage_params   (uniform) — (a0, a1, dt_w, _)
+//   1 stage_params   (uniform)
 //   2 Bx_n           (ro)
 //   3 By_n           (ro)
 //   4 Bx_other       (ro)
@@ -43,30 +56,39 @@ struct StageParamsB {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let n = U_uniforms.grid_n;
-    if (gid.x >= n || gid.y >= n) { return; }
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
+    let dx         = U_uniforms.dx;
+    let dt         = dt_buf[0];
+    let coef       = stage_params.dt_w * dt / dx;
 
-    let n_i = i32(n);
-    let i   = i32(gid.x);
-    let j   = i32(gid.y);
-    let dx  = U_uniforms.dx;
-    let dt  = dt_buf[0];
+    let ix = gid.x;
+    let iy = gid.y;
 
-    let idx_c    = cell_index(gid.x, gid.y, n);
-    let idx_lftj = cell_index_wrapped(i - 1, j,     n_i);
-    let idx_dwni = cell_index_wrapped(i,     j - 1, n_i);
+    // ── Bx_face interior x-faces: ix ∈ [ghost, ghost+N+1), iy ∈ [ghost, ghost+N) ──
+    if (ix < n_interior + 1u && iy < n_interior) {
+        let bix = ix + ghost;
+        let biy = iy + ghost;
+        let dst = bx_face_idx(bix, biy, n_total);
+        let ez_top = Ez_edge[ez_edge_idx(bix, biy + 1u, n_total)];
+        let ez_bot = Ez_edge[ez_edge_idx(bix, biy,      n_total)];
+        Bx_out[dst] =
+            stage_params.a0 * Bx_n[dst]
+          + stage_params.a1 * Bx_other[dst]
+          - coef * (ez_top - ez_bot);
+    }
 
-    let ez_here = Ez_edge[idx_c];
-    let ez_left = Ez_edge[idx_lftj];
-    let ez_down = Ez_edge[idx_dwni];
-
-    let coef = stage_params.dt_w * dt / dx;
-    Bx_out[idx_c] =
-        stage_params.a0 * Bx_n[idx_c]
-      + stage_params.a1 * Bx_other[idx_c]
-      - coef * (ez_here - ez_down);
-    By_out[idx_c] =
-        stage_params.a0 * By_n[idx_c]
-      + stage_params.a1 * By_other[idx_c]
-      + coef * (ez_here - ez_left);
+    // ── By_face interior y-faces: ix ∈ [ghost, ghost+N), iy ∈ [ghost, ghost+N+1) ──
+    if (ix < n_interior && iy < n_interior + 1u) {
+        let bix = ix + ghost;
+        let biy = iy + ghost;
+        let dst = by_face_idx(bix, biy, n_total);
+        let ez_rgt = Ez_edge[ez_edge_idx(bix + 1u, biy, n_total)];
+        let ez_lft = Ez_edge[ez_edge_idx(bix,      biy, n_total)];
+        By_out[dst] =
+            stage_params.a0 * By_n[dst]
+          + stage_params.a1 * By_other[dst]
+          + coef * (ez_rgt - ez_lft);
+    }
 }

@@ -1,13 +1,14 @@
 // ─── compute-dt.wgsl ─────────────────────────────────────────────────
-// Three entry points (reset / reduce / finalize), unchanged in shape
-// from Phase 2.  The per-cell signal speed estimate now uses the fast
-// magnetosonic speed instead of pure sound speed:
+// Three entry points (reset / reduce / finalize). Per-cell signal speed
+// uses the fast magnetosonic speed (hyperbolic CFL). Phase 4 also folds
+// in the resistive parabolic CFL:
 //
-//   per direction: |v_dir| + c_fast_dir
-//   reduce to max over both directions across the grid
+//   dt_hyp  = CFL · dx / max(|v|+c_fast)
+//   dt_res  = 0.5 · dx² / η                              (η > 0)
+//   dt      = min(dt_hyp, dt_res), clamped to [DT_MIN, DT_MAX]
 //
-// c_fast for the x-direction uses Bx² in the Alfvén term; for the y-
-// direction it uses By². We take the larger of the two.
+// If η == 0, the resistive contribution is treated as infinite (no
+// limit). Reduce dispatches over interior cells only.
 //
 // Bindings:
 //   0 uniforms   (uniform)
@@ -45,11 +46,18 @@ fn reduce(
     if (lid == 0u) { atomicStore(&tile_max, 0u); }
     workgroupBarrier();
 
-    let n = U_uniforms.grid_n;
-    if (gid.x < n && gid.y < n) {
-        let bx = 0.5 * (Bx_face[bx_face_left_index(gid.x, gid.y, n)] + Bx_face[bx_face_right_index(gid.x, gid.y, n)]);
-        let by = 0.5 * (By_face[by_face_down_index(gid.x, gid.y, n)] + By_face[by_face_up_index(gid.x, gid.y, n)]);
-        let idx = cell_index(gid.x, gid.y, n);
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
+
+    if (gid.x < n_interior && gid.y < n_interior) {
+        let ix = gid.x + ghost;
+        let iy = gid.y + ghost;
+        let bx = 0.5 * (Bx_face[bx_face_left_idx(ix, iy, n_total)]
+                      + Bx_face[bx_face_right_idx(ix, iy, n_total)]);
+        let by = 0.5 * (By_face[by_face_down_idx(ix, iy, n_total)]
+                      + By_face[by_face_up_idx(ix, iy, n_total)]);
+        let idx = cell_idx_total(ix, iy, n_total);
         let P  = cons_to_prim_mhd(U0_in[idx], U1_in[idx], bx, by, U_uniforms.gamma);
         let cfx = fast_mag_speed(P, U_uniforms.gamma, 0u);
         let cfy = fast_mag_speed(P, U_uniforms.gamma, 1u);
@@ -70,7 +78,16 @@ fn reduce(
 fn finalize() {
     let s_bits = atomicLoad(&wavespeed);
     let s = max(bitcast<f32>(s_bits), 1.0e-12);
-    var dt = CFL_NUMBER * U_uniforms.dx / s;
+    let dx = U_uniforms.dx;
+    let eta = U_uniforms.eta;
+    var dt_hyp = CFL_NUMBER * dx / s;
+    var dt_res: f32;
+    if (eta > 0.0) {
+        dt_res = 0.5 * dx * dx / eta;
+    } else {
+        dt_res = 1.0e30;   // effectively infinite
+    }
+    var dt = min(dt_hyp, dt_res);
     dt = clamp(dt, DT_MIN, DT_MAX);
     dt_buf[0] = dt;
 }

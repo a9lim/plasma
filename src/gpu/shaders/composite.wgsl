@@ -1,12 +1,11 @@
 // ─── composite.wgsl ──────────────────────────────────────────────────
 // Render the colored buffer to the canvas. Fullscreen triangle, no
-// vertex buffers. Each pixel samples the cell whose normalized UV
-// contains it (nearest-neighbor at low resolution preserves the grid
-// texture). LIC composition lives in Phase 6.
+// vertex buffers. Each pixel samples the interior cell whose normalized
+// UV contains it; ghost cells are NOT shown.
 //
-// Canvas format is non-sRGB (preferred format from the WebGPU spec is
-// rgba8unorm / bgra8unorm), so we already-gamma-encoded sRGB values
-// pass through unchanged.
+// Phase 4: colored is sized (N_total)², with valid data only at
+// interior indices [ghost, ghost+N) per axis. Fragment shader maps UV
+// ∈ [0, 1] to interior cells via (ghost + floor(uv·N_interior)).
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -22,18 +21,18 @@ fn vsMain(@builtin(vertex_index) vid: u32) -> VertexOutput {
     let x = f32(i32(vid & 1u)) * 4.0 - 1.0;
     let y = f32(i32(vid >> 1u)) * 4.0 - 1.0;
     out.pos = vec4<f32>(x, y, 0.0, 1.0);
-    // UV in [0,1]; the Y-flip aligns "grid row 0 at bottom of screen"
-    // with the conventional simulation orientation (origin lower-left).
     out.uv = vec2<f32>(0.5 * (x + 1.0), 0.5 * (y + 1.0));
     return out;
 }
 
 @fragment
 fn fsMain(in: VertexOutput) -> @location(0) vec4<f32> {
-    let n = U_uniforms.grid_n;
-    let nf = f32(n);
-    let ix = u32(clamp(floor(in.uv.x * nf), 0.0, nf - 1.0));
-    let iy = u32(clamp(floor(in.uv.y * nf), 0.0, nf - 1.0));
-    let idx = cell_index(ix, iy, n);
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
+    let nf = f32(n_interior);
+    let ix_int = u32(clamp(floor(in.uv.x * nf), 0.0, nf - 1.0));
+    let iy_int = u32(clamp(floor(in.uv.y * nf), 0.0, nf - 1.0));
+    let idx = cell_idx_total(ix_int + ghost, iy_int + ghost, n_total);
     return colored[idx];
 }

@@ -11,22 +11,22 @@
 // Star-state intermediate states (M&K 2005 eqs 38-67), with B_n constant
 // across all waves (continuous face-normal B).
 //
-// Degenerate-branch handling (per Phase 3a agent's pre-flight):
-//   Branch A — Bx² < ε² · ρ   → Alfvén waves degenerate; fall back to HLLC
-//                              (3-wave: SL, SM, SR; transverse B advected
-//                              with average velocity, M&K eqs 51 reduced).
-//   Branch B — wave-speed coincidence (rare; |S* - S| < tol)
-//                              → fall back to HLL (no star states).
-//   Branch C — star-state pressure < PRESSURE_FLOOR
-//                              → pressure-floor + fall back to HLL.
+// Phase 4: drops wrap_idx in favour of direct indexing into ghost-padded
+// buffers. Each invocation writes the flux at the LEFT face of cell
+// (ix, iy) — index `bx_face_idx(ix, iy)` for x-sweep, `by_face_idx(ix, iy)`
+// for y-sweep — using QL from the right edge of cell (ix-1, iy) and QR
+// from the left edge of cell (ix, iy). The flux buffer itself is sized
+// (n_total × n_total) like the cell-centered arrays; we just don't write
+// the last column / row for the relevant sweep.
 //
-// Reads PPM-reconstructed L/R face primitive states from edge_r_*[i-1]
-// (for QL) and edge_l_*[i] (for QR). The face is owned by cell (i-1)
-// on its right side; this kernel computes the flux through that face.
+// Dispatch range (sweep_dir == 0):
+//   ix ∈ [ghost, ghost + n_interior + 1)   — N+1 x-faces per row
+//   iy ∈ [ghost, ghost + n_interior)       — N rows
+// Dispatch range (sweep_dir == 1):
+//   ix ∈ [ghost, ghost + n_interior)       — N cols
+//   iy ∈ [ghost, ghost + n_interior + 1)   — N+1 y-faces per col
 //
-// Convention: kernel cell (i,j) computes flux at face (i+½, j) for
-// x-sweep (axis=0), face (i, j+½) for y-sweep (axis=1) — same as
-// Phase 3a's HLL.
+// Degenerate-branch handling unchanged from Phase 3b.
 //
 // Bindings:
 //   0 uniforms (uniform)
@@ -53,15 +53,9 @@
 @group(0) @binding(9) var<storage, read_write> flux_0:    array<vec4<f32>>;
 @group(0) @binding(10) var<storage, read_write> flux_1:   array<vec4<f32>>;
 
-// Branch-A threshold: ε² used to declare Bx ≈ 0.
 const HLLD_BX_EPS2: f32 = 1.0e-24;
-// Branch-B tolerance: relative wave-speed coincidence trigger.
 const HLLD_WS_TOL:  f32 = 1.0e-8;
 
-// Unpack one cell's PPM-edge state pair (4-vec primitives) into an MhdPrim.
-// `edge0` = (ρ, vx, vy, vz)
-// `edge1` = (p, Bt1, Bz, _)   where Bt1 = By for x-sweep, Bx for y-sweep
-// `b_normal` overwrites the face-normal B (continuous across the face).
 fn unpack_edge_prim(edge0: vec4<f32>, edge1: vec4<f32>, b_normal: f32, axis: u32) -> MhdPrim {
     var Q: MhdPrim;
     Q.rho = max(edge0.x, DENSITY_FLOOR);
@@ -80,7 +74,6 @@ fn unpack_edge_prim(edge0: vec4<f32>, edge1: vec4<f32>, b_normal: f32, axis: u32
     return Q;
 }
 
-// HLL flux helper (used as fallback by HLLD for degenerate branches).
 struct HLLOut {
     f0:   vec4<f32>,
     f1:   vec4<f32>,
@@ -121,20 +114,10 @@ fn hll_flux_mhd(QL: MhdPrim, QR: MhdPrim, axis: u32, gamma: f32) -> HLLOut {
     return out;
 }
 
-// Unified vector form of the MHD conservative state along the sweep axis.
-// Returns (ρ, ρu_n, ρu_t1, ρu_t2, E, B_t1, B_t2) — 7 scalars in a vec4+vec4
-// shape we can slice. We do this all in scalar form for HLLD's algebra.
 struct AxisState {
-    rho: f32,
-    un:  f32,   // velocity normal to face
-    ut1: f32,   // velocity transverse (1)
-    ut2: f32,   // velocity transverse (2)
-    bn:  f32,   // B normal (constant)
-    bt1: f32,
-    bt2: f32,
-    p:   f32,
-    pT:  f32,   // total pressure = p + ½B²
-    E:   f32,   // total energy density
+    rho: f32, un:  f32, ut1: f32, ut2: f32,
+    bn:  f32, bt1: f32, bt2: f32,
+    p:   f32, pT:  f32, E:   f32,
 };
 
 fn prim_to_axis_state(P: MhdPrim, axis: u32, gamma: f32) -> AxisState {
@@ -156,15 +139,9 @@ fn prim_to_axis_state(P: MhdPrim, axis: u32, gamma: f32) -> AxisState {
     return A;
 }
 
-// Assemble axis-frame flux from state.
 struct AxisFlux {
-    f_rho: f32,
-    f_mn:  f32,
-    f_mt1: f32,
-    f_mt2: f32,
-    f_E:   f32,
-    f_bt1: f32,   // = un·bt1 - ut1·bn
-    f_bt2: f32,   // = un·bt2 - ut2·bn
+    f_rho: f32, f_mn: f32, f_mt1: f32, f_mt2: f32,
+    f_E:   f32, f_bt1: f32, f_bt2: f32,
 };
 
 fn axis_flux(A: AxisState) -> AxisFlux {
@@ -180,150 +157,153 @@ fn axis_flux(A: AxisState) -> AxisFlux {
     return F;
 }
 
-// Pack an axis-frame conservative-state set into (U0, U1, bt1, bt2) for
-// the downstream write. axis chooses whether the in-plane velocity pair
-// (vx, vy) or (vy, vx) is reconstructed from (un, ut1).
 struct PackedFlux {
     f0:   vec4<f32>,
     f1:   vec4<f32>,
-    fBt1: f32,   // transverse-B flux for B_t1 (= By for x-sweep, Bx for y-sweep)
-    fBt2: f32,   // = Bz flux's transverse-B contribution
+    fBt1: f32,
+    fBt2: f32,
 };
 
 fn pack_flux(F: AxisFlux, axis: u32) -> PackedFlux {
     var P: PackedFlux;
     if (axis == 0u) {
-        // Normal = x → return (Fρ, Fρvx, Fρvy, Fρvz) and (FE, FBz, _, _).
         P.f0 = vec4<f32>(F.f_rho, F.f_mn, F.f_mt1, F.f_mt2);
-        P.f1 = vec4<f32>(F.f_E,   F.f_bt2, 0.0, 0.0);   // .y = Bz flux
+        P.f1 = vec4<f32>(F.f_E,   F.f_bt2, 0.0, 0.0);
         P.fBt1 = F.f_bt1;
     } else {
-        // Normal = y → vy is normal, vx is transverse-1.
         P.f0 = vec4<f32>(F.f_rho, F.f_mt1, F.f_mn, F.f_mt2);
         P.f1 = vec4<f32>(F.f_E,   F.f_bt2, 0.0, 0.0);
         P.fBt1 = F.f_bt1;
     }
-    P.fBt2 = 0.0;  // unused; kept for the existing flux_1.w slot.
+    P.fBt2 = 0.0;
     return P;
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let n = U_uniforms.grid_n;
-    if (gid.x >= n || gid.y >= n) { return; }
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
+    let axis       = U_uniforms.sweep_dir;
+    let g          = U_uniforms.gamma;
 
-    let n_i  = i32(n);
-    let axis = U_uniforms.sweep_dir;
-    let g    = U_uniforms.gamma;
-
-    let i  = i32(gid.x);
-    let j  = i32(gid.y);
-    var ip = i;
-    var jp = j;
-    if (axis == 0u) { ip = i + 1; } else { jp = j + 1; }
-
-    let idx_c = cell_index(gid.x, gid.y, n);
-    let ip_u  = wrap_idx(ip, n_i);
-    let jp_u  = wrap_idx(jp, n_i);
-    let idx_p = cell_index(ip_u, jp_u, n);
-
-    // Face-normal B: continuous staggered face value owned by cell (i,j).
-    var b_normal: f32;
+    // Dispatch shape: extended by one row/col on the transverse axis so
+    // that compute-emf can read flux from cells one row/col outside the
+    // interior on each side.
+    //   x-sweep:  ix ∈ [ghost, ghost+N+1)         — N+1 x-faces
+    //             iy ∈ [ghost-1, ghost+N+1)       — N+2 rows
+    //   y-sweep:  ix ∈ [ghost-1, ghost+N+1)       — N+2 cols
+    //             iy ∈ [ghost, ghost+N+1)         — N+1 y-faces
+    var x_extent: u32;
+    var y_extent: u32;
     if (axis == 0u) {
-        b_normal = Bx_face[idx_c];
+        x_extent = n_interior + 1u;
+        y_extent = n_interior + 2u;
     } else {
-        b_normal = By_face[idx_c];
+        x_extent = n_interior + 2u;
+        y_extent = n_interior + 1u;
+    }
+    if (gid.x >= x_extent || gid.y >= y_extent) { return; }
+
+    // ix/iy is the cell on the HIGH side of the face. Offset depends on
+    // sweep axis: for x-sweep, faces start at ix=ghost; rows extend by
+    // one on each side.
+    var ix: u32;
+    var iy: u32;
+    if (axis == 0u) {
+        ix = ghost + gid.x;
+        iy = ghost + gid.y - 1u;
+    } else {
+        ix = ghost + gid.x - 1u;
+        iy = ghost + gid.y;
     }
 
-    // L state from right-edge of cell (i,j); R state from left-edge of (i+1,j).
-    let QL = unpack_edge_prim(edge_r_0[idx_c], edge_r_1[idx_c], b_normal, axis);
-    let QR = unpack_edge_prim(edge_l_0[idx_p], edge_l_1[idx_p], b_normal, axis);
+    // Source PPM edges: QL = right edge of cell (i-1, j) for x-sweep,
+    // QR = left edge of cell (i, j).
+    var ix_l: u32 = ix;
+    var iy_l: u32 = iy;
+    if (axis == 0u) { ix_l = ix - 1u; } else { iy_l = iy - 1u; }
+    let idx_l = cell_idx_total(ix_l, iy_l, n_total);
+    let idx_r = cell_idx_total(ix,   iy,   n_total);
+
+    // Face-normal B at this face.
+    var b_normal: f32;
+    if (axis == 0u) {
+        b_normal = Bx_face[bx_face_idx(ix, iy, n_total)];
+    } else {
+        b_normal = By_face[by_face_idx(ix, iy, n_total)];
+    }
+
+    let QL = unpack_edge_prim(edge_r_0[idx_l], edge_r_1[idx_l], b_normal, axis);
+    let QR = unpack_edge_prim(edge_l_0[idx_r], edge_l_1[idx_r], b_normal, axis);
 
     let AL = prim_to_axis_state(QL, axis, g);
     let AR = prim_to_axis_state(QR, axis, g);
     let FL = axis_flux(AL);
     let FR = axis_flux(AR);
 
-    // Wave-speed estimates: fast magnetosonic on each side.
     let cfL = fast_mag_speed(QL, g, axis);
     let cfR = fast_mag_speed(QR, g, axis);
     let SL  = min(AL.un - cfL, AR.un - cfR);
     let SR  = max(AL.un + cfL, AR.un + cfR);
 
-    // ── Early exits (M&K 2005, supersonic branches) ────────────────
+    // Cell index of the FACE itself (the left face of cell idx_r). flux
+    // arrays use the same cell-centered indexing scheme; we write at
+    // idx_r (the cell on the "high" side of the face).
+    let dst = idx_r;
+
     if (SL >= 0.0) {
         let pf = pack_flux(FL, axis);
-        flux_0[idx_c] = pf.f0;
-        flux_1[idx_c] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+        flux_0[dst] = pf.f0;
+        flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
         return;
     }
     if (SR <= 0.0) {
         let pf = pack_flux(FR, axis);
-        flux_0[idx_c] = pf.f0;
-        flux_1[idx_c] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+        flux_0[dst] = pf.f0;
+        flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
         return;
     }
 
-    // ── Branch B: degenerate wave-speed coincidence → HLL fallback ──
+    // Branch B: degenerate wave-speed coincidence → HLL fallback.
     if (SR - SL < HLLD_WS_TOL * (abs(SR) + abs(SL) + 1.0e-12)) {
         let h = hll_flux_mhd(QL, QR, axis, g);
-        flux_0[idx_c] = h.f0;
-        flux_1[idx_c] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
+        flux_0[dst] = h.f0;
+        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
         return;
     }
 
-    // ── Compute contact speed S_M (M&K eq 38) ─────────────────────
-    //   S_M = [(SR-uR)·ρR·uR - (SL-uL)·ρL·uL - p_T,R + p_T,L]
-    //         / [(SR-uR)·ρR - (SL-uL)·ρL]
     let rcL = AL.rho * (SL - AL.un);
     let rcR = AR.rho * (SR - AR.un);
     let SM_num = rcR * AR.un - rcL * AL.un - AR.pT + AL.pT;
     let SM_den = rcR - rcL;
     let SM = SM_num / select(SM_den, sign(SM_den) * 1.0e-12, abs(SM_den) < 1.0e-30);
 
-    // Star-state total pressure (M&K eq 41). Equal on both sides.
-    //   p_T* = p_T,L + ρL·(SL - uL)·(SM - uL)
-    //        = p_T,R + ρR·(SR - uR)·(SM - uR)
     let pT_star = AL.pT + AL.rho * (SL - AL.un) * (SM - AL.un);
 
-    // ── Branch C: negative star pressure → HLL fallback ──
+    // Branch C: negative star pressure → HLL fallback.
     if (pT_star <= PRESSURE_FLOOR) {
         let h = hll_flux_mhd(QL, QR, axis, g);
-        flux_0[idx_c] = h.f0;
-        flux_1[idx_c] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
+        flux_0[dst] = h.f0;
+        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, h.fBt2);
         return;
     }
 
-    // ── Branch A: Bx² < ε² · ρ → Alfvén waves degenerate, HLLC ─────
-    // Use the average ρ on either side as the scale for the threshold.
+    // Branch A: Bx² < ε² · ρ → Alfvén waves degenerate, HLLC.
     let bn2 = b_normal * b_normal;
     let rho_scale = max(0.5 * (AL.rho + AR.rho), DENSITY_FLOOR);
     let branchA = bn2 < HLLD_BX_EPS2 * rho_scale;
 
     if (branchA) {
-        // HLLC for MHD with B_n ≈ 0: 3-wave structure (SL, SM, SR).
-        // Star-region density (M&K eq 43 simplified with B_n = 0):
-        //   ρ*_K = ρ_K · (S_K - u_K) / (S_K - S_M)
-        //   transverse velocities & B advected at S_M (rotational discontinuity
-        //   collapses onto the contact when B_n = 0).
-        // SL - SM is strictly negative and SR - SM strictly positive when
-        // we reach here (Branch B already filters the coincidence case);
-        // small floor just guards against fp drift.
         let denom_L = min(SL - SM, -1.0e-20);
         let denom_R = max(SR - SM,  1.0e-20);
         let rhoLs = AL.rho * (SL - AL.un) / denom_L;
         let rhoRs = AR.rho * (SR - AR.un) / denom_R;
 
-        // Conservative state vectors (axis frame): (ρ, ρu_n, ρu_t1, ρu_t2, E, B_t1, B_t2)
-        // U*_K = ρ*_K · (1, S_M, u_t1_K, u_t2_K, E*_K/ρ*_K, B_t1_K/ρ*_K, B_t2_K/ρ*_K)
-        // simplified — B_t1, B_t2 advect, energy from total-pressure jump:
-        //   E*_K = ((S_K - u_K) E_K - p_T,K · u_K + p_T* · S_M) / (S_K - S_M)
         let E_Ls = ((SL - AL.un) * AL.E - AL.pT * AL.un + pT_star * SM) / (SL - SM);
         let E_Rs = ((SR - AR.un) * AR.E - AR.pT * AR.un + pT_star * SM) / (SR - SM);
-        // Fluxes via HLLC formula: F* = F_K + S_K · (U*_K - U_K)
         var Fout: AxisFlux;
         if (SM >= 0.0) {
-            // Left star.
             Fout.f_rho = FL.f_rho + SL * (rhoLs                - AL.rho);
             Fout.f_mn  = FL.f_mn  + SL * (rhoLs * SM           - AL.rho * AL.un);
             Fout.f_mt1 = FL.f_mt1 + SL * (rhoLs * AL.ut1       - AL.rho * AL.ut1);
@@ -341,31 +321,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             Fout.f_bt2 = FR.f_bt2 + SR * (AR.bt2 * (SR - AR.un)/(SR - SM) - AR.bt2);
         }
         let pf = pack_flux(Fout, axis);
-        flux_0[idx_c] = pf.f0;
-        flux_1[idx_c] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+        flux_0[dst] = pf.f0;
+        flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
         return;
     }
 
-    // ── Full HLLD 5-wave path ─────────────────────────────────────
-    // Star-state densities (M&K eq 43):
-    //   ρ*_K = ρ_K · (S_K - u_K) / (S_K - S_M)
-    // SL-SM strictly negative, SR-SM strictly positive past Branch B.
+    // Full HLLD 5-wave path.
     let dL = min(SL - SM, -1.0e-20);
     let dR = max(SR - SM,  1.0e-20);
     let rhoLs = AL.rho * (SL - AL.un) / dL;
     let rhoRs = AR.rho * (SR - AR.un) / dR;
 
-    // Star-state transverse velocities & B (M&K eqs 44, 46 in axis frame):
-    //   u_t* = u_t,K - B_n · B_t,K · (S_M - u_K) / [ρ_K (S_K - u_K)(S_K - S_M) - B_n²]
-    //   B_t* = B_t,K · [ρ_K (S_K - u_K)² - B_n²] / [ρ_K (S_K - u_K)(S_K - S_M) - B_n²]
-    // denomL/denomR vanish only at the rotational-discontinuity boundary
-    // (Branch B coincidence, already filtered) or B_n=0 (Branch A). Guard
-    // away from zero with a small floor preserving sign.
     let denomL_raw = AL.rho * (SL - AL.un) * (SL - SM) - bn2;
     let denomR_raw = AR.rho * (SR - AR.un) * (SR - SM) - bn2;
-    // Physical denom is O(ρ·c_f²) ≫ 1e-12 when full HLLD is appropriate.
-    // Branch A (B_n→0) and Branch B (wave coincidence) are filtered above;
-    // remaining floor just kills fp drift singularities.
     let safeDL = select(denomL_raw, 1.0e-20, abs(denomL_raw) < 1.0e-20);
     let safeDR = select(denomR_raw, 1.0e-20, abs(denomR_raw) < 1.0e-20);
 
@@ -382,9 +350,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bt1_Rs = AR.bt1 * g_R / safeDR;
     let bt2_Rs = AR.bt2 * g_R / safeDR;
 
-    // Energy in star states (M&K eq 48):
-    //   E*_K = ((S_K - u_K) E_K - p_T,K u_K + p_T* S_M
-    //           + B_n (v·B_K - v*·B*_K)) / (S_K - S_M)
     let vdotb_L  = AL.un  * b_normal + AL.ut1  * AL.bt1  + AL.ut2  * AL.bt2;
     let vdotb_R  = AR.un  * b_normal + AR.ut1  * AR.bt1  + AR.ut2  * AR.bt2;
     let vdotbLs  = SM     * b_normal + ut1_Ls  * bt1_Ls  + ut2_Ls  * bt2_Ls;
@@ -395,17 +360,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let E_Rs = ((SR - AR.un) * AR.E - AR.pT * AR.un + pT_star * SM
                + b_normal * (vdotb_R - vdotbRs)) / (SR - SM);
 
-    // Alfvén wave speeds (M&K eq 51):
-    //   S_L* = S_M - |B_n| / sqrt(ρ*_L)
-    //   S_R* = S_M + |B_n| / sqrt(ρ*_R)
     let absBn = abs(b_normal);
     let SLs = SM - absBn / sqrt(max(rhoLs, DENSITY_FLOOR));
     let SRs = SM + absBn / sqrt(max(rhoRs, DENSITY_FLOOR));
 
-    // Double-star states (between the two Alfvén waves, M&K eqs 59-63):
-    //   sqrt(ρ*_L)·u_t** = sqrt(ρ*_L) u_t*_L + sqrt(ρ*_R) u_t*_R + (B_t*_R - B_t*_L) sign(B_n)
-    //                      all divided by (sqrt(ρ*_L) + sqrt(ρ*_R))
-    //   B_t** = ...
     let srL = sqrt(max(rhoLs, DENSITY_FLOOR));
     let srR = sqrt(max(rhoRs, DENSITY_FLOOR));
     let srSum = srL + srR;
@@ -416,24 +374,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bt1_ss = (srL * bt1_Rs + srR * bt1_Ls + srL * srR * (ut1_Rs - ut1_Ls) * sgnBn) / srSum;
     let bt2_ss = (srL * bt2_Rs + srR * bt2_Ls + srL * srR * (ut2_Rs - ut2_Ls) * sgnBn) / srSum;
 
-    // Energy in double-star (M&K eq 64). v**·B** is the double-star
-    // velocity-B inner product (same on both sides of the contact):
-    //   E**_L = E*_L - sqrt(ρ*_L) sign(B_n) (v*_L · B*_L - v** · B**)
-    //   E**_R = E*_R + sqrt(ρ*_R) sign(B_n) (v*_R · B*_R - v** · B**)
     let vdotb_ss = SM * b_normal + ut1_ss * bt1_ss + ut2_ss * bt2_ss;
     let E_Lss = E_Ls - srL * sgnBn * (vdotbLs - vdotb_ss);
     let E_Rss = E_Rs + srR * sgnBn * (vdotbRs - vdotb_ss);
 
-    // Choose the appropriate star state based on which wave region we're in.
-    // SL < 0 < SR (already checked). Sub-regions:
-    //   SL  < 0 ≤ SL*  → left star
-    //   SL* < 0 ≤ SM   → left double-star
-    //   SM  < 0 ≤ SR*  → right double-star
-    //   SR* < 0 ≤ SR   → right star
-    // Compute flux as F_K + S_K (U*_K - U_K) at left-star boundary, etc.
     var Fout: AxisFlux;
     if (SLs >= 0.0) {
-        // Left star.
         Fout.f_rho = FL.f_rho + SL * (rhoLs                - AL.rho);
         Fout.f_mn  = FL.f_mn  + SL * (rhoLs * SM           - AL.rho * AL.un);
         Fout.f_mt1 = FL.f_mt1 + SL * (rhoLs * ut1_Ls       - AL.rho * AL.ut1);
@@ -442,11 +388,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Fout.f_bt1 = FL.f_bt1 + SL * (bt1_Ls               - AL.bt1);
         Fout.f_bt2 = FL.f_bt2 + SL * (bt2_Ls               - AL.bt2);
     } else if (SM >= 0.0) {
-        // Left double-star.
-        // F** = F_L + S_L* (U** - U*_L) + S_L (U*_L - U_L)
-        //     = F_L + S_L (U*_L - U_L) + S_L* (U** - U*_L)
         Fout.f_rho = FL.f_rho + SL  * (rhoLs              - AL.rho)
-                              + SLs * (rhoLs              - rhoLs);  // ρ unchanged across Alfvén
+                              + SLs * (rhoLs              - rhoLs);
         Fout.f_mn  = FL.f_mn  + SL  * (rhoLs * SM         - AL.rho * AL.un)
                               + SLs * (rhoLs * SM         - rhoLs * SM);
         Fout.f_mt1 = FL.f_mt1 + SL  * (rhoLs * ut1_Ls     - AL.rho * AL.ut1)
@@ -460,7 +403,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Fout.f_bt2 = FL.f_bt2 + SL  * (bt2_Ls             - AL.bt2)
                               + SLs * (bt2_ss             - bt2_Ls);
     } else if (SRs >= 0.0) {
-        // Right double-star.
         Fout.f_rho = FR.f_rho + SR  * (rhoRs              - AR.rho)
                               + SRs * (rhoRs              - rhoRs);
         Fout.f_mn  = FR.f_mn  + SR  * (rhoRs * SM         - AR.rho * AR.un)
@@ -476,7 +418,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Fout.f_bt2 = FR.f_bt2 + SR  * (bt2_Rs             - AR.bt2)
                               + SRs * (bt2_ss             - bt2_Rs);
     } else {
-        // Right star.
         Fout.f_rho = FR.f_rho + SR * (rhoRs                - AR.rho);
         Fout.f_mn  = FR.f_mn  + SR * (rhoRs * SM           - AR.rho * AR.un);
         Fout.f_mt1 = FR.f_mt1 + SR * (rhoRs * ut1_Rs       - AR.rho * AR.ut1);
@@ -487,6 +428,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let pf = pack_flux(Fout, axis);
-    flux_0[idx_c] = pf.f0;
-    flux_1[idx_c] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
+    flux_0[dst] = pf.f0;
+    flux_1[dst] = vec4<f32>(pf.f1.x, pf.f1.y, pf.fBt1, pf.fBt2);
 }

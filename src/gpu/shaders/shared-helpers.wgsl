@@ -1,5 +1,7 @@
 // ─── shared-helpers.wgsl ─────────────────────────────────────────────
-// Phase 3b: 2.5D ideal MHD on a Yee-style staggered grid.
+// Phase 4: 2.5D resistive MHD on a Yee-style staggered grid with
+// 2-layer ghost cells per side and per-edge boundary conditions.
+//
 //   • PPM reconstruction (Colella & Woodward 1984) — produces per-cell,
 //     per-direction L/R primitive face states (no slopes).
 //   • HLLD Riemann (Miyoshi & Kusano 2005) — 5-wave structure, with
@@ -7,6 +9,11 @@
 //   • RK3 SSP — three storage slots (n/1/2) for U_cell + face B,
 //     updated in lockstep. Stage weights live in three small uniform
 //     buffers (stage_1, stage_2, stage_3), written once at init.
+//   • Explicit resistivity — η ∇²B added per RK3 stage AFTER the CT
+//     update. SSP-compatible by linearity (η ∇² is a linear operator on B).
+//   • Per-edge BCs filled by apply-bcs.wgsl at the start of each stage,
+//     into 2 ghost-cell layers per side. The main shaders drop wrap_idx
+//     in favour of direct indexing.
 //
 // ── Transpiler contract (vanilla WebGPU only) ───────────────────────
 // The codebase is written so a future WebGPU→CPU JS transpiler can map
@@ -21,14 +28,54 @@
 //   • Per-stage parameters are immutable uniform buffers; per-sweep
 //     direction is a second immutable uniform buffer. The transpiler
 //     just binds the right pair per dispatch.
+//   • BC dispatch is a single shader with a switch over 4 modes × 4
+//     edges = 16 cases — no shader permutations, no specialization
+//     constants.
+//
+// ── Ghost-cell convention (Phase 4) ─────────────────────────────────
+// All buffers expand by GHOST_W = 2 cells per side. With interior size
+// N×N, cell-centered buffer size is (N+2*GHOST_W) × (N+2*GHOST_W) =
+// (N+4)×(N+4). The INTERIOR index range in both axes is:
+//     [GHOST_W, GHOST_W + N) = [2, N+2)
+// Ghost cells occupy:
+//     i ∈ [0, GHOST_W)              → west / left ghost  (W edge)
+//     i ∈ [GHOST_W+N, N+2*GHOST_W)  → east / right ghost (E edge)
+//     j ∈ [0, GHOST_W)              → south / bottom ghost (S edge)
+//     j ∈ [GHOST_W+N, N+2*GHOST_W)  → north / top    ghost (N edge)
+// apply-bcs.wgsl runs at the start of each RK3 stage and fills these
+// strips per BC mode for that edge. Corners use whichever non-periodic
+// edge owns them, falling back to either side if both are periodic.
+//
+// ── Face / edge convention (Yee staggered, Phase 4 — LEFT/DOWN owner) ─
+// Cell (i,j) is bounded by:
+//   Bx_face[i,   j]  on its LEFT  (x-face at i-½)
+//   Bx_face[i+1, j]  on its RIGHT (x-face at i+½)
+//   By_face[i, j  ]  on its BOTTOM (y-face at j-½)
+//   By_face[i, j+1]  on its TOP    (y-face at j+½)
+// Bx_face dimensions: (N+2*GHOST_W + 1) × (N+2*GHOST_W) = (N+5) × (N+4).
+// By_face dimensions: (N+2*GHOST_W)     × (N+2*GHOST_W + 1) = (N+4) × (N+5).
+// Ez_edge sits at cell corners (i-½, j-½), dim (N+5) × (N+5).
+//
+// Discrete CT update (forward Euler):
+//   Bx_face[i,j] += -(dt/dy) · (Ez_edge[i, j+1] - Ez_edge[i, j])
+//   By_face[i,j] += +(dt/dx) · (Ez_edge[i+1,j] - Ez_edge[i, j])
+// where the Ez differences are taken at the two endpoints of the
+// face. With Ez = arithmetic mean of the four neighbouring face fluxes
+// (Balsara-Spicer; see compute-emf.wgsl), discrete ∇·B is preserved
+// exactly to machine precision: corner contributions cancel in pairs
+// around every cell.
+//
+// Face fluxes carry the SAME convention:
+//   flux_x[i, j] = flux through the LEFT face of cell (i, j) at i-½.
+//   flux_y[i, j] = flux through the BOTTOM face of cell (i, j) at j-½.
 //
 // ── Bind-group layouts (transpiler reads these as nested-loop kernels) ─
 // All compute pipelines use one bind group (group 0) shaped as:
 //   binding 0: uniform Uniforms        (per sweep direction)
 //   binding 1..N: storage buffers      (read-only or read-write)
 // Weighted-update pipelines add an additional uniform StageParams at
-// binding 1. The exact entries-per-shader are documented in each shader's
-// header.
+// binding 1. The BC shader uses one extra storage buffer `bc_uniforms`
+// to branch over per-edge modes + driven inflow state.
 //
 // ── State layout ────────────────────────────────────────────────────
 // Cell-centered conserved state, packed as TWO vec4<f32> arrays per
@@ -38,66 +85,112 @@
 // where E is total energy density:
 //   E = p/(γ-1) + ½·ρ·|v|² + ½·|B|²
 //
-// Cell-centered primitive state (7 active components, stored as TWO vec4):
-//   prim0 = (ρ, vx, vy, vz)
-//   prim1 = (p, Bt1, Bt2, _) — packed for the active sweep direction:
-//     x-sweep: Bt1 = By, Bt2 = Bz   (transverse to the x-face normal)
-//     y-sweep: Bt1 = Bx, Bt2 = Bz   (transverse to the y-face normal)
-//   The normal-direction B is read directly from Bx_face / By_face
-//   (continuous across the face by the CT discretization of ∇·B=0).
-//
-// ── Face / edge convention (Yee staggered) ──────────────────────────
-// Cell (i,j) owns:
-//   Bx_face[i,j]  = Bx at face (i+½, j)         (x-face to its right)
-//   By_face[i,j]  = By at face (i, j+½)         (y-face above it)
-//   Ez_edge[i,j]  = Ez at corner (i+½, j+½)     (upper-right corner)
-//   flux_x[i,j]   = MHD flux through face (i+½, j)
-//   flux_y[i,j]   = MHD flux through face (i, j+½)
-// Faces wrap mod N under periodic BCs.
-//
-// Discrete CT update (forward Euler, dt from compute-dt):
-//   Bx_face[i,j] += -(dt/dy) · (Ez_edge[i,j] - Ez_edge[i,j-1])
-//   By_face[i,j] += +(dt/dx) · (Ez_edge[i,j] - Ez_edge[i-1,j])
-// With Ez_edge defined as Balsara-Spicer arithmetic mean of the four
-// neighboring face fluxes (see compute-emf.wgsl), discrete ∇·B is
-// preserved exactly to machine precision: the corner contributions
-// cancel in pairs around every cell.
-//
 // ── γ & floors ──────────────────────────────────────────────────────
 // γ comes from the Uniforms; pressure & density floors match config.js.
 
 struct Uniforms {
-    dx:           f32,
-    gamma:        f32,
-    view_min:     f32,
-    view_max:     f32,
-    grid_n:       u32,
-    sweep_dir:    u32,  // 0 = x-sweep / x-face shaders, 1 = y-sweep / y-face shaders
-    step_parity:  u32,  // 0 = even, 1 = odd — informational (drove Strang ordering in Phase 2)
-    view_mode:    u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
+    dx:            f32,
+    gamma:         f32,
+    view_min:      f32,
+    view_max:      f32,
+    eta:           f32,
+    _pad_f0:       f32,
+    _pad_f1:       f32,
+    _pad_f2:       f32,
+    grid_n:        u32,  // INTERIOR grid resolution per axis
+    grid_n_total:  u32,  // grid_n + 2*ghost_w (total storage width per axis)
+    ghost_w:       u32,  // ghost-cell width per side (= 2 in Phase 4)
+    sweep_dir:     u32,  // 0 = x-sweep / x-face shaders, 1 = y-sweep / y-face shaders
+    step_parity:   u32,  // 0 = even, 1 = odd — informational
+    view_mode:     u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
+    _pad_u0:       u32,
+    _pad_u1:       u32,
+};
+
+// BC modes — match config.js / enum values.
+const BC_PERIODIC:   u32 = 0u;
+const BC_OUTFLOW:    u32 = 1u;
+const BC_REFLECTING: u32 = 2u;
+const BC_DRIVEN:     u32 = 3u;
+
+// Per-edge BC config + driven inflow state. Single storage buffer bound
+// only by apply-bcs.wgsl. Driven state is in primitive form; the shader
+// converts to conservative on write.
+//
+// Index convention for `mode[]`:
+//   mode[0] = N (top,    j-ghost-strip at the top)
+//   mode[1] = S (bottom, j-ghost-strip at the bottom)
+//   mode[2] = E (right,  i-ghost-strip at the right)
+//   mode[3] = W (left,   i-ghost-strip at the left)
+struct BcUniforms {
+    mode_n: u32,
+    mode_s: u32,
+    mode_e: u32,
+    mode_w: u32,
+    driven_rho: f32,
+    driven_vx:  f32,
+    driven_vy:  f32,
+    driven_vz:  f32,
+    driven_bx:  f32,
+    driven_by:  f32,
+    driven_bz:  f32,
+    driven_p:   f32,
 };
 
 const PRESSURE_FLOOR: f32 = 1.0e-6;
 const DENSITY_FLOOR:  f32 = 1.0e-6;
 
 // ── Indexing helpers ────────────────────────────────────────────────
+// Phase 4 drops wrap_idx in favour of direct indexing into ghost-padded
+// buffers. The interior range is [ghost_w, ghost_w+grid_n) in both axes;
+// PPM's 5-point stencil [i-2, i+2] is always in-bounds for interior i.
+
+// Cell-centered linear index into an (N_total × N_total) buffer.
+fn cell_idx_total(ix: u32, iy: u32, n_total: u32) -> u32 {
+    return iy * n_total + ix;
+}
+
+// Backwards-compat alias used by view-field/colormap. In Phase 4 callers
+// use the n_total form; we keep `cell_index` as a thin alias.
+fn cell_index(ix: u32, iy: u32, n_total: u32) -> u32 {
+    return iy * n_total + ix;
+}
+
+// Bx_face owns one extra column (N_total+1 wide), still N_total tall.
+//   Bx_face[i,j] sits on the LEFT face of cell (i,j) at x = (i-ghost-½)·dx.
+fn bx_face_idx(ix: u32, iy: u32, n_total: u32) -> u32 {
+    return iy * (n_total + 1u) + ix;
+}
+
+// By_face owns one extra row (N_total tall + 1), still N_total wide.
+//   By_face[i,j] sits on the BOTTOM face of cell (i,j) at y = (j-ghost-½)·dx.
+fn by_face_idx(ix: u32, iy: u32, n_total: u32) -> u32 {
+    return iy * n_total + ix;
+}
+
+// Ez_edge sits at corners (i-½, j-½), so (N_total+1) × (N_total+1).
+fn ez_edge_idx(ix: u32, iy: u32, n_total: u32) -> u32 {
+    return iy * (n_total + 1u) + ix;
+}
+
+// Legacy helper preserved for any shaders that still want it (none should
+// in Phase 4; the function is kept only for compute-dt's fallback path if
+// needed). Direct indexing replaces wrap.
 fn wrap_idx(i: i32, n: i32) -> u32 {
     return u32(((i % n) + n) % n);
 }
 
-fn cell_index(ix: u32, iy: u32, n: u32) -> u32 {
-    return iy * n + ix;
-}
-
-fn cell_index_wrapped(ix: i32, iy: i32, n: i32) -> u32 {
-    let wx = wrap_idx(ix, n);
-    let wy = wrap_idx(iy, n);
-    return wy * u32(n) + wx;
-}
+// Cell-centered Bx average from the two adjacent x-faces (LEFT-face owner):
+//   bx_c = 0.5 · (Bx_face[i, j] + Bx_face[i+1, j])
+// Callers inline this — we expose only the per-face indices so we don't
+// need to pass storage-buffer pointers across function calls (WGSL
+// pointer-to-storage parameters are not universally supported).
+fn bx_face_left_idx(ix: u32, iy: u32, n_total: u32)  -> u32 { return bx_face_idx(ix,      iy, n_total); }
+fn bx_face_right_idx(ix: u32, iy: u32, n_total: u32) -> u32 { return bx_face_idx(ix + 1u, iy, n_total); }
+fn by_face_down_idx(ix: u32, iy: u32, n_total: u32)  -> u32 { return by_face_idx(ix, iy,      n_total); }
+fn by_face_up_idx(ix: u32, iy: u32, n_total: u32)    -> u32 { return by_face_idx(ix, iy + 1u, n_total); }
 
 // ── Cons / prim conversion ──────────────────────────────────────────
-// Bx, By must be supplied at the cell center (caller averages neighboring
-// faces). Bz comes from U1.y.
 struct MhdPrim {
     rho: f32,
     vx:  f32,
@@ -135,28 +228,8 @@ fn cons_to_prim_mhd(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32, gamma: f
     return P;
 }
 
-// Compose cell-center Bx, By by averaging the two owning faces under
-// periodic wrap. Cell (i,j) sits between Bx_face[i-1,j] (its left face)
-// and Bx_face[i,j] (its right face); same for By. Callers inline the
-// face reads — we expose only the index pair so we don't need to pass
-// storage-buffer pointers through function calls (which adds WGSL
-// boilerplate without much win).
-fn bx_face_left_index(ix: u32, iy: u32, n: u32) -> u32 {
-    return cell_index_wrapped(i32(ix) - 1, i32(iy), i32(n));
-}
-fn bx_face_right_index(ix: u32, iy: u32, n: u32) -> u32 {
-    return cell_index(ix, iy, n);
-}
-fn by_face_down_index(ix: u32, iy: u32, n: u32) -> u32 {
-    return cell_index_wrapped(i32(ix), i32(iy) - 1, i32(n));
-}
-fn by_face_up_index(ix: u32, iy: u32, n: u32) -> u32 {
-    return cell_index(ix, iy, n);
-}
-
 fn fast_mag_speed(P: MhdPrim, gamma: f32, axis: u32) -> f32 {
     // c_fast² = ½(c_s² + c_A²) + ½√((c_s² + c_A²)² − 4 c_s² c_An²)
-    // where c_An² is the squared Alfvén speed along the face normal.
     let rho = max(P.rho, DENSITY_FLOOR);
     let p   = max(P.p,   PRESSURE_FLOOR);
     let cs2 = gamma * p / rho;
@@ -166,29 +239,15 @@ fn fast_mag_speed(P: MhdPrim, gamma: f32, axis: u32) -> f32 {
     if (axis == 0u) { can2 = P.bx * P.bx / rho; }
     else            { can2 = P.by * P.by / rho; }
     let sum = cs2 + ca2;
-    // discriminant ≥ 0 by AM-GM on (c_s², c_An²); guard against fp drift.
     let disc = max(sum * sum - 4.0 * cs2 * can2, 0.0);
     let cf2  = 0.5 * (sum + sqrt(disc));
     return sqrt(max(cf2, 0.0));
 }
 
 // 1D MHD flux along the sweep axis given full primitive state.
-// Returns (F_U0, F_U1) where F_U0 = (Fρ, Fρvx, Fρvy, Fρvz) and
-// F_U1 = (FE, FBz, _, _).
-// Stone+ 2008 eq. 13 (with B² = bx²+by²+bz², and Btot·v shorthand).
-// We do NOT include the flux for the normal-direction B (it's continuous
-// across the face by construction); the transverse-B fluxes feed the
-// CT EMF stage. The flux components returned in F.y/F.z carry the
-// transverse-B advection contributions used by the EMF kernel.
 struct MhdFlux {
     f0: vec4<f32>,
     f1: vec4<f32>,
-    // The transverse B fluxes (signed): for x-sweep these are
-    //   fBy = vx·By - vy·Bx  (= -Ez at the x-face)
-    //   fBz = vx·Bz - vz·Bx
-    // For y-sweep:
-    //   fBx = vy·Bx - vx·By  (= +Ez at the y-face)
-    //   fBz = vy·Bz - vz·By
     f_bt1: f32,
     f_bt2: f32,
 };
@@ -199,12 +258,11 @@ fn mhd_flux(P: MhdPrim, gamma: f32, axis: u32) -> MhdFlux {
     let ke  = 0.5 * rho * (P.vx*P.vx + P.vy*P.vy + P.vz*P.vz);
     let mb  = 0.5 * (P.bx*P.bx + P.by*P.by + P.bz*P.bz);
     let E   = p / (gamma - 1.0) + ke + mb;
-    let p_t = p + mb;                       // total (gas + magnetic) pressure
+    let p_t = p + mb;
     let vdotb = P.vx*P.bx + P.vy*P.by + P.vz*P.bz;
 
     var F: MhdFlux;
     if (axis == 0u) {
-        // x-sweep: normal is x, transverse-1 is By, transverse-2 is Bz
         F.f0 = vec4<f32>(
             rho * P.vx,
             rho * P.vx * P.vx + p_t - P.bx * P.bx,
@@ -216,10 +274,9 @@ fn mhd_flux(P: MhdPrim, gamma: f32, axis: u32) -> MhdFlux {
             P.vx * P.bz - P.vz * P.bx,
             0.0, 0.0,
         );
-        F.f_bt1 = P.vx * P.by - P.vy * P.bx;  // flux of By in x-direction = -Ez_face
+        F.f_bt1 = P.vx * P.by - P.vy * P.bx;
         F.f_bt2 = P.vx * P.bz - P.vz * P.bx;
     } else {
-        // y-sweep: normal is y, transverse-1 is Bx, transverse-2 is Bz
         F.f0 = vec4<f32>(
             rho * P.vy,
             rho * P.vy * P.vx       - P.by * P.bx,
@@ -231,13 +288,12 @@ fn mhd_flux(P: MhdPrim, gamma: f32, axis: u32) -> MhdFlux {
             P.vy * P.bz - P.vz * P.by,
             0.0, 0.0,
         );
-        F.f_bt1 = P.vy * P.bx - P.vx * P.by;  // flux of Bx in y-direction = +Ez_face
+        F.f_bt1 = P.vy * P.bx - P.vx * P.by;
         F.f_bt2 = P.vy * P.bz - P.vz * P.by;
     }
     return F;
 }
 
-// Build the conservative state from primitive plus the three B components.
 struct ConsPair {
     U0: vec4<f32>,
     U1: vec4<f32>,

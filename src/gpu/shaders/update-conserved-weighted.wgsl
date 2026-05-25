@@ -1,21 +1,18 @@
 // ─── update-conserved-weighted.wgsl ──────────────────────────────────
-// Weighted RK3 SSP stage update for the 6-component cell-centered
-// conserved state. Replaces forward-Euler update-conserved.wgsl.
+// Weighted RK3 SSP stage update for the cell-centered conserved state.
 //
-//   U_out[i,j] = a0 · U_n[i,j] + a1 · U_other[i,j] + dt_w · L[i,j]
+//   U_out[i,j] = a0 · U_n[i,j] + a1 · U_other[i,j] + dt_w · dt · L[i,j]
 //
-// where L is the spatial RHS (-∇·F) evaluated on the U_other state's
-// fluxes, and `a0`, `a1`, `dt_w` are the per-stage SSP weights:
-//   Stage 1  (U_n → U_1):  a0=1,    a1=0,    dt_w=1
-//   Stage 2  (U_n,U_1 → U_2):  a0=3/4, a1=1/4, dt_w=1/4
-//   Stage 3  (U_n,U_2 → U_n+1): a0=1/3, a1=2/3, dt_w=2/3
+// where L is the spatial RHS (-∇·F) and a0/a1/dt_w are SSP weights.
 //
-// The `dt_w` here is the *coefficient*; the actual time step from
-// compute-dt is in dt_buf[0]. Total integration weight = dt_w · dt_buf[0].
+// Phase 4: direct indexing into ghost-padded buffers; the flux stencil
+// uses flux[i] (LEFT face of cell i) and flux[i+1] (LEFT face of cell
+// i+1, which is the RIGHT face of cell i):
 //
-// Stage 1 has `a1=0` so U_other is unused (but bound for layout
-// uniformity); we still read U_other to keep the bind-group shape
-// identical across stages.
+//   -∂F/∂x ≈ -(flux_x[i+1, j] - flux_x[i, j]) / dx
+//   -∂F/∂y ≈ -(flux_y[i, j+1] - flux_y[i, j]) / dx
+//
+// Dispatch covers interior cells: [ghost, ghost+N) × [ghost, ghost+N).
 //
 // Bindings:
 //   0 uniforms       (uniform)
@@ -55,31 +52,32 @@ struct StageParams {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let n = U_uniforms.grid_n;
-    if (gid.x >= n || gid.y >= n) { return; }
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
 
-    let n_i = i32(n);
-    let i   = i32(gid.x);
-    let j   = i32(gid.y);
+    if (gid.x >= n_interior || gid.y >= n_interior) { return; }
+    let ix = gid.x + ghost;
+    let iy = gid.y + ghost;
 
-    let idx_c   = cell_index(gid.x, gid.y, n);
-    let idx_xlo = cell_index_wrapped(i - 1, j, n_i);
-    let idx_ylo = cell_index_wrapped(i, j - 1, n_i);
+    let idx_c    = cell_idx_total(ix,      iy,      n_total);
+    let idx_xhi  = cell_idx_total(ix + 1u, iy,      n_total);  // right face: flux_x at (i+1, j)
+    let idx_yhi  = cell_idx_total(ix,      iy + 1u, n_total);  // top   face: flux_y at (i, j+1)
 
     let dt   = dt_buf[0];
-    let coef = stage_params.dt_w * dt / U_uniforms.dx;
+    let dx   = U_uniforms.dx;
+    let scale = stage_params.dt_w * dt / dx;
 
-    let dFx_0 = flux_x_0[idx_c] - flux_x_0[idx_xlo];
-    let dFy_0 = flux_y_0[idx_c] - flux_y_0[idx_ylo];
-    let dFx_1 = flux_x_1[idx_c] - flux_x_1[idx_xlo];
-    let dFy_1 = flux_y_1[idx_c] - flux_y_1[idx_ylo];
+    let dFx_0 = flux_x_0[idx_xhi] - flux_x_0[idx_c];
+    let dFy_0 = flux_y_0[idx_yhi] - flux_y_0[idx_c];
+    let dFx_1 = flux_x_1[idx_xhi] - flux_x_1[idx_c];
+    let dFy_1 = flux_y_1[idx_yhi] - flux_y_1[idx_c];
 
     let mask = vec4<f32>(1.0, 1.0, 0.0, 0.0);
 
-    let L0 = -(dFx_0 + dFy_0) / U_uniforms.dx;
-    let L1 = -mask * (dFx_1 + dFy_1) / U_uniforms.dx;
+    let L0 = -(dFx_0 + dFy_0) / dx;
+    let L1 = -mask * (dFx_1 + dFy_1) / dx;
 
-    // U_out = a0·U_n + a1·U_other + dt_w·dt·L
     U0_out[idx_c] =
         stage_params.a0 * U0_n[idx_c]
       + stage_params.a1 * U0_other[idx_c]
