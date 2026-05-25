@@ -53,7 +53,15 @@
 @group(0) @binding(9) var<storage, read_write> flux_0:    array<vec4<f32>>;
 @group(0) @binding(10) var<storage, read_write> flux_1:   array<vec4<f32>>;
 
-const HLLD_BX_EPS2: f32 = 1.0e-24;
+// Threshold below which the normal-B² triggers HLLD's Alfvén-degenerate
+// fallback to HLLC. Originally 1e-24 (essentially "exactly machine zero"),
+// but HANDOFF flagged that as too conservative: at thin current sheets,
+// |Bn| ~ 1e-5 is small enough that the full 5-wave HLLD path has tiny
+// denominators (rho·(S-u)² - bn² and S-S*), and the 1e-20 denominator
+// guards inflate bt_Ls = bt·g/safeDL into huge values that NaN-cascade.
+// 1e-10 means fall back to HLLC whenever |Bn| < ~1e-5·√ρ — robust at
+// near-degenerate sheets, no visible effect on bulk physics.
+const HLLD_BX_EPS2: f32 = 1.0e-10;
 const HLLD_WS_TOL:  f32 = 1.0e-8;
 
 fn unpack_edge_prim(edge0: vec4<f32>, edge1: vec4<f32>, b_normal: f32, axis: u32) -> MhdPrim {

@@ -120,7 +120,7 @@ function updateConservedWeightedBGL(device) {
         { binding: 7,  visibility: COMPUTE, buffer: RO_STO },   // flux_x_1
         { binding: 8,  visibility: COMPUTE, buffer: RO_STO },   // flux_y_0
         { binding: 9,  visibility: COMPUTE, buffer: RO_STO },   // flux_y_1
-        { binding: 10, visibility: COMPUTE, buffer: RO_STO },   // dt_buf
+        { binding: 10, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf (uniform: keeps storage count at 10)
         { binding: 11, visibility: COMPUTE, buffer: RW_STO },   // U0_out
         { binding: 12, visibility: COMPUTE, buffer: RW_STO },   // U1_out
     ]);
@@ -153,15 +153,21 @@ function applyBcsBGL(device) {
     ]);
 }
 
-// New in Phase 4. Explicit resistive diffusion.
+// New in Phase 4. Explicit resistive diffusion. Two entry points
+// (snapshot + main) share the same BGL; snapshot writes the snap
+// buffers and main reads them — so all six face/cell bindings are rw.
+// 7 storage bindings total (under the 10-per-stage cap).
 function applyResistivityBGL(device) {
     return bgl(device, 'plasma.applyResistivity.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
         { binding: 1, visibility: COMPUTE, buffer: UNIFORM },   // stage_params
-        { binding: 2, visibility: COMPUTE, buffer: RW_STO },    // Bx_face
-        { binding: 3, visibility: COMPUTE, buffer: RW_STO },    // By_face
-        { binding: 4, visibility: COMPUTE, buffer: RW_STO },    // U1_out (Bz lives in .y)
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },    // Bx_face   (dst)
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },    // By_face   (dst)
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },    // U1_out    (dst; Bz in .y)
         { binding: 5, visibility: COMPUTE, buffer: RO_STO },    // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },    // Bx_snap
+        { binding: 7, visibility: COMPUTE, buffer: RW_STO },    // By_snap
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },    // U1_snap
     ]);
 }
 
@@ -276,6 +282,11 @@ export async function createPipelines(device, format) {
         layout: mkPipeLayout(applyResLayout),
         compute: { module: applyResistivityModule, entryPoint: 'main' },
     });
+    const applyResSnapshot = device.createComputePipeline({
+        label: 'plasma.apply-resistivity.snapshot',
+        layout: mkPipeLayout(applyResLayout),
+        compute: { module: applyResistivityModule, entryPoint: 'snapshot' },
+    });
 
     const dtPipeLayout = mkPipeLayout(dtLayout);
     const dtReset = device.createComputePipeline({
@@ -338,7 +349,7 @@ export async function createPipelines(device, format) {
         pipelines: {
             reconstructPpm, riemannHlld, computeEmf,
             updateConservedWeighted, updateBWeighted,
-            applyBcs, applyResistivity,
+            applyBcs, applyResistivity, applyResSnapshot,
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite, licAdvect,
         },

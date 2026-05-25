@@ -13,6 +13,11 @@ const REQUIRED_LIMITS = {
     // most adapters report.
     maxStorageBufferBindingSize: 256 * 1024 * 1024,
     maxBufferSize: 256 * 1024 * 1024,
+    // Default per-stage limit is 8. update-conserved-weighted needs 10 storage
+    // buffers (after dt_buf was moved to a uniform binding) and riemann-hlld
+    // needs 10. Most desktop adapters advertise 10; clamped on request below
+    // so a constrained GPU doesn't reject outright (CPU fallback engages then).
+    maxStorageBuffersPerShaderStage: 10,
 };
 
 /**

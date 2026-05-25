@@ -107,6 +107,18 @@ export class PlasmaBuffers {
         // Per-stage scratch: Ez_edge recomputed each stage.
         this.Ez_edge = mkStorage('plasma.Ez_edge', u_f32_edge_bytes);
 
+        // ── Resistivity snapshot buffers ────────────────────────────
+        // apply-resistivity's 5-point Laplacian reads neighbors. WebGPU
+        // has no cross-invocation memory ordering inside a dispatch, so
+        // in-place read-modify-write on a `read_write` storage buffer
+        // races at workgroup-tile boundaries (manifests as regular-
+        // spacing artifacts at high η). Fix: snapshot dst → snap BEFORE
+        // the Laplacian, then have apply-resistivity read from snap
+        // (race-free) and write to dst.
+        this.Bx_res_snap = mkStorage('plasma.Bx_res_snap', u_f32_xface_bytes);
+        this.By_res_snap = mkStorage('plasma.By_res_snap', u_f32_yface_bytes);
+        this.U1_res_snap = mkStorage('plasma.U1_res_snap', u_v4_cell_bytes);
+
         // ── PPM edge states — 4 buffers × 2 axes = 8 buffers ───────
         this.edge_l_x_0 = mkStorage('plasma.edge_l_x_0', u_v4_cell_bytes);
         this.edge_l_x_1 = mkStorage('plasma.edge_l_x_1', u_v4_cell_bytes);
@@ -134,7 +146,17 @@ export class PlasmaBuffers {
         this.dt = device.createBuffer({
             label: 'plasma.dt',
             size: 16,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            // STORAGE: written by compute-dt's atomicMax reduction.
+            // UNIFORM: read by update-conserved-weighted (where dropping it
+            //   from the storage count is what gets us under the 10-binding
+            //   per-stage limit). Other consumers (update-b-weighted,
+            //   apply-resistivity) still bind it as storage; either is fine.
+            // COPY_SRC: stats-display reads dt back via ReadbackPool each
+            //   sample (12 Hz at 256²). Without this the copy validates out
+            //   and dt reads back as 0 — which is why simTime sat at 0 even
+            //   independently of the simTime-ratchet bug HANDOFF flagged.
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM
+                 | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
 
         // ── Uniforms: two sweep-direction buffers ──────────────────

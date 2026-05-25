@@ -76,6 +76,12 @@ export class Sim {
         this.eta      = ETA_DEFAULT;
         this.cfl      = CFL;
         this.pressureFloor = PRESSURE_FLOOR;
+        // Per-preset η floor coefficient — η_min = etaFloorCoeff · dx
+        // enforces a grid magnetic Reynolds limit so current-sheet
+        // thinning can't outrun dissipation and NaN-cascade. 0 disables
+        // the floor (1D shocks + Harris's thick-sheet geometry don't
+        // need it). Set by loadPreset.
+        this.etaFloorCoeff = 0;
 
         this.stepCount = 0;
         this.simTime   = 0;
@@ -128,11 +134,17 @@ export class Sim {
         this.gamma   = preset.gamma   ?? this.gamma;
         this.viewMin = preset.viewMin ?? this.viewMin;
         this.viewMax = preset.viewMax ?? this.viewMax;
-        this.eta     = preset.eta     ?? this.eta;
+        // Floor coeff must be set BEFORE dx (in case the preset changes
+        // domainLength) and BEFORE eta is clamped.
+        this.etaFloorCoeff = preset.etaFloorCoeff ?? 0;
         if (preset.domainLength) {
             this.domainLength = preset.domainLength;
             this.dx = preset.domainLength / this.n;
         }
+        // Apply preset's preferred η, then floor to the grid Reynolds limit.
+        // For presets without a floor (etaFloorCoeff = 0) this is a no-op
+        // and preset.eta (often 0 = ideal MHD) passes through unchanged.
+        this.eta = Math.max(preset.eta ?? this.eta, this.getEtaMin());
         if (preset.bc) {
             this.bcConfig = { ...this.bcConfig, ...preset.bc };
         }
@@ -183,9 +195,27 @@ export class Sim {
         this.buffers.pushBC(this.bcConfig);
     }
 
-    /** Update explicit resistivity. UI typically passes 0 for "ideal". */
+    /**
+     * Smallest stable resistivity at the current preset + resolution.
+     * Returns 0 if the active preset doesn't declare a floor.
+     *
+     * Grid magnetic Reynolds criterion: η ≳ C · v_char · dx. The
+     * preset's etaFloorCoeff bakes in the C · v_char product (calibrated
+     * empirically per preset); the dx factor adapts the floor to the
+     * current grid resolution automatically.
+     */
+    getEtaMin() {
+        return (this.etaFloorCoeff ?? 0) * this.dx;
+    }
+
+    /**
+     * Update explicit resistivity. UI typically passes 0 for "ideal", but
+     * for presets with an active η floor (currently Orszag-Tang) the
+     * value is clamped up to getEtaMin() to keep current-sheet thinning
+     * within the grid's resolvable scales.
+     */
     setEta(eta) {
-        this.eta = eta;
+        this.eta = Math.max(eta, this.getEtaMin());
         this._pushUniforms();
     }
 
@@ -367,6 +397,12 @@ export class Sim {
                 { binding: 3, resource: { buffer: By } },
                 { binding: 4, resource: { buffer: U1_out } },
                 { binding: 5, resource: { buffer: b.dt } },
+                // Snapshot buffers — see apply-resistivity.wgsl header.
+                // The snapshot dispatch writes these; the main dispatch
+                // reads them (race-free 5-point Laplacian).
+                { binding: 6, resource: { buffer: b.Bx_res_snap } },
+                { binding: 7, resource: { buffer: b.By_res_snap } },
+                { binding: 8, resource: { buffer: b.U1_res_snap } },
             ],
         });
     }
@@ -562,14 +598,21 @@ export class Sim {
         pass.setBindGroup(0, this._applyBcsBG(dstU0, dstU1, dstBx, dstBy));
         pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
 
-        // 9b. Resistivity (η ∇²B) — adds in-place to dstBx, dstBy, and
-        // the Bz component of dstU1. Reads neighbours from the same
-        // buffers; within a single dispatch, neighbour reads return
-        // pre-write values (WebGPU has no cross-invocation memory
-        // ordering inside a dispatch), which gives the correct
-        // explicit-Euler diffusion semantics.
+        // 9b. Snapshot dst → snap. Race-free per-cell copy; required
+        // because the next pass's 5-point Laplacian reads neighbours,
+        // and WebGPU has no cross-invocation memory ordering inside a
+        // dispatch — so reading from the same buffer being written
+        // racily picks up post-write values at workgroup-tile bounds.
+        // The snapshot decouples reads from writes (dispatches within
+        // a pass ARE sequenced, so main below sees snapshot's writes).
+        const resBg = this._applyResBG(stageBuf, dstBx, dstBy, dstU1);
+        pass.setPipeline(pipelines.pipelines.applyResSnapshot);
+        pass.setBindGroup(0, resBg);
+        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+
+        // 9c. Resistivity (η ∇²B) — reads snap, writes dst.
         pass.setPipeline(pipelines.pipelines.applyResistivity);
-        pass.setBindGroup(0, this._applyResBG(stageBuf, dstBx, dstBy, dstU1));
+        pass.setBindGroup(0, resBg);
         pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
     }
 

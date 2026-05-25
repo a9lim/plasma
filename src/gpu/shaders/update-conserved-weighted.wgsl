@@ -25,7 +25,7 @@
 //   7 flux_x_1       (ro)
 //   8 flux_y_0       (ro)
 //   9 flux_y_1       (ro)
-//  10 dt_buf         (ro)
+//  10 dt_buf         (uniform — keeps storage-buffer count at 10, the per-stage cap)
 //  11 U0_out         (rw)
 //  12 U1_out         (rw)
 
@@ -34,6 +34,17 @@ struct StageParams {
     a1:    f32,
     dt_w:  f32,
     _pad:  f32,
+};
+
+// Uniform wrapper around the dt scalar. compute-dt writes the underlying
+// buffer as storage<read_write>; we read it here as uniform to keep this
+// stage's storage-buffer binding count at exactly 10 (the per-stage cap
+// most desktop adapters expose). Padded to 16 B to match buffers.js.
+struct DtUniform {
+    dt:    f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 @group(0) @binding(0)  var<uniform> U_uniforms: Uniforms;
@@ -46,7 +57,7 @@ struct StageParams {
 @group(0) @binding(7)  var<storage, read>       flux_x_1: array<vec4<f32>>;
 @group(0) @binding(8)  var<storage, read>       flux_y_0: array<vec4<f32>>;
 @group(0) @binding(9)  var<storage, read>       flux_y_1: array<vec4<f32>>;
-@group(0) @binding(10) var<storage, read>       dt_buf:   array<f32, 1>;
+@group(0) @binding(10) var<uniform>             dt_buf:   DtUniform;
 @group(0) @binding(11) var<storage, read_write> U0_out:   array<vec4<f32>>;
 @group(0) @binding(12) var<storage, read_write> U1_out:   array<vec4<f32>>;
 
@@ -64,7 +75,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx_xhi  = cell_idx_total(ix + 1u, iy,      n_total);  // right face: flux_x at (i+1, j)
     let idx_yhi  = cell_idx_total(ix,      iy + 1u, n_total);  // top   face: flux_y at (i, j+1)
 
-    let dt   = dt_buf[0];
+    let dt   = dt_buf.dt;
     let dx   = U_uniforms.dx;
     let scale = stage_params.dt_w * dt / dx;
 
@@ -78,12 +89,50 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let L0 = -(dFx_0 + dFy_0) / dx;
     let L1 = -mask * (dFx_1 + dFy_1) / dx;
 
-    U0_out[idx_c] =
+    let u0_raw =
         stage_params.a0 * U0_n[idx_c]
       + stage_params.a1 * U0_other[idx_c]
       + stage_params.dt_w * dt * L0;
-    U1_out[idx_c] =
+    let u1_raw =
         stage_params.a0 * U1_n[idx_c]
       + stage_params.a1 * U1_other[idx_c]
       + stage_params.dt_w * dt * L1;
+
+    // ── Defensive sanitization ──────────────────────────────────────
+    // Catches NaN/Inf/sub-floor cells before they cascade through the
+    // next RK3 stage's HLLD + wavespeed reduction (a single NaN cell
+    // poisons the entire dt computation, and within ~5 steps the whole
+    // field is non-finite). The downstream cons_to_prim floor catches
+    // residual sub-physical states but only AFTER NaN has already
+    // propagated; intervening at the conserved-state write is the only
+    // place to break the cycle.
+    //
+    // NaN handling exploits IEEE-754 maxNum semantics: max(NaN, x) = x
+    // and min(NaN, x) = x. So clamp(NaN, low, high) = min(max(NaN, low),
+    // high) = min(low, high) = low. Density and energy thus snap to
+    // their floors automatically. For momentum and Bz (which can be
+    // any sign), we use `x == x` (false for NaN) to gate the value.
+
+    // Momentum: zero if non-finite (interpretation: "no motion").
+    let mx = select(0.0, u0_raw.y, u0_raw.y == u0_raw.y);
+    let my = select(0.0, u0_raw.z, u0_raw.z == u0_raw.z);
+    let mz = select(0.0, u0_raw.w, u0_raw.w == u0_raw.w);
+
+    // Density: clamp to [floor, large]. NaN → floor.
+    let rho = clamp(u0_raw.x, DENSITY_FLOOR, 1.0e30);
+
+    // KE from sanitized momentum and density. Guaranteed finite.
+    let ke = 0.5 * (mx*mx + my*my + mz*mz) / rho;
+
+    // Energy: must be at least KE + p_floor/(γ−1). We can't add the
+    // magnetic contribution here (Bx/By live on faces, not in U), but
+    // the downstream cons_to_prim floor catches the residual slop.
+    let E_min = ke + PRESSURE_FLOOR / (U_uniforms.gamma - 1.0);
+    let E = clamp(u1_raw.x, E_min, 1.0e30);
+
+    // Bz: zero if non-finite.
+    let bz = select(0.0, u1_raw.y, u1_raw.y == u1_raw.y);
+
+    U0_out[idx_c] = vec4<f32>(rho, mx, my, mz);
+    U1_out[idx_c] = vec4<f32>(E, bz, 0.0, 0.0);
 }
