@@ -139,7 +139,80 @@ export function makeBrioWuPreset(n = GRID_N) {
     };
 }
 
+/**
+ * Orszag-Tang vortex. The canonical 2D MHD test (Orszag & Tang 1979).
+ * γ = 5/3. Square periodic domain [0, 2π]².
+ *
+ *   ρ  = γ²        (= 25/9 ≈ 2.778)
+ *   p  = γ         (= 5/3)
+ *   vx = -sin(y)
+ *   vy =  sin(x)
+ *   vz =  0
+ *   Bx = -sin(y)
+ *   By =  sin(2x)
+ *   Bz =  0
+ *
+ * Face-centered B init follows the staggered convention:
+ *   Bx_face[i,j] lives at (x = (i+1)·dx, y = (j+½)·dx)   — x-face of cell (i,j)
+ *   By_face[i,j] lives at (x = (i+½)·dx, y = (j+1)·dx)   — y-face of cell (i,j)
+ * Cell centers are at (x = (i+½)·dx, y = (j+½)·dx).
+ *
+ * At t ≈ 0.5 (per Athena++ reference): a large central density blob, four
+ * developed current sheets, magnetic islands forming at the sheet
+ * intersections. The classic MHD-test acid test.
+ */
+export function makeOrszagTangPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 2.0 * Math.PI;
+    const dx = L / n;
+    const cells = n * n;
+    const U0 = new Float32Array(4 * cells);
+    const U1 = new Float32Array(4 * cells);
+    const Bx_face = new Float32Array(cells);
+    const By_face = new Float32Array(cells);
+
+    const rho = gamma * gamma;
+    const p   = gamma;
+
+    for (let j = 0; j < n; j++) {
+        const y_c = (j + 0.5) * dx;   // cell-center y
+        const y_xf = y_c;             // x-face y (same as cell-center for "right face of (i,j)")
+        const y_yf = (j + 1.0) * dx;  // y-face y (the upper face)
+        for (let i = 0; i < n; i++) {
+            const idx = j * n + i;
+            const x_c  = (i + 0.5) * dx;   // cell-center x
+            const x_xf = (i + 1.0) * dx;   // x-face x (the right face)
+            const x_yf = x_c;              // y-face x (cell-center)
+
+            // Cell-centered primitives.
+            const vx = -Math.sin(y_c);
+            const vy =  Math.sin(x_c);
+            const bx_c = -Math.sin(y_c);
+            const by_c =  Math.sin(2 * x_c);
+            const bz   = 0.0;
+
+            writeCell(U0, U1, idx, rho, vx, vy, 0, p, bx_c, by_c, bz, gamma);
+
+            // Face-centered B.
+            Bx_face[idx] = -Math.sin(y_xf);
+            By_face[idx] =  Math.sin(2 * x_yf);
+        }
+    }
+
+    return {
+        id: 'orszag-tang',
+        label: 'Orszag-Tang vortex',
+        gamma,
+        domainLength: L,
+        data: { U0, U1, Bx_face, By_face },
+        viewMin: 1.0,
+        viewMax: 6.0,
+        verifyTime: 0.5,
+    };
+}
+
 export const PRESETS = {
     sod: makeSodPreset,
     'brio-wu': makeBrioWuPreset,
+    'orszag-tang': makeOrszagTangPreset,
 };

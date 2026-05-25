@@ -38,7 +38,7 @@ Build phases:
 7. Phase 7: polish (about, edu-content, JSON-LD, OG image, pointer perturbation).
 8. Phase 8: parent-repo wiring.
 
-## Layout (current — Phase 3a, grows over time)
+## Layout (current — Phase 3b, grows over time)
 
 ```
 plasma/
@@ -50,29 +50,87 @@ plasma/
 ├── LICENSE                 ← AGPL-3.0
 └── src/
     ├── config.js           ← grid size, CFL, γ, view-mode enum, uniform layout
-    ├── sim.js              ← step orchestrator (4 submits/step in 3a)
-    ├── presets.js          ← Sod (hydro) + Brio-Wu (MHD) ICs
+    ├── sim.js              ← step orchestrator (2 submits/step: compute_dt, RK3-chain)
+    ├── presets.js          ← Sod (hydro), Brio-Wu (MHD shock tube), Orszag-Tang
     ├── colormaps.js        ← viridis LUT
     └── gpu/
         ├── device.js       ← adapter+device init module
-        ├── buffers.js      ← cell-state ping-pong, face-B ping-pong, edge-Ez
+        ├── buffers.js      ← 3-slot RK3 storage (U_n/U_1/U_2), face-B per slot, edge-Ez,
+        │                     8 PPM edge buffers, stage_params uniform buffers
         ├── pipelines.js    ← compute + render pipeline factory
         ├── render.js       ← view-field → colormap → composite
         └── shaders/
-            ├── shared-helpers.wgsl   ← MHD prim/cons, fast mag speed, face conv
-            ├── clear.wgsl            ← Phase-1 placeholder, currently unused
-            ├── reconstruct-plm.wgsl  ← per-direction PLM on MHD primitives
-            ├── riemann-hll.wgsl      ← MHD HLL (fast magnetosonic wave speed)
-            ├── compute-emf.wgsl      ← Balsara-Spicer Ez at corners
-            ├── update-conserved.wgsl ← unsplit U += -(∇·F)_x - (∇·F)_y
-            ├── update-b.wgsl         ← CT: face-B += -∇×E
-            ├── compute-dt.wgsl       ← MHD CFL via fast magnetosonic
-            ├── view-field.wgsl       ← scalar extract (ρ, p, |v|, |B|, Jz)
-            ├── colormap.wgsl         ← LUT lookup
-            └── composite.wgsl        ← canvas blit
+            ├── shared-helpers.wgsl              ← MHD prim/cons, fast mag speed, face conv
+            ├── clear.wgsl                      ← Phase-1 placeholder, currently unused
+            ├── reconstruct-ppm.wgsl            ← per-direction PPM (CW 1984) — L/R edge states
+            ├── riemann-hlld.wgsl               ← HLLD (M&K 2005) + HLLC + HLL fallbacks
+            ├── compute-emf.wgsl                ← Balsara-Spicer Ez at corners
+            ├── update-conserved-weighted.wgsl  ← RK3 SSP weighted U update
+            ├── update-b-weighted.wgsl          ← RK3 SSP weighted face-B update (CT)
+            ├── compute-dt.wgsl                 ← MHD CFL via fast magnetosonic
+            ├── view-field.wgsl                 ← scalar extract (ρ, p, |v|, |B|, Jz)
+            ├── colormap.wgsl                   ← LUT lookup
+            └── composite.wgsl                  ← canvas blit
 ```
 
-HLLD + PPM + RK3 SSP arrive in Phase 3b; resistivity and per-edge BCs in Phase 4.
+Resistivity and per-edge BCs in Phase 4.
+
+## Numerical method (Phase 3b)
+
+| Piece               | Choice                                         |
+|---------------------|------------------------------------------------|
+| Reconstruction      | PPM (Colella & Woodward 1984)                  |
+| Riemann solver      | HLLD (Miyoshi & Kusano 2005)                   |
+| Time integration    | RK3 SSP (Gottlieb-Shu 1998)                    |
+| Divergence-free B   | Constrained transport (Balsara-Spicer EMF)     |
+| Boundaries          | Periodic only (per-edge in Phase 4)            |
+| Resistivity         | η = 0 (added in Phase 4)                       |
+
+HLLD degenerate branches (all fall back to simpler solvers):
+1. **Branch A** (`Bx² < ε² · ρ`, ε² = 1e-24): Alfvén waves degenerate → HLLC.
+2. **Branch B** (`SR - SL < tol · (|SR| + |SL|)`, tol = 1e-8): wave-speed
+   coincidence → HLL.
+3. **Branch C** (star-state total pressure ≤ PRESSURE_FLOOR): negative
+   pressure → HLL.
+
+## RK3 SSP scheme
+
+    U(1)   = U(n) + dt · L(U(n))
+    U(2)   = (3/4)U(n) + (1/4)U(1) + (1/4)dt · L(U(1))
+    U(n+1) = (1/3)U(n) + (2/3)U(2) + (2/3)dt · L(U(2))
+
+`dt` is computed once at the start of the step (from U(n)) and reused
+across all three stages — required for SSP. Applied in lockstep to
+U_cell, Bx_face, By_face.
+
+Storage: three slots (`U_n`, `U_1`, `U_2`) for cell-centered conserved
+state + face-centered transverse B. Stage 3 writes back to slot N, so
+no buffer swap is needed at end of step.
+
+## Bind-group layout (transpiler-friendly contract)
+
+All compute pipelines use one bind group (group 0). Layouts are static,
+declared up front in `pipelines.js`, and documented per-shader in each
+shader's header comment.
+
+* No dynamic offsets.
+* No push constants (not in WebGPU regardless).
+* No subgroup ops, no shared-memory tricks beyond compute-dt's
+  workgroup tile-max reduction (a textbook pattern; trivially maps to
+  a per-workgroup loop on CPU).
+* Atomics confined to compute-dt (`atomic<u32>` over float bits via
+  `bitcast<u32>`).
+* `Uniforms` struct (with `sweep_dir`) is held in TWO buffers
+  (`uniform_x`, `uniform_y`) pre-written at preset load — passes that
+  want sweep_dir=0 bind `uniform_x`, sweep_dir=1 bind `uniform_y`.
+* Stage weights live in THREE small uniform buffers (`stage_1`,
+  `stage_2`, `stage_3`) written once at init. Each holds
+  `(a0, a1, dt_w, _pad)` for that stage's linear combination.
+
+The mental model is: every compute dispatch maps to a clean nested
+loop in JS over the workgroup grid, reading inputs from bound storage
+buffers and writing outputs. A future WebGPU→CPU transpiler can drop
+each shader into that loop pattern without architectural changes.
 
 ## Shared-module dependencies
 

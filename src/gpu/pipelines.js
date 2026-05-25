@@ -1,17 +1,24 @@
 /**
- * @fileoverview Compute / render pipeline factory (Phase 3a).
+ * @fileoverview Compute / render pipeline factory (Phase 3b).
  *
- * Phase 3a expands Phase 2's bind-group layouts to carry the MHD state
- * (two cell-centered vec4 arrays U0/U1, two face-centered scalar arrays
- * Bx_face/By_face, one edge-centered Ez_edge). Per-direction PLM slope
- * and HLL flux buffers (x- and y-side) coexist so a single unsplit CT
- * update sees both directions' fluxes.
+ * Phase 3b swaps:
+ *   reconstruct-plm.wgsl   → reconstruct-ppm.wgsl   (8 edge buffers, not 4 slope)
+ *   riemann-hll.wgsl       → riemann-hlld.wgsl     (reads l/r edge states)
+ *   update-conserved.wgsl  → update-conserved-weighted.wgsl  (+stage_params)
+ *   update-b.wgsl          → update-b-weighted.wgsl          (+stage_params)
+ *
+ * Bind-group layouts kept vanilla for the upcoming WebGPU→CPU transpiler
+ * contract:
+ *   - one uniform buffer + N storage buffers per layout
+ *   - no dynamic offsets
+ *   - no push constants
+ *   - no subgroup ops / shared-memory tricks
  *
  * Each shader is prepended with shared-helpers.wgsl. Cache-bust:
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 3;
+const SHADER_VERSION = 4;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -58,29 +65,33 @@ function dtBGL(device) {
     ]);
 }
 
-function reconstructBGL(device) {
-    return bgl(device, 'plasma.reconstruct.bgl', [
+function reconstructPpmBGL(device) {
+    return bgl(device, 'plasma.reconstructPpm.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
         { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
         { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
-        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // slopes_0
-        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // slopes_1
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // edge_l_0
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // edge_l_1
+        { binding: 7, visibility: COMPUTE, buffer: RW_STO },  // edge_r_0
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // edge_r_1
     ]);
 }
 
-function riemannBGL(device) {
-    return bgl(device, 'plasma.riemann.bgl', [
+function riemannHlldBGL(device) {
+    return bgl(device, 'plasma.riemannHlld.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
         { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
         { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
-        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // slopes_0
-        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // slopes_1
-        { binding: 7, visibility: COMPUTE, buffer: RW_STO },  // flux_0
-        { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // flux_1
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // edge_l_0
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // edge_l_1
+        { binding: 7, visibility: COMPUTE, buffer: RO_STO },  // edge_r_0
+        { binding: 8, visibility: COMPUTE, buffer: RO_STO },  // edge_r_1
+        { binding: 9, visibility: COMPUTE, buffer: RW_STO },  // flux_0
+        { binding: 10, visibility: COMPUTE, buffer: RW_STO }, // flux_1
     ]);
 }
 
@@ -93,30 +104,36 @@ function emfBGL(device) {
     ]);
 }
 
-function updateConservedBGL(device) {
-    return bgl(device, 'plasma.updateU.bgl', [
-        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
-        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0_in
-        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1_in
-        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // flux_x_0
-        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // flux_x_1
-        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // flux_y_0
-        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // flux_y_1
-        { binding: 7, visibility: COMPUTE, buffer: RO_STO },  // dt_buf
-        { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // U0_out
-        { binding: 9, visibility: COMPUTE, buffer: RW_STO },  // U1_out
+function updateConservedWeightedBGL(device) {
+    return bgl(device, 'plasma.updateUWeighted.bgl', [
+        { binding: 0,  visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1,  visibility: COMPUTE, buffer: UNIFORM },  // stage_params
+        { binding: 2,  visibility: COMPUTE, buffer: RO_STO },   // U0_n
+        { binding: 3,  visibility: COMPUTE, buffer: RO_STO },   // U1_n
+        { binding: 4,  visibility: COMPUTE, buffer: RO_STO },   // U0_other
+        { binding: 5,  visibility: COMPUTE, buffer: RO_STO },   // U1_other
+        { binding: 6,  visibility: COMPUTE, buffer: RO_STO },   // flux_x_0
+        { binding: 7,  visibility: COMPUTE, buffer: RO_STO },   // flux_x_1
+        { binding: 8,  visibility: COMPUTE, buffer: RO_STO },   // flux_y_0
+        { binding: 9,  visibility: COMPUTE, buffer: RO_STO },   // flux_y_1
+        { binding: 10, visibility: COMPUTE, buffer: RO_STO },   // dt_buf
+        { binding: 11, visibility: COMPUTE, buffer: RW_STO },   // U0_out
+        { binding: 12, visibility: COMPUTE, buffer: RW_STO },   // U1_out
     ]);
 }
 
-function updateBBGL(device) {
-    return bgl(device, 'plasma.updateB.bgl', [
+function updateBWeightedBGL(device) {
+    return bgl(device, 'plasma.updateBWeighted.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
-        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // Bx_in
-        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // By_in
-        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Ez_edge
-        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // dt_buf
-        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // Bx_out
-        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // By_out
+        { binding: 1, visibility: COMPUTE, buffer: UNIFORM },   // stage_params
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },    // Bx_n
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },    // By_n
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },    // Bx_other
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },    // By_other
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },    // Ez_edge
+        { binding: 7, visibility: COMPUTE, buffer: RO_STO },    // dt_buf
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },    // Bx_out
+        { binding: 9, visibility: COMPUTE, buffer: RW_STO },    // By_out
     ]);
 }
 
@@ -149,25 +166,25 @@ function compositeBGL(device) {
 
 export async function createPipelines(device, format) {
     const [
-        plmModule, riemannModule, emfModule, updateUModule, updateBModule,
+        ppmModule, hlldModule, emfModule, updateUWModule, updateBWModule,
         dtModule, viewModule, colormapModule, compositeModule,
     ] = await Promise.all([
-        makeModule(device, 'plasma.reconstruct-plm',   'reconstruct-plm.wgsl'),
-        makeModule(device, 'plasma.riemann-hll',       'riemann-hll.wgsl'),
-        makeModule(device, 'plasma.compute-emf',       'compute-emf.wgsl'),
-        makeModule(device, 'plasma.update-conserved',  'update-conserved.wgsl'),
-        makeModule(device, 'plasma.update-b',          'update-b.wgsl'),
-        makeModule(device, 'plasma.compute-dt',        'compute-dt.wgsl'),
-        makeModule(device, 'plasma.view-field',        'view-field.wgsl'),
-        makeModule(device, 'plasma.colormap',          'colormap.wgsl'),
-        makeModule(device, 'plasma.composite',         'composite.wgsl'),
+        makeModule(device, 'plasma.reconstruct-ppm',          'reconstruct-ppm.wgsl'),
+        makeModule(device, 'plasma.riemann-hlld',             'riemann-hlld.wgsl'),
+        makeModule(device, 'plasma.compute-emf',              'compute-emf.wgsl'),
+        makeModule(device, 'plasma.update-conserved-weighted', 'update-conserved-weighted.wgsl'),
+        makeModule(device, 'plasma.update-b-weighted',         'update-b-weighted.wgsl'),
+        makeModule(device, 'plasma.compute-dt',               'compute-dt.wgsl'),
+        makeModule(device, 'plasma.view-field',               'view-field.wgsl'),
+        makeModule(device, 'plasma.colormap',                 'colormap.wgsl'),
+        makeModule(device, 'plasma.composite',                'composite.wgsl'),
     ]);
 
-    const reconstructLayout = reconstructBGL(device);
-    const riemannLayout     = riemannBGL(device);
+    const reconstructLayout = reconstructPpmBGL(device);
+    const riemannLayout     = riemannHlldBGL(device);
     const emfLayout         = emfBGL(device);
-    const updateULayout     = updateConservedBGL(device);
-    const updateBLayout     = updateBBGL(device);
+    const updateULayout     = updateConservedWeightedBGL(device);
+    const updateBLayout     = updateBWeightedBGL(device);
     const dtLayout          = dtBGL(device);
     const viewLayout        = viewBGL(device);
     const colormapLayout    = colormapBGL(device);
@@ -175,30 +192,30 @@ export async function createPipelines(device, format) {
 
     const mkPipeLayout = (bgl) => device.createPipelineLayout({ bindGroupLayouts: [bgl] });
 
-    const reconstructPlm = device.createComputePipeline({
-        label: 'plasma.reconstruct-plm',
+    const reconstructPpm = device.createComputePipeline({
+        label: 'plasma.reconstruct-ppm',
         layout: mkPipeLayout(reconstructLayout),
-        compute: { module: plmModule, entryPoint: 'main' },
+        compute: { module: ppmModule, entryPoint: 'main' },
     });
-    const riemannHll = device.createComputePipeline({
-        label: 'plasma.riemann-hll',
+    const riemannHlld = device.createComputePipeline({
+        label: 'plasma.riemann-hlld',
         layout: mkPipeLayout(riemannLayout),
-        compute: { module: riemannModule, entryPoint: 'main' },
+        compute: { module: hlldModule, entryPoint: 'main' },
     });
     const computeEmf = device.createComputePipeline({
         label: 'plasma.compute-emf',
         layout: mkPipeLayout(emfLayout),
         compute: { module: emfModule, entryPoint: 'main' },
     });
-    const updateConserved = device.createComputePipeline({
-        label: 'plasma.update-conserved',
+    const updateConservedWeighted = device.createComputePipeline({
+        label: 'plasma.update-conserved-weighted',
         layout: mkPipeLayout(updateULayout),
-        compute: { module: updateUModule, entryPoint: 'main' },
+        compute: { module: updateUWModule, entryPoint: 'main' },
     });
-    const updateB = device.createComputePipeline({
-        label: 'plasma.update-b',
+    const updateBWeighted = device.createComputePipeline({
+        label: 'plasma.update-b-weighted',
         layout: mkPipeLayout(updateBLayout),
-        compute: { module: updateBModule, entryPoint: 'main' },
+        compute: { module: updateBWModule, entryPoint: 'main' },
     });
 
     const dtPipeLayout = mkPipeLayout(dtLayout);
@@ -251,7 +268,8 @@ export async function createPipelines(device, format) {
             composite:   compositeLayout,
         },
         pipelines: {
-            reconstructPlm, riemannHll, computeEmf, updateConserved, updateB,
+            reconstructPpm, riemannHlld, computeEmf,
+            updateConservedWeighted, updateBWeighted,
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite,
         },

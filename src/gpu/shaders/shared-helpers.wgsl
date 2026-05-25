@@ -1,5 +1,34 @@
 // ─── shared-helpers.wgsl ─────────────────────────────────────────────
-// Phase 3a: 2.5D ideal MHD on a Yee-style staggered grid.
+// Phase 3b: 2.5D ideal MHD on a Yee-style staggered grid.
+//   • PPM reconstruction (Colella & Woodward 1984) — produces per-cell,
+//     per-direction L/R primitive face states (no slopes).
+//   • HLLD Riemann (Miyoshi & Kusano 2005) — 5-wave structure, with
+//     HLLC and HLL fallbacks for the three documented degenerate branches.
+//   • RK3 SSP — three storage slots (n/1/2) for U_cell + face B,
+//     updated in lockstep. Stage weights live in three small uniform
+//     buffers (stage_1, stage_2, stage_3), written once at init.
+//
+// ── Transpiler contract (vanilla WebGPU only) ───────────────────────
+// The codebase is written so a future WebGPU→CPU JS transpiler can map
+// each compute dispatch onto a clean nested loop:
+//   • No subgroup ops, no indirect dispatch, no push constants.
+//   • All bind-group layouts are static: one uniform + N storage buffers,
+//     no dynamic offsets.
+//   • Workgroup-shared memory only in compute-dt's reduction (a textbook
+//     tile-max pattern; trivially maps to a per-workgroup loop on CPU).
+//   • Atomics confined to compute-dt (`atomic<u32>` over float bits via
+//     bitcast); easy CPU emulation.
+//   • Per-stage parameters are immutable uniform buffers; per-sweep
+//     direction is a second immutable uniform buffer. The transpiler
+//     just binds the right pair per dispatch.
+//
+// ── Bind-group layouts (transpiler reads these as nested-loop kernels) ─
+// All compute pipelines use one bind group (group 0) shaped as:
+//   binding 0: uniform Uniforms        (per sweep direction)
+//   binding 1..N: storage buffers      (read-only or read-write)
+// Weighted-update pipelines add an additional uniform StageParams at
+// binding 1. The exact entries-per-shader are documented in each shader's
+// header.
 //
 // ── State layout ────────────────────────────────────────────────────
 // Cell-centered conserved state, packed as TWO vec4<f32> arrays per

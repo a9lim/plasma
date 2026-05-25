@@ -26,12 +26,15 @@ export class PlasmaRenderer {
         this.buffers = buffers;
 
         // colormap and composite bind groups only depend on buffers we
-        // don't ping-pong, so build them up front.
+        // don't ping-pong, so build them up front. Use uniform_x as the
+        // canonical "view" uniform binding (sweep_dir is irrelevant for
+        // viz passes — they read all of dx/gamma/view_min/view_max/
+        // view_mode from the same struct shape).
         this._colormapBG = device.createBindGroup({
             label: 'plasma.colormap.bg',
             layout: pipelines.layouts.colormap,
             entries: [
-                { binding: 0, resource: { buffer: buffers.uniform } },
+                { binding: 0, resource: { buffer: buffers.uniform_x } },
                 { binding: 1, resource: { buffer: buffers.field } },
                 { binding: 2, resource: { buffer: buffers.lut } },
                 { binding: 3, resource: { buffer: buffers.colored } },
@@ -42,26 +45,27 @@ export class PlasmaRenderer {
             label: 'plasma.composite.bg',
             layout: pipelines.layouts.composite,
             entries: [
-                { binding: 0, resource: { buffer: buffers.uniform } },
+                { binding: 0, resource: { buffer: buffers.uniform_x } },
                 { binding: 1, resource: { buffer: buffers.colored } },
             ],
         });
     }
 
     _viewBindGroup() {
-        // Recreate every render — the buffers ping-pong each step (cell-
-        // state AND face-B together) and we want the current view to
-        // reflect the freshly-stepped state. Cost is < 50 µs.
+        // U_n is the start-of-step state, which after sim.swap() points
+        // at the just-finished step's destination. We rebuild every
+        // render because the underlying buffer handle ping-pongs between
+        // (A, B). Cost is < 50 µs.
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.viewField.bg',
             layout: this.pipelines.layouts.view,
             entries: [
-                { binding: 0, resource: { buffer: b.uniform } },
-                { binding: 1, resource: { buffer: b.U0_current } },
-                { binding: 2, resource: { buffer: b.U1_current } },
-                { binding: 3, resource: { buffer: b.Bx_current } },
-                { binding: 4, resource: { buffer: b.By_current } },
+                { binding: 0, resource: { buffer: b.uniform_x } },
+                { binding: 1, resource: { buffer: b.U0_n } },
+                { binding: 2, resource: { buffer: b.U1_n } },
+                { binding: 3, resource: { buffer: b.Bx_n } },
+                { binding: 4, resource: { buffer: b.By_n } },
                 { binding: 5, resource: { buffer: b.field } },
             ],
         });
