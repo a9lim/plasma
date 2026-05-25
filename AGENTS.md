@@ -38,25 +38,41 @@ Build phases:
 7. Phase 7: polish (about, edu-content, JSON-LD, OG image, pointer perturbation).
 8. Phase 8: parent-repo wiring.
 
-## Layout (Phase 1 — grows over time)
+## Layout (current — Phase 3a, grows over time)
 
 ```
 plasma/
 ├── index.html              ← canvas + no-WebGPU fallback
-├── main.js                 ← entry: WebGPU init, frame loop
+├── main.js                 ← entry: WebGPU init, frame loop, accumulator
 ├── styles.css              ← canvas + fallback layout (HUD lands later)
 ├── colors.js               ← _PALETTE extensions, frozen at startup
 ├── about.md                ← educational content (stub until Phase 7)
 ├── LICENSE                 ← AGPL-3.0
 └── src/
+    ├── config.js           ← grid size, CFL, γ, view-mode enum, uniform layout
+    ├── sim.js              ← step orchestrator (4 submits/step in 3a)
+    ├── presets.js          ← Sod (hydro) + Brio-Wu (MHD) ICs
+    ├── colormaps.js        ← viridis LUT
     └── gpu/
         ├── device.js       ← adapter+device init module
+        ├── buffers.js      ← cell-state ping-pong, face-B ping-pong, edge-Ez
+        ├── pipelines.js    ← compute + render pipeline factory
+        ├── render.js       ← view-field → colormap → composite
         └── shaders/
-            └── clear.wgsl  ← fullscreen-quad clear (placeholder for compositor)
+            ├── shared-helpers.wgsl   ← MHD prim/cons, fast mag speed, face conv
+            ├── clear.wgsl            ← Phase-1 placeholder, currently unused
+            ├── reconstruct-plm.wgsl  ← per-direction PLM on MHD primitives
+            ├── riemann-hll.wgsl      ← MHD HLL (fast magnetosonic wave speed)
+            ├── compute-emf.wgsl      ← Balsara-Spicer Ez at corners
+            ├── update-conserved.wgsl ← unsplit U += -(∇·F)_x - (∇·F)_y
+            ├── update-b.wgsl         ← CT: face-B += -∇×E
+            ├── compute-dt.wgsl       ← MHD CFL via fast magnetosonic
+            ├── view-field.wgsl       ← scalar extract (ρ, p, |v|, |B|, Jz)
+            ├── colormap.wgsl         ← LUT lookup
+            └── composite.wgsl        ← canvas blit
 ```
 
-Future-phase additions land under `src/` (`sim.js`, `presets.js`, `boundary.js`,
-…) and `src/gpu/` (`buffers.js`, `pipelines.js`, `render.js`, `lic.js`, more shaders).
+HLLD + PPM + RK3 SSP arrive in Phase 3b; resistivity and per-edge BCs in Phase 4.
 
 ## Shared-module dependencies
 

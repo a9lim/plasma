@@ -1,22 +1,17 @@
 /**
- * @fileoverview Compute / render pipeline factory.
+ * @fileoverview Compute / render pipeline factory (Phase 3a).
  *
- * Mirrors geon's gpu-pipelines.js spirit — single concat of a shared
- * WGSL prelude + per-pipeline shader source — but adapted for the grid
- * Eulerian compute graph instead of particle Lagrangian. Each shader
- * is prepended with shared-helpers.wgsl so the `Uniforms` struct, the
- * cons↔prim helpers, and the wrap helpers are visible everywhere.
+ * Phase 3a expands Phase 2's bind-group layouts to carry the MHD state
+ * (two cell-centered vec4 arrays U0/U1, two face-centered scalar arrays
+ * Bx_face/By_face, one edge-centered Ez_edge). Per-direction PLM slope
+ * and HLL flux buffers (x- and y-side) coexist so a single unsplit CT
+ * update sees both directions' fluxes.
  *
- * The bind-group layout for every Phase-2 compute pipeline keeps slot 0
- * as the uniform buffer; sweep pipelines share an identical layout so
- * dispatching them in alternating x/y order doesn't require rebuilding
- * bind groups. See sim.js for the actual encoding.
- *
- * Cache-bust: bump SHADER_VERSION whenever a .wgsl file is edited so
- * browsers refetch instead of serving a stale module.
+ * Each shader is prepended with shared-helpers.wgsl. Cache-bust:
+ * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 2;
+const SHADER_VERSION = 3;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -25,7 +20,6 @@ async function fetchWGSL(filename) {
     return resp.text();
 }
 
-/** Module-scope cache for the shared helpers — fetched at most once. */
 let _sharedHelpersPromise = null;
 function getSharedHelpers() {
     if (!_sharedHelpersPromise) {
@@ -45,140 +39,169 @@ function bgl(device, label, entries) {
     return device.createBindGroupLayout({ label, entries });
 }
 
-const COMPUTE = GPUShaderStage.COMPUTE;
+const COMPUTE  = GPUShaderStage.COMPUTE;
 const FRAGMENT = GPUShaderStage.FRAGMENT;
-const VERTEX = GPUShaderStage.VERTEX;
+const VERTEX   = GPUShaderStage.VERTEX;
+const RO_STO   = { type: 'read-only-storage' };
+const RW_STO   = { type: 'storage' };
+const UNIFORM  = { type: 'uniform' };
 
-/**
- * Build the unified sweep bind-group layout — same shape for
- * reconstruct, riemann, and update so we can reuse bind groups across
- * the three passes within a single sweep.
- *
- * Layout:
- *   0 — Uniforms (uniform)
- *   1 — U_in       (read-only storage)
- *   2 — slopes     (read-write storage)
- *   3 — flux       (read-write storage)
- *   4 — U_out      (read-write storage)
- *   5 — dt_buf     (read-only storage)
- */
-function sweepBGL(device) {
-    return bgl(device, 'plasma.sweep.bgl', [
-        { binding: 0, visibility: COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: COMPUTE, buffer: { type: 'storage' } },
-        { binding: 3, visibility: COMPUTE, buffer: { type: 'storage' } },
-        { binding: 4, visibility: COMPUTE, buffer: { type: 'storage' } },
-        { binding: 5, visibility: COMPUTE, buffer: { type: 'read-only-storage' } },
-    ]);
-}
-
-/**
- * compute-dt bind group:
- *   0 — Uniforms (uniform)
- *   1 — U_in       (read-only storage)
- *   2 — wavespeed  (atomic<u32> as storage)
- *   3 — dt_buf     (storage)
- */
 function dtBGL(device) {
     return bgl(device, 'plasma.computeDt.bgl', [
-        { binding: 0, visibility: COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: COMPUTE, buffer: { type: 'storage' } },
-        { binding: 3, visibility: COMPUTE, buffer: { type: 'storage' } },
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // wavespeed atomic
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // dt_buf
     ]);
 }
 
-/**
- * view-field bind group:
- *   0 — Uniforms
- *   1 — U_in   (read-only storage)
- *   2 — field  (storage)
- */
+function reconstructBGL(device) {
+    return bgl(device, 'plasma.reconstruct.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // slopes_0
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // slopes_1
+    ]);
+}
+
+function riemannBGL(device) {
+    return bgl(device, 'plasma.riemann.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // slopes_0
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // slopes_1
+        { binding: 7, visibility: COMPUTE, buffer: RW_STO },  // flux_0
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // flux_1
+    ]);
+}
+
+function emfBGL(device) {
+    return bgl(device, 'plasma.emf.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // flux_x_1
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // flux_y_1
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },  // Ez_edge
+    ]);
+}
+
+function updateConservedBGL(device) {
+    return bgl(device, 'plasma.updateU.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0_in
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1_in
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // flux_x_0
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // flux_x_1
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // flux_y_0
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // flux_y_1
+        { binding: 7, visibility: COMPUTE, buffer: RO_STO },  // dt_buf
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // U0_out
+        { binding: 9, visibility: COMPUTE, buffer: RW_STO },  // U1_out
+    ]);
+}
+
+function updateBBGL(device) {
+    return bgl(device, 'plasma.updateB.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // Bx_in
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // By_in
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Ez_edge
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // dt_buf
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // Bx_out
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // By_out
+    ]);
+}
+
 function viewBGL(device) {
     return bgl(device, 'plasma.viewField.bgl', [
-        { binding: 0, visibility: COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: COMPUTE, buffer: { type: 'storage' } },
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // field
     ]);
 }
 
-/**
- * colormap bind group:
- *   0 — Uniforms
- *   1 — field    (read-only storage)
- *   2 — lut      (read-only storage)
- *   3 — colored  (storage)
- */
 function colormapBGL(device) {
     return bgl(device, 'plasma.colormap.bgl', [
-        { binding: 0, visibility: COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 3, visibility: COMPUTE, buffer: { type: 'storage' } },
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },
     ]);
 }
 
-/**
- * composite bind group (used by a render pipeline):
- *   0 — Uniforms (visible in vertex + fragment)
- *   1 — colored (read-only storage, fragment)
- */
 function compositeBGL(device) {
     return bgl(device, 'plasma.composite.bgl', [
-        { binding: 0, visibility: VERTEX | FRAGMENT, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: FRAGMENT,         buffer: { type: 'read-only-storage' } },
+        { binding: 0, visibility: VERTEX | FRAGMENT, buffer: UNIFORM },
+        { binding: 1, visibility: FRAGMENT,          buffer: RO_STO },
     ]);
 }
 
-/**
- * Create every pipeline the sim needs in one go. Returns an object
- * holding all pipelines and their bind-group layouts.
- */
 export async function createPipelines(device, format) {
-    // Shader modules
     const [
-        plmModule, riemannModule, updateModule,
+        plmModule, riemannModule, emfModule, updateUModule, updateBModule,
         dtModule, viewModule, colormapModule, compositeModule,
     ] = await Promise.all([
         makeModule(device, 'plasma.reconstruct-plm',   'reconstruct-plm.wgsl'),
         makeModule(device, 'plasma.riemann-hll',       'riemann-hll.wgsl'),
+        makeModule(device, 'plasma.compute-emf',       'compute-emf.wgsl'),
         makeModule(device, 'plasma.update-conserved',  'update-conserved.wgsl'),
+        makeModule(device, 'plasma.update-b',          'update-b.wgsl'),
         makeModule(device, 'plasma.compute-dt',        'compute-dt.wgsl'),
         makeModule(device, 'plasma.view-field',        'view-field.wgsl'),
         makeModule(device, 'plasma.colormap',          'colormap.wgsl'),
         makeModule(device, 'plasma.composite',         'composite.wgsl'),
     ]);
 
-    // Bind-group layouts
-    const sweepLayout     = sweepBGL(device);
-    const dtLayout        = dtBGL(device);
-    const viewLayout      = viewBGL(device);
-    const colormapLayout  = colormapBGL(device);
-    const compositeLayout = compositeBGL(device);
+    const reconstructLayout = reconstructBGL(device);
+    const riemannLayout     = riemannBGL(device);
+    const emfLayout         = emfBGL(device);
+    const updateULayout     = updateConservedBGL(device);
+    const updateBLayout     = updateBBGL(device);
+    const dtLayout          = dtBGL(device);
+    const viewLayout        = viewBGL(device);
+    const colormapLayout    = colormapBGL(device);
+    const compositeLayout   = compositeBGL(device);
 
-    const sweepPipeLayout     = device.createPipelineLayout({ bindGroupLayouts: [sweepLayout] });
-    const dtPipeLayout        = device.createPipelineLayout({ bindGroupLayouts: [dtLayout] });
-    const viewPipeLayout      = device.createPipelineLayout({ bindGroupLayouts: [viewLayout] });
-    const colormapPipeLayout  = device.createPipelineLayout({ bindGroupLayouts: [colormapLayout] });
-    const compositePipeLayout = device.createPipelineLayout({ bindGroupLayouts: [compositeLayout] });
+    const mkPipeLayout = (bgl) => device.createPipelineLayout({ bindGroupLayouts: [bgl] });
 
     const reconstructPlm = device.createComputePipeline({
         label: 'plasma.reconstruct-plm',
-        layout: sweepPipeLayout,
+        layout: mkPipeLayout(reconstructLayout),
         compute: { module: plmModule, entryPoint: 'main' },
     });
     const riemannHll = device.createComputePipeline({
         label: 'plasma.riemann-hll',
-        layout: sweepPipeLayout,
+        layout: mkPipeLayout(riemannLayout),
         compute: { module: riemannModule, entryPoint: 'main' },
+    });
+    const computeEmf = device.createComputePipeline({
+        label: 'plasma.compute-emf',
+        layout: mkPipeLayout(emfLayout),
+        compute: { module: emfModule, entryPoint: 'main' },
     });
     const updateConserved = device.createComputePipeline({
         label: 'plasma.update-conserved',
-        layout: sweepPipeLayout,
-        compute: { module: updateModule, entryPoint: 'main' },
+        layout: mkPipeLayout(updateULayout),
+        compute: { module: updateUModule, entryPoint: 'main' },
+    });
+    const updateB = device.createComputePipeline({
+        label: 'plasma.update-b',
+        layout: mkPipeLayout(updateBLayout),
+        compute: { module: updateBModule, entryPoint: 'main' },
     });
 
+    const dtPipeLayout = mkPipeLayout(dtLayout);
     const dtReset = device.createComputePipeline({
         label: 'plasma.compute-dt.reset',
         layout: dtPipeLayout,
@@ -197,19 +220,19 @@ export async function createPipelines(device, format) {
 
     const viewField = device.createComputePipeline({
         label: 'plasma.view-field',
-        layout: viewPipeLayout,
+        layout: mkPipeLayout(viewLayout),
         compute: { module: viewModule, entryPoint: 'main' },
     });
 
     const colormap = device.createComputePipeline({
         label: 'plasma.colormap',
-        layout: colormapPipeLayout,
+        layout: mkPipeLayout(colormapLayout),
         compute: { module: colormapModule, entryPoint: 'main' },
     });
 
     const composite = device.createRenderPipeline({
         label: 'plasma.composite',
-        layout: compositePipeLayout,
+        layout: mkPipeLayout(compositeLayout),
         vertex:   { module: compositeModule, entryPoint: 'vsMain' },
         fragment: { module: compositeModule, entryPoint: 'fsMain', targets: [{ format }] },
         primitive: { topology: 'triangle-list' },
@@ -217,14 +240,18 @@ export async function createPipelines(device, format) {
 
     return {
         layouts: {
-            sweep: sweepLayout,
-            dt: dtLayout,
-            view: viewLayout,
-            colormap: colormapLayout,
-            composite: compositeLayout,
+            reconstruct: reconstructLayout,
+            riemann:     riemannLayout,
+            emf:         emfLayout,
+            updateU:     updateULayout,
+            updateB:     updateBLayout,
+            dt:          dtLayout,
+            view:        viewLayout,
+            colormap:    colormapLayout,
+            composite:   compositeLayout,
         },
         pipelines: {
-            reconstructPlm, riemannHll, updateConserved,
+            reconstructPlm, riemannHll, computeEmf, updateConserved, updateB,
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite,
         },

@@ -2,13 +2,12 @@
  * @fileoverview View-field → colormap → composite render chain.
  *
  * Three GPU passes wired into one entry point:
- *   1. view-field   — compute: U_current → field (scalar density)
+ *   1. view-field   — compute: U_current + face B → field (scalar by view-mode)
  *   2. colormap     — compute: field + LUT → colored (vec4 RGB)
  *   3. composite    — render:  colored → canvas via fullscreen triangle
  *
- * Bind groups are rebuilt lazily when `current` ping-pongs (it changes
- * mid-step), so we cache the most recent (buffers.current, bindGroup)
- * pair and only recreate when the source buffer changes.
+ * view-field's bind group is rebuilt every render — the buffers ping-pong
+ * every step (cell-state AND face-B together).
  */
 
 const WG = 8;
@@ -25,9 +24,6 @@ export class PlasmaRenderer {
         this.context = context;
         this.pipelines = pipelines;
         this.buffers = buffers;
-
-        this._viewBG = null;
-        this._viewBGSource = null;
 
         // colormap and composite bind groups only depend on buffers we
         // don't ping-pong, so build them up front.
@@ -53,19 +49,22 @@ export class PlasmaRenderer {
     }
 
     _viewBindGroup() {
-        const src = this.buffers.current;
-        if (this._viewBG && this._viewBGSource === src) return this._viewBG;
-        this._viewBG = this.device.createBindGroup({
+        // Recreate every render — the buffers ping-pong each step (cell-
+        // state AND face-B together) and we want the current view to
+        // reflect the freshly-stepped state. Cost is < 50 µs.
+        const b = this.buffers;
+        return this.device.createBindGroup({
             label: 'plasma.viewField.bg',
             layout: this.pipelines.layouts.view,
             entries: [
-                { binding: 0, resource: { buffer: this.buffers.uniform } },
-                { binding: 1, resource: { buffer: src } },
-                { binding: 2, resource: { buffer: this.buffers.field } },
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.U0_current } },
+                { binding: 2, resource: { buffer: b.U1_current } },
+                { binding: 3, resource: { buffer: b.Bx_current } },
+                { binding: 4, resource: { buffer: b.By_current } },
+                { binding: 5, resource: { buffer: b.field } },
             ],
         });
-        this._viewBGSource = src;
-        return this._viewBG;
     }
 
     /**

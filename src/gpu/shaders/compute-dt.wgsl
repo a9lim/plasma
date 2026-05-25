@@ -1,28 +1,30 @@
 // ─── compute-dt.wgsl ─────────────────────────────────────────────────
-// Two entry points:
+// Three entry points (reset / reduce / finalize), unchanged in shape
+// from Phase 2.  The per-cell signal speed estimate now uses the fast
+// magnetosonic speed instead of pure sound speed:
 //
-//   reset:      Single-thread dispatch. Zeroes the atomic wave-speed
-//               buffer so reduce can start fresh.
+//   per direction: |v_dir| + c_fast_dir
+//   reduce to max over both directions across the grid
 //
-//   reduce:     One workgroup per tile; each invocation computes
-//               (|vx| + c_s) + (|vy| + c_s) at its cell and combines
-//               into a workgroup-local atomic, then to a global atomic.
-//               Uses bitcast<u32>(f32) — valid for non-negative floats
-//               because IEEE-754 magnitude is monotonic on positive
-//               values.
+// c_fast for the x-direction uses Bx² in the Alfvén term; for the y-
+// direction it uses By². We take the larger of the two.
 //
-//   finalize:   Single-thread dispatch. Reads the bitcasted u32 max
-//               wave speed, computes dt = CFL · dx / max_speed, clamps
-//               to [DT_MIN, DT_MAX], writes to dt_buf[0].
-//
-// 2D sweep-split CFL: the per-cell signal speed across the dimensional
-// split is max over directions, so a single combined |v|+c_s estimate
-// per axis works.  We take the max of the x- and y-direction estimates.
+// Bindings:
+//   0 uniforms   (uniform)
+//   1 U0_in      (ro)
+//   2 U1_in      (ro)
+//   3 Bx_face    (ro)
+//   4 By_face    (ro)
+//   5 wavespeed  (atomic<u32>)
+//   6 dt_buf     (rw)
 
 @group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
-@group(0) @binding(1) var<storage, read>           U_in:        array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write>     wavespeed:   atomic<u32>;
-@group(0) @binding(3) var<storage, read_write>     dt_buf:      array<f32, 1>;
+@group(0) @binding(1) var<storage, read>           U0_in:       array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>           U1_in:       array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read>           Bx_face:     array<f32>;
+@group(0) @binding(4) var<storage, read>           By_face:     array<f32>;
+@group(0) @binding(5) var<storage, read_write>     wavespeed:   atomic<u32>;
+@group(0) @binding(6) var<storage, read_write>     dt_buf:      array<f32, 1>;
 
 const CFL_NUMBER: f32 = 0.4;
 const DT_MIN: f32 = 1.0e-8;
@@ -45,12 +47,14 @@ fn reduce(
 
     let n = U_uniforms.grid_n;
     if (gid.x < n && gid.y < n) {
-        let prim = cons_to_prim(U_in[cell_index(gid.x, gid.y, n)], U_uniforms.gamma);
-        let cs   = sound_speed(prim, U_uniforms.gamma);
-        // Max over directions — what dimensional splitting actually
-        // bounds per substep.
-        let sx = abs(prim.y) + cs;
-        let sy = abs(prim.z) + cs;
+        let bx = 0.5 * (Bx_face[bx_face_left_index(gid.x, gid.y, n)] + Bx_face[bx_face_right_index(gid.x, gid.y, n)]);
+        let by = 0.5 * (By_face[by_face_down_index(gid.x, gid.y, n)] + By_face[by_face_up_index(gid.x, gid.y, n)]);
+        let idx = cell_index(gid.x, gid.y, n);
+        let P  = cons_to_prim_mhd(U0_in[idx], U1_in[idx], bx, by, U_uniforms.gamma);
+        let cfx = fast_mag_speed(P, U_uniforms.gamma, 0u);
+        let cfy = fast_mag_speed(P, U_uniforms.gamma, 1u);
+        let sx = abs(P.vx) + cfx;
+        let sy = abs(P.vy) + cfy;
         let s  = max(sx, sy);
         atomicMax(&tile_max, bitcast<u32>(s));
     }

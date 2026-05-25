@@ -1,41 +1,41 @@
 /**
- * @fileoverview Phase 2 orchestrator.
+ * @fileoverview Phase 3a orchestrator — 2.5D ideal MHD with CT.
  *
- * Encapsulates the GPU side of the sim: owns buffers, pipelines, the
- * renderer, and the per-step encoding logic. Wired up from main.js,
- * which still owns the rAF loop + accumulator + visibilitychange.
+ * Pipeline per step:
+ *   Submit 1 (compute_dt): reset → reduce → finalize. Sweep_dir = 0.
+ *   Submit 2 (x-sweep RC+Riemann): writeBuffer sweep_dir=0; PLM_x → HLL_x.
+ *                                  Writes flux_x_0/flux_x_1, slopes_x_*.
+ *   Submit 3 (y-sweep RC+Riemann): writeBuffer sweep_dir=1; PLM_y → HLL_y.
+ *                                  Writes flux_y_0/flux_y_1, slopes_y_*.
+ *   Submit 4 (unsplit CT update): compute_emf → update_conserved → update_b.
+ *                                 Writes U0_next, U1_next, Bx_next, By_next.
+ *   buffers.swap() flips current/next.
  *
- * Time integration: dimensional-split forward Euler.
- *   per step:
- *     1. compute_dt (reset → reduce → finalize) on current state
- *     2. sweep along axis A: PLM → HLL → update  (ping-pong U)
- *     3. sweep along axis B: PLM → HLL → update  (ping-pong U)
- *   Strang ordering: even step → (X, Y), odd step → (Y, X)
+ * Why 4 submits: writeBuffer for the sweep_dir uniform must complete
+ * before the bound shader reads it. Within a single submit, prior
+ * writeBuffers are visible to the encoded passes — but multiple
+ * writeBuffers before one submit all land in the queue and the encoder
+ * sees only the last value. Splitting into separate submits is what
+ * makes the per-pass uniform difference real.
  *
- * Submit boundaries: queue.writeBuffer() is processed by the queue in
- * insertion order BEFORE any subsequent command buffer's contents. If
- * we batched compute_dt + both sweeps into a single encoder + submit,
- * the second and third writeBuffer() calls (for the sweep_dir flip)
- * would land before any pass ran, clobbering the first sweep's
- * uniform values. We therefore submit three command buffers per step:
- * one for dt, one per sweep. The CPU side cost is trivial.
+ * Pre-flight for Phase 3b: RK3 is 3 stages × (dt + x-sweep + y-sweep +
+ * unsplit_update) = 12 submits, which is too many. The right shape is
+ * to move sweep_dir (and stage_weight) into a storage buffer written
+ * by a tiny init pass; that lets a whole step encode in 1-2 submits.
+ * For 3a we ship the simpler writeBuffer pattern and document the
+ * call-out below.
  */
 
 import { PlasmaBuffers } from './gpu/buffers.js';
 import { createPipelines } from './gpu/pipelines.js';
 import { PlasmaRenderer } from './gpu/render.js';
-import { makeSodPreset } from './presets.js';
+import { makeBrioWuPreset } from './presets.js';
 import { VIRIDIS } from './colormaps.js';
-import { GRID_N, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP } from './config.js';
+import { GRID_N, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP, VIEW_DENSITY } from './config.js';
 
 const WG = WORKGROUP;
 
 export class Sim {
-    /**
-     * @param {GPUDevice} device
-     * @param {GPUCanvasContext} context
-     * @param {GPUTextureFormat} format
-     */
     constructor(device, context, format) {
         this.device  = device;
         this.context = context;
@@ -46,6 +46,7 @@ export class Sim {
         this.gamma   = GAMMA_DEFAULT;
         this.viewMin = 0.05;
         this.viewMax = 1.10;
+        this.viewMode = VIEW_DENSITY;
 
         this.stepCount = 0;
 
@@ -54,28 +55,22 @@ export class Sim {
         this.renderer  = null;
     }
 
-    /**
-     * Async init — fetches WGSL, builds pipelines, allocates buffers,
-     * uploads the Sod IC and viridis LUT, primes uniforms + dt.
-     */
     async init() {
         this.pipelines = await createPipelines(this.device, this.format);
         this.buffers   = new PlasmaBuffers(this.device, this.n);
         this.renderer  = new PlasmaRenderer(this.device, this.context, this.pipelines, this.buffers);
 
-        this.loadPreset(makeSodPreset(this.n));
+        // Phase 3a default preset: Brio-Wu MHD shock tube. Sod still
+        // available via loadPreset(makeSodPreset(n)).
+        this.loadPreset(makeBrioWuPreset(this.n));
         this.buffers.uploadLUT(VIRIDIS);
 
-        // Initial dt floor — finalize() will overwrite this every step.
         const seed = new Float32Array([1e-4]);
         this.device.queue.writeBuffer(this.buffers.dt, 0, seed.buffer);
 
         this._pushUniformsFor(0);
     }
 
-    /**
-     * Load a preset descriptor: replaces U, γ, dx, and view window.
-     */
     loadPreset(preset) {
         this.gamma   = preset.gamma   ?? this.gamma;
         this.viewMin = preset.viewMin ?? this.viewMin;
@@ -94,113 +89,241 @@ export class Sim {
             gridN: this.n,
             sweepDir,
             stepParity: this.stepCount & 1,
+            viewMode: this.viewMode,
         });
     }
 
-    _sweepBindGroup(srcBuf, dstBuf) {
-        return this.device.createBindGroup({
-            label: 'plasma.sweep.bg',
-            layout: this.pipelines.layouts.sweep,
-            entries: [
-                { binding: 0, resource: { buffer: this.buffers.uniform } },
-                { binding: 1, resource: { buffer: srcBuf } },
-                { binding: 2, resource: { buffer: this.buffers.slopes } },
-                { binding: 3, resource: { buffer: this.buffers.flux } },
-                { binding: 4, resource: { buffer: dstBuf } },
-                { binding: 5, resource: { buffer: this.buffers.dt } },
-            ],
-        });
-    }
+    // ── Bind-group builders ─────────────────────────────────────────
+    // We rebuild bind groups every step because the ping-pong current/next
+    // pair flips. WebGPU bind-group creation is cheap (well under 50 µs
+    // each on a typical adapter).
 
-    _dtBindGroup(srcBuf) {
+    _dtBG() {
+        const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.computeDt.bg',
             layout: this.pipelines.layouts.dt,
             entries: [
-                { binding: 0, resource: { buffer: this.buffers.uniform } },
-                { binding: 1, resource: { buffer: srcBuf } },
-                { binding: 2, resource: { buffer: this.buffers.wavespeed } },
-                { binding: 3, resource: { buffer: this.buffers.dt } },
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.U0_current } },
+                { binding: 2, resource: { buffer: b.U1_current } },
+                { binding: 3, resource: { buffer: b.Bx_current } },
+                { binding: 4, resource: { buffer: b.By_current } },
+                { binding: 5, resource: { buffer: b.wavespeed } },
+                { binding: 6, resource: { buffer: b.dt } },
             ],
         });
     }
 
-    /** Submit compute_dt as its own command buffer. */
-    _submitComputeDt(sweepDir) {
-        const { device, pipelines, buffers } = this;
-        const groups = Math.ceil(this.n / WG);
+    _reconstructBG(s0Buf, s1Buf) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.reconstruct.bg',
+            layout: this.pipelines.layouts.reconstruct,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.U0_current } },
+                { binding: 2, resource: { buffer: b.U1_current } },
+                { binding: 3, resource: { buffer: b.Bx_current } },
+                { binding: 4, resource: { buffer: b.By_current } },
+                { binding: 5, resource: { buffer: s0Buf } },
+                { binding: 6, resource: { buffer: s1Buf } },
+            ],
+        });
+    }
 
-        this._pushUniformsFor(sweepDir);
-        const bg = this._dtBindGroup(buffers.current);
+    _riemannBG(s0Buf, s1Buf, f0Buf, f1Buf) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.riemann.bg',
+            layout: this.pipelines.layouts.riemann,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.U0_current } },
+                { binding: 2, resource: { buffer: b.U1_current } },
+                { binding: 3, resource: { buffer: b.Bx_current } },
+                { binding: 4, resource: { buffer: b.By_current } },
+                { binding: 5, resource: { buffer: s0Buf } },
+                { binding: 6, resource: { buffer: s1Buf } },
+                { binding: 7, resource: { buffer: f0Buf } },
+                { binding: 8, resource: { buffer: f1Buf } },
+            ],
+        });
+    }
+
+    _emfBG() {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.emf.bg',
+            layout: this.pipelines.layouts.emf,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.flux_x_1 } },
+                { binding: 2, resource: { buffer: b.flux_y_1 } },
+                { binding: 3, resource: { buffer: b.Ez_edge } },
+            ],
+        });
+    }
+
+    _updateConservedBG() {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.updateU.bg',
+            layout: this.pipelines.layouts.updateU,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.U0_current } },
+                { binding: 2, resource: { buffer: b.U1_current } },
+                { binding: 3, resource: { buffer: b.flux_x_0 } },
+                { binding: 4, resource: { buffer: b.flux_x_1 } },
+                { binding: 5, resource: { buffer: b.flux_y_0 } },
+                { binding: 6, resource: { buffer: b.flux_y_1 } },
+                { binding: 7, resource: { buffer: b.dt } },
+                { binding: 8, resource: { buffer: b.U0_next } },
+                { binding: 9, resource: { buffer: b.U1_next } },
+            ],
+        });
+    }
+
+    _updateBBG() {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.updateB.bg',
+            layout: this.pipelines.layouts.updateB,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.Bx_current } },
+                { binding: 2, resource: { buffer: b.By_current } },
+                { binding: 3, resource: { buffer: b.Ez_edge } },
+                { binding: 4, resource: { buffer: b.dt } },
+                { binding: 5, resource: { buffer: b.Bx_next } },
+                { binding: 6, resource: { buffer: b.By_next } },
+            ],
+        });
+    }
+
+    // ── Submit helpers ──────────────────────────────────────────────
+    _submitComputeDt() {
+        const { device, pipelines } = this;
+        const groups = Math.ceil(this.n / WG);
+        this._pushUniformsFor(0);
+        const bg = this._dtBG();
 
         const encoder = device.createCommandEncoder({ label: 'plasma.computeDt.enc' });
         const pass = encoder.beginComputePass({ label: 'plasma.computeDt' });
         pass.setBindGroup(0, bg);
-
         pass.setPipeline(pipelines.pipelines.dtReset);
         pass.dispatchWorkgroups(1, 1, 1);
-
         pass.setPipeline(pipelines.pipelines.dtReduce);
         pass.dispatchWorkgroups(groups, groups, 1);
-
         pass.setPipeline(pipelines.pipelines.dtFinalize);
         pass.dispatchWorkgroups(1, 1, 1);
-
         pass.end();
         device.queue.submit([encoder.finish()]);
     }
 
-    /** Submit one sweep (PLM → HLL → update) as its own command buffer. */
-    _submitSweep(sweepDir) {
+    _submitDirectionalSweep(axis) {
         const { device, pipelines, buffers } = this;
         const groups = Math.ceil(this.n / WG);
+        this._pushUniformsFor(axis);
 
-        this._pushUniformsFor(sweepDir);
-        const bg = this._sweepBindGroup(buffers.current, buffers.next);
+        const s0Buf = (axis === 0) ? buffers.slopes_x_0 : buffers.slopes_y_0;
+        const s1Buf = (axis === 0) ? buffers.slopes_x_1 : buffers.slopes_y_1;
+        const f0Buf = (axis === 0) ? buffers.flux_x_0  : buffers.flux_y_0;
+        const f1Buf = (axis === 0) ? buffers.flux_x_1  : buffers.flux_y_1;
 
-        const encoder = device.createCommandEncoder({ label: `plasma.sweep.dir${sweepDir}.enc` });
-        const pass = encoder.beginComputePass({ label: `plasma.sweep.dir${sweepDir}` });
-        pass.setBindGroup(0, bg);
+        const recBG = this._reconstructBG(s0Buf, s1Buf);
+        const riBG  = this._riemannBG(s0Buf, s1Buf, f0Buf, f1Buf);
+
+        const encoder = device.createCommandEncoder({ label: `plasma.sweep.axis${axis}.enc` });
+        const pass = encoder.beginComputePass({ label: `plasma.sweep.axis${axis}` });
 
         pass.setPipeline(pipelines.pipelines.reconstructPlm);
+        pass.setBindGroup(0, recBG);
         pass.dispatchWorkgroups(groups, groups, 1);
 
         pass.setPipeline(pipelines.pipelines.riemannHll);
-        pass.dispatchWorkgroups(groups, groups, 1);
-
-        pass.setPipeline(pipelines.pipelines.updateConserved);
+        pass.setBindGroup(0, riBG);
         pass.dispatchWorkgroups(groups, groups, 1);
 
         pass.end();
         device.queue.submit([encoder.finish()]);
-
-        buffers.swap();
     }
 
-    /**
-     * One full physics step.
-     */
+    _submitUnsplitUpdate() {
+        const { device, pipelines } = this;
+        const groups = Math.ceil(this.n / WG);
+
+        const emfBG = this._emfBG();
+        const uBG   = this._updateConservedBG();
+        const bBG   = this._updateBBG();
+
+        const encoder = device.createCommandEncoder({ label: 'plasma.update.enc' });
+        const pass = encoder.beginComputePass({ label: 'plasma.update' });
+
+        pass.setPipeline(pipelines.pipelines.computeEmf);
+        pass.setBindGroup(0, emfBG);
+        pass.dispatchWorkgroups(groups, groups, 1);
+
+        pass.setPipeline(pipelines.pipelines.updateConserved);
+        pass.setBindGroup(0, uBG);
+        pass.dispatchWorkgroups(groups, groups, 1);
+
+        pass.setPipeline(pipelines.pipelines.updateB);
+        pass.setBindGroup(0, bBG);
+        pass.dispatchWorkgroups(groups, groups, 1);
+
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+    }
+
     step() {
-        // Strang ordering — flip x↔y every other step.
-        const dirs = (this.stepCount & 1) ? [1, 0] : [0, 1];
-
-        this._submitComputeDt(dirs[0]);
-        this._submitSweep(dirs[0]);
-        this._submitSweep(dirs[1]);
-
+        this._submitComputeDt();
+        this._submitDirectionalSweep(0);
+        this._submitDirectionalSweep(1);
+        this._submitUnsplitUpdate();
+        this.buffers.swap();
         this.stepCount += 1;
     }
 
-    /**
-     * Encode and submit the render chain (view-field → colormap →
-     * composite).
-     */
     render() {
-        // Ensure view_min/view_max are present in uniforms for the
-        // colormap pass. The last sweep's pushUniforms already covers
-        // this, but a no-op resend keeps state explicit if step()
-        // hasn't run yet (e.g. very first render after init).
         this._pushUniformsFor(0);
         this.renderer.render();
     }
+
+    // ── Debug: ∇·B L2 norm sanity (uncomment in main.js every 100 frames)
+    // Add a readback path here if you want to verify CT in production.
+    // Skipped by default to keep the hot path GPU-only.
+    /*
+    async debugDivB() {
+        const n = this.n;
+        const cells = n * n;
+        const staging_bx = this.device.createBuffer({
+            size: cells * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        const staging_by = this.device.createBuffer({
+            size: cells * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        const enc = this.device.createCommandEncoder();
+        enc.copyBufferToBuffer(this.buffers.Bx_current, 0, staging_bx, 0, cells * 4);
+        enc.copyBufferToBuffer(this.buffers.By_current, 0, staging_by, 0, cells * 4);
+        this.device.queue.submit([enc.finish()]);
+        await Promise.all([staging_bx.mapAsync(GPUMapMode.READ), staging_by.mapAsync(GPUMapMode.READ)]);
+        const bx = new Float32Array(staging_bx.getMappedRange()).slice();
+        const by = new Float32Array(staging_by.getMappedRange()).slice();
+        staging_bx.unmap(); staging_by.unmap();
+        staging_bx.destroy(); staging_by.destroy();
+        let s2 = 0;
+        for (let j = 0; j < n; j++) {
+            for (let i = 0; i < n; i++) {
+                const idx  = j * n + i;
+                const il   = j * n + ((i - 1 + n) % n);
+                const jd   = ((j - 1 + n) % n) * n + i;
+                const d    = (bx[idx] - bx[il]) + (by[idx] - by[jd]);
+                s2 += d * d;
+            }
+        }
+        return Math.sqrt(s2 / cells) / this.dx;
+    }
+    */
 }

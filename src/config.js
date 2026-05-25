@@ -37,19 +37,21 @@ export const DT_MAX = 1e-2;
 // Soft floor on dt so a stalled simulation doesn't grind frames to zero.
 export const DT_MIN = 1e-8;
 
-// View-mode enum (Phase 2 only exposes density; Phase 5+ adds pressure,
-// |v|, vorticity, etc.).
+// View-mode enum. Phase 3a adds |B| and Jz for the MHD view; Phase 5+ adds
+// the remaining options (β, vorticity, Schlieren).
 export const VIEW_DENSITY  = 0;
 export const VIEW_PRESSURE = 1;
 export const VIEW_VMAG     = 2;
+export const VIEW_BMAG     = 3;
+export const VIEW_JZ       = 4;
 
 // Normalization window for the default density view. Sod expects ρ ∈ [0.125,
 // 1.0] initially; we give a small margin in both directions.
 export const VIEW_DENSITY_MIN = 0.05;
 export const VIEW_DENSITY_MAX = 1.10;
 
-// Uniform-buffer slot count. Padded to 16-byte alignment in buffers.js.
-// Fields: dx, dt, gamma, grid_n (u32), sweep_dir (u32), step_parity (u32),
-//         view_min, view_max — 8 × 4B = 32B. Always size-pad to 64B for
-//         comfort with future additions.
+// Uniform-buffer layout (Phase 3a): see `Uniforms` struct in shared-helpers.wgsl.
+//   f32 dx, gamma, view_min, view_max,
+//   u32 grid_n, sweep_dir, step_parity, view_mode
+// 8 × 4B = 32B, padded to 64B for future room.
 export const UNIFORM_BUFFER_SIZE = 64;
