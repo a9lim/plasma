@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plasma — 2D Resistive MHD Simulator | a9l.im</title>
+    <meta name="description" content="WebGPU-native interactive 2D resistive magnetohydrodynamics plasma simulator. Educational physics in the browser.">
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+    <meta name="author" content="a9lim">
+    <meta name="theme-color" content="#e11107">
+    <meta property="og:title" content="Plasma — 2D Resistive MHD Simulator">
+    <meta property="og:description" content="WebGPU-native interactive 2D resistive MHD plasma simulator.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://a9l.im/plasma">
+    <meta property="og:site_name" content="a9l.im">
+    <meta property="og:locale" content="en_US">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Plasma — 2D Resistive MHD Simulator">
+    <meta name="twitter:description" content="WebGPU-native interactive 2D resistive MHD plasma simulator.">
+    <meta name="twitter:site" content="@_a9lim">
+    <meta name="twitter:creator" content="@_a9lim">
+    <link rel="icon" href="/favicon.ico">
+    <link rel="canonical" href="https://a9l.im/plasma">
+    <link rel="alternate" hreflang="en" href="https://a9l.im/plasma">
+    <link rel="alternate" hreflang="x-default" href="https://a9l.im/plasma">
+    <link rel="manifest" href="/manifest.json">
+
+    <link rel="stylesheet" href="/fonts/fonts.css">
+    <!-- shared-tokens.js MUST run synchronously before CSS parses so its
+         injected CSS custom properties are available to shared-base.css. -->
+    <script src="/shared-tokens.js"></script>
+    <link rel="stylesheet" href="/shared-base.css">
+    <link rel="stylesheet" href="styles.css">
+
+    <script defer src="colors.js"></script>
+    <script type="module" src="main.js"></script>
+</head>
+
+<body>
+    <canvas id="simCanvas" aria-label="Plasma simulation canvas"></canvas>
+
+    <div id="no-webgpu" hidden>
+        <h1>WebGPU required</h1>
+        <p>
+            This simulator needs WebGPU. Try a recent Chrome, Edge, or Safari 26+
+            on desktop, or browse the other sims at
+            <a href="/sims">/sims</a>.
+        </p>
+    </div>
+</body>
+
+</html>

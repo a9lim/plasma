@@ -1,0 +1,68 @@
+/* ═══════════════════════════════════════════════
+   plasma — Phase 1 layout
+   Most styling will inherit from /shared-base.css
+   once the HUD lands in Phase 5. This file only
+   handles the full-viewport canvas plus the
+   no-WebGPU landing fallback.
+   ═══════════════════════════════════════════════ */
+
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+}
+
+#simCanvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    z-index: 0;
+}
+
+/* ─── No-WebGPU landing fallback ─────────────── */
+
+#no-webgpu {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: var(--sp-6, 24px);
+    text-align: center;
+    background: var(--bg);
+    color: var(--text);
+    z-index: 10;
+    gap: var(--sp-4, 16px);
+}
+
+#no-webgpu[hidden] {
+    display: none;
+}
+
+#no-webgpu h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.5rem;
+    margin: 0;
+}
+
+#no-webgpu p {
+    max-width: 36rem;
+    margin: 0;
+    line-height: 1.5;
+    color: var(--text-muted, var(--text));
+}
+
+#no-webgpu a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
