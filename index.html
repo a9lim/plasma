@@ -34,11 +34,218 @@
     <link rel="stylesheet" href="styles.css">
 
     <script defer src="colors.js"></script>
+    <script defer src="/shared-utils.js"></script>
+    <script defer src="/shared-haptics.js"></script>
+    <script defer src="/shared-icons.js"></script>
+    <script defer src="/shared-toolbar.js"></script>
+    <script defer src="/shared-forms.js"></script>
+    <script defer src="/shared-settings.js"></script>
+    <script defer src="/shared-dropdown.js"></script>
+    <script defer src="/shared-tooltip.js"></script>
+    <script defer src="/shared-sparkline.js"></script>
+    <script defer src="/shared-shortcuts.js"></script>
+    <script defer src="/shared-about.js"></script>
     <script type="module" src="main.js"></script>
+
+    <!-- Phase 5 ships a placeholder JSON-LD stub; full SEO content lands in Phase 7. -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": ["WebApplication", "LearningResource"],
+      "name": "Plasma",
+      "url": "https://a9l.im/plasma",
+      "description": "Interactive 2D resistive magnetohydrodynamics simulator with HLLD Riemann solver, PPM reconstruction, RK3 SSP time integration, and constrained-transport divergence cleaning.",
+      "applicationCategory": "EducationalApplication",
+      "learningResourceType": "Simulation",
+      "operatingSystem": "Any (Web Browser with WebGPU)",
+      "browserRequirements": "Modern browser with WebGPU support",
+      "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+      "inLanguage": "en",
+      "interactivityType": "active",
+      "author": {
+        "@type": "Person",
+        "name": "a9lim",
+        "url": "https://a9l.im/#about"
+      }
+    }
+    </script>
 </head>
 
-<body>
+<body class="sim-body">
+    <a href="#control-panel" class="skip-link">Skip to controls</a>
+    <a href="#simCanvas" class="skip-link">Skip to simulation</a>
+
     <canvas id="simCanvas" aria-label="Plasma simulation canvas"></canvas>
+    <canvas id="probeOverlay" aria-hidden="true"></canvas>
+
+    <nav id="topbar" class="sim-toolbar glass" role="toolbar" aria-label="Simulation controls">
+        <div class="topbar-left">
+            <a href="/" class="sim-home" title="a9l.im"><img src="/logo.svg" alt="a9l.im" height="28"></a>
+            <h1 class="sim-brand">Plasma</h1>
+        </div>
+        <div class="topbar-right sim-toolbar-actions">
+            <button id="playBtn" class="tool-btn" title="Pause" aria-label="Pause simulation"></button>
+            <button id="speedBtn" class="tool-btn speed-btn" aria-label="Simulation speed" title="Speed: 1x">
+                <span class="speed-label">1x</span>
+            </button>
+            <button id="stepBtn" class="tool-btn" title="Step Forward" aria-label="Step forward" data-icon="step"></button>
+            <div class="tool-sep"></div>
+            <button id="clearBtn" class="tool-btn" title="Reset preset" aria-label="Reset preset" data-icon="reset"></button>
+            <button id="saveBtn" class="tool-btn" title="Save state" aria-label="Save state" data-icon="save"></button>
+            <button id="loadBtn" class="tool-btn" title="Load state" aria-label="Load state" data-icon="load"></button>
+            <div class="tool-sep"></div>
+            <button id="themeToggleBtn" class="tool-btn" title="Toggle Theme" aria-label="Toggle theme" data-icon="theme"></button>
+            <button id="settings-btn" class="tool-btn" title="Settings" aria-label="Settings" data-icon="gear"></button>
+            <button id="about-btn" class="tool-btn" aria-label="About" title="About" data-icon="about"></button>
+            <button id="panelToggle" class="tool-btn" title="Toggle sidebar" aria-label="Toggle settings panel" aria-expanded="false" data-icon="menu"></button>
+        </div>
+    </nav>
+
+    <aside id="control-panel" class="sim-panel glass" role="complementary" aria-label="Controls panel">
+        <div class="sheet-handle"></div>
+        <div class="stats-header">
+            <div class="sidebar-tabs" role="tablist" aria-label="Sidebar tabs">
+                <button class="tab-btn active" data-tab="settings" role="tab" aria-selected="true">Settings</button>
+                <button class="tab-btn" data-tab="stats"    role="tab" aria-selected="false">Stats</button>
+                <button class="tab-btn" data-tab="probe"    role="tab" aria-selected="false">Probe</button>
+            </div>
+            <button id="panelClose" class="tool-btn icon-tight" title="Close" aria-label="Close panel" data-icon="close" data-icon-size="16"></button>
+        </div>
+        <div class="tabs-wrap">
+            <div class="tab-panels scrollbar-thin">
+                <!-- ── Settings ── -->
+                <section class="tab-panel active" id="tab-settings" role="tabpanel" data-tab="settings">
+                    <div class="panel-section">
+                        <h2 class="group-label">Preset</h2>
+                        <select id="ctrl-preset" class="sim-select" aria-label="Preset">
+                            <option value="orszag-tang" selected>Orszag-Tang vortex</option>
+                            <option value="harris">Harris current sheet</option>
+                            <option value="brio-wu">Brio-Wu shock tube</option>
+                            <option value="sod">Sod shock tube</option>
+                        </select>
+                    </div>
+
+                    <div class="panel-section">
+                        <h2 class="group-label">View mode</h2>
+                        <select id="ctrl-view" class="sim-select" aria-label="View mode">
+                            <option value="4" selected>J_z (current density)</option>
+                            <option value="3">|B| (field magnitude)</option>
+                            <option value="0">ρ (density)</option>
+                            <option value="2">|v| (velocity magnitude)</option>
+                            <option value="1">p (pressure)</option>
+                        </select>
+                        <p class="panel-hint">β, vorticity and Schlieren view modes ship with the LIC pass in Phase 6.</p>
+                    </div>
+
+                    <div class="panel-section">
+                        <h2 class="group-label">Resistivity η</h2>
+                        <div class="control-group">
+                            <label>
+                                <span>η (log scale)</span>
+                                <span class="slider-value" id="ctrl-eta-val">1.00e-3</span>
+                            </label>
+                            <input type="range" id="ctrl-eta" min="-6.5" max="-1" step="0.1" value="-3">
+                            <p class="panel-hint">Below 1e-6 snaps to 0 (ideal MHD).</p>
+                        </div>
+                    </div>
+
+                    <div class="panel-section">
+                        <h2 class="group-label">Resolution</h2>
+                        <div class="mode-toggles" id="ctrl-res-toggles">
+                            <button class="mode-btn active" data-res="256">256²</button>
+                            <button class="mode-btn"        data-res="512">512²</button>
+                            <button class="mode-btn"        data-res="1024">1024²</button>
+                        </div>
+                        <p class="panel-hint">Changing resolution reloads the current preset.</p>
+                    </div>
+
+                    <div class="panel-section">
+                        <h2 class="group-label">Boundaries</h2>
+                        <div class="ctrl-row">
+                            <label for="ctrl-bc-n">North</label>
+                            <select id="ctrl-bc-n" class="sim-select bc-select" aria-label="North BC">
+                                <option value="periodic">Periodic</option>
+                                <option value="outflow">Outflow</option>
+                                <option value="reflecting">Reflecting</option>
+                                <option value="driven">Driven</option>
+                            </select>
+                        </div>
+                        <div class="ctrl-row">
+                            <label for="ctrl-bc-s">South</label>
+                            <select id="ctrl-bc-s" class="sim-select bc-select" aria-label="South BC">
+                                <option value="periodic">Periodic</option>
+                                <option value="outflow">Outflow</option>
+                                <option value="reflecting">Reflecting</option>
+                                <option value="driven">Driven</option>
+                            </select>
+                        </div>
+                        <div class="ctrl-row">
+                            <label for="ctrl-bc-e">East</label>
+                            <select id="ctrl-bc-e" class="sim-select bc-select" aria-label="East BC">
+                                <option value="periodic">Periodic</option>
+                                <option value="outflow">Outflow</option>
+                                <option value="reflecting">Reflecting</option>
+                                <option value="driven">Driven</option>
+                            </select>
+                        </div>
+                        <div class="ctrl-row">
+                            <label for="ctrl-bc-w">West</label>
+                            <select id="ctrl-bc-w" class="sim-select bc-select" aria-label="West BC">
+                                <option value="periodic">Periodic</option>
+                                <option value="outflow">Outflow</option>
+                                <option value="reflecting">Reflecting</option>
+                                <option value="driven">Driven</option>
+                            </select>
+                        </div>
+
+                        <div id="ctrl-driven-panel" class="driven-panel">
+                            <h3 class="group-label group-label-sub">Driven inflow state</h3>
+                            <div class="ctrl-row">
+                                <label for="driven-rho">ρ₀ <span class="slider-value" id="driven-rho-val">1.000</span></label>
+                                <input type="number" id="driven-rho" step="0.05" value="1">
+                            </div>
+                            <div class="ctrl-row">
+                                <label for="driven-vx">v_x <span class="slider-value" id="driven-vx-val">0.000</span></label>
+                                <input type="number" id="driven-vx" step="0.05" value="0">
+                            </div>
+                            <div class="ctrl-row">
+                                <label for="driven-vy">v_y <span class="slider-value" id="driven-vy-val">0.000</span></label>
+                                <input type="number" id="driven-vy" step="0.05" value="0">
+                            </div>
+                            <div class="ctrl-row">
+                                <label for="driven-vz">v_z <span class="slider-value" id="driven-vz-val">0.000</span></label>
+                                <input type="number" id="driven-vz" step="0.05" value="0">
+                            </div>
+                            <div class="ctrl-row">
+                                <label for="driven-bx">B_x <span class="slider-value" id="driven-bx-val">0.000</span></label>
+                                <input type="number" id="driven-bx" step="0.05" value="0">
+                            </div>
+                            <div class="ctrl-row">
+                                <label for="driven-by">B_y <span class="slider-value" id="driven-by-val">0.000</span></label>
+                                <input type="number" id="driven-by" step="0.05" value="0">
+                            </div>
+                            <div class="ctrl-row">
+                                <label for="driven-bz">B_z <span class="slider-value" id="driven-bz-val">0.000</span></label>
+                                <input type="number" id="driven-bz" step="0.05" value="0">
+                            </div>
+                            <div class="ctrl-row">
+                                <label for="driven-p">p₀ <span class="slider-value" id="driven-p-val">1.000</span></label>
+                                <input type="number" id="driven-p" step="0.05" value="1">
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ── Stats ── -->
+                <section class="tab-panel" id="tab-stats" role="tabpanel" data-tab="stats" aria-live="polite">
+                </section>
+
+                <!-- ── Probe ── -->
+                <section class="tab-panel" id="tab-probe" role="tabpanel" data-tab="probe">
+                </section>
+            </div>
+        </div>
+    </aside>
 
     <div id="no-webgpu" hidden>
         <h1>WebGPU required</h1>
@@ -48,6 +255,18 @@
             <a href="/sims">/sims</a>.
         </p>
     </div>
+
+    <details class="edu-content">
+      <summary>About this simulation</summary>
+      <article>
+        <h2>What is Plasma?</h2>
+        <p>A WebGPU-native 2D resistive magnetohydrodynamics (MHD) simulator. The grid-Eulerian finite-volume scheme uses HLLD Riemann solvers, PPM reconstruction, RK3 SSP time integration, and constrained transport to keep ∇·B at machine roundoff. Default preset shows the Orszag-Tang vortex; switch to Harris current sheet to watch magnetic reconnection develop.</p>
+        <h3>References</h3>
+        <p>Full educational content ships in Phase 7.</p>
+      </article>
+    </details>
+
+    <script src="/shared-tabs.js"></script>
 </body>
 
 </html>

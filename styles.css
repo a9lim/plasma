@@ -1,10 +1,23 @@
 /* ═══════════════════════════════════════════════
-   plasma — Phase 1 layout
-   Most styling will inherit from /shared-base.css
-   once the HUD lands in Phase 5. This file only
-   handles the full-viewport canvas plus the
-   no-WebGPU landing fallback.
+   plasma — Phase 5 layout overrides
+   Most styling inherits from /shared-base.css
+   (.glass, .sim-toolbar, .sim-panel, .tool-btn,
+   .ctrl-row, .stats-header, .sidebar-tabs, etc.).
+   This file adds plasma-specific positioning,
+   the canvas full-viewport rule, the probe
+   overlay, and a small handful of layout tokens.
    ═══════════════════════════════════════════════ */
+
+:root {
+    --sp-1: 4px;
+    --sp-2: 8px;
+    --sp-3: 12px;
+    --sp-4: 16px;
+    --sp-5: 20px;
+    --sp-6: 24px;
+    --sp-8: 32px;
+    --inset: 12px;
+}
 
 html, body {
     margin: 0;
@@ -17,6 +30,8 @@ html, body {
     font-family: var(--font-sans);
 }
 
+/* ─── Canvas (full viewport) ──────────────────── */
+
 #simCanvas {
     position: fixed;
     inset: 0;
@@ -26,7 +41,141 @@ html, body {
     z-index: 0;
 }
 
-/* ─── No-WebGPU landing fallback ─────────────── */
+#probeOverlay {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    z-index: 1;
+    pointer-events: none;
+}
+
+/* ─── Topbar overrides ────────────────────────── */
+
+#topbar {
+    top: var(--inset);
+    left: var(--inset);
+    right: var(--inset);
+}
+
+.topbar-left {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-6);
+    min-width: 0;
+}
+
+/* ─── Control panel overrides ─────────────────── */
+
+#control-panel {
+    top: calc(var(--inset) + var(--toolbar-h) + var(--inset));
+    right: var(--inset);
+    bottom: var(--inset);
+    max-width: calc(100vw - var(--inset) * 2);
+    pointer-events: none;
+}
+
+#control-panel.open {
+    pointer-events: auto;
+}
+
+/* ─── Sidebar panel sections ──────────────────── */
+
+.panel-section {
+    padding: var(--sp-3) 0 var(--sp-4);
+}
+
+.panel-section + .panel-section {
+    border-top: none;       /* lines-as-accents, not boundaries */
+    margin-top: 0;
+}
+
+.panel-hint {
+    font-family: var(--font-mono);
+    font-style: italic;
+    font-size: var(--font-sm);
+    color: var(--text-muted);
+    margin: var(--sp-2) 0 0;
+    line-height: 1.4;
+}
+
+.group-label-sub {
+    font-size: var(--font-sm);
+    margin-top: var(--sp-3);
+    margin-bottom: var(--sp-2);
+}
+
+/* ─── Control rows for plasma BC dropdowns ────── */
+
+.ctrl-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-3);
+    padding: var(--sp-2) 0;
+}
+
+.ctrl-row label {
+    flex: 0 0 auto;
+    font-size: var(--font-base);
+    color: var(--text-secondary);
+}
+
+.ctrl-row .sim-select,
+.ctrl-row .sim-dropdown {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.ctrl-row input[type="number"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: var(--bg-panel-solid);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: var(--font-base);
+    padding: var(--sp-1) var(--sp-2);
+    border: none;
+    border-radius: var(--radius);
+    outline: none;
+    text-align: right;
+}
+
+.ctrl-row input[type="number"]:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 0;
+}
+
+/* ─── Sparkline + canvases inside stat-rows ───── */
+
+.spark-wrap {
+    display: inline-flex;
+    align-items: center;
+}
+
+.spark-canvas {
+    display: block;
+}
+
+.probe-spark {
+    display: block;
+    width: 100%;
+    margin-top: var(--sp-2);
+}
+
+.probe-field-select {
+    min-width: 0;
+    flex: 1;
+}
+
+/* ─── Driven inflow reveal (controlled by bindDeps) ── */
+
+.driven-panel {
+    padding-top: var(--sp-2);
+}
+
+/* ─── No-WebGPU landing ───────────────────────── */
 
 #no-webgpu {
     position: fixed;
@@ -35,17 +184,15 @@ html, body {
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: var(--sp-6, 24px);
+    padding: var(--sp-6);
     text-align: center;
     background: var(--bg);
     color: var(--text);
-    z-index: 10;
-    gap: var(--sp-4, 16px);
+    z-index: 1000;
+    gap: var(--sp-4);
 }
 
-#no-webgpu[hidden] {
-    display: none;
-}
+#no-webgpu[hidden] { display: none; }
 
 #no-webgpu h1 {
     font-family: var(--font-display);
@@ -65,4 +212,25 @@ html, body {
     color: var(--accent);
     text-decoration: underline;
     text-underline-offset: 2px;
+}
+
+/* ─── Mobile responsive ───────────────────────── */
+
+@media (max-width: 900px) {
+    :root {
+        --inset: 8px;
+        --panel-w: 100%;
+    }
+    #control-panel {
+        max-width: 100%;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .tab-panels,
+    #topbar {
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        background: var(--bg-panel-solid);
+    }
 }

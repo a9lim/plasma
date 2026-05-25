@@ -34,11 +34,50 @@ Build phases:
 1. Phase 1: WebGPU init, fullscreen-quad render, frame loop, visibilitychange pause.
 2. Phase 2: pure hydro (Euler) with HLL + PLM + FE — Sod tube.
 3. Phase 3: full MHD with HLLD + PPM + RK3 + CT — Orszag-Tang.
-4. **Phase 4** (current): resistivity + per-edge BCs — Harris reconnection.
-5. Phase 5: UI (sidebar tabs, presets, stats, probe).
+4. Phase 4: resistivity + per-edge BCs — Harris reconnection.
+5. **Phase 5** (current): UI (sidebar tabs, presets, stats, probe).
 6. Phase 6: LIC visualization.
 7. Phase 7: polish (about, edu-content, JSON-LD, OG image, pointer perturbation).
 8. Phase 8: parent-repo wiring.
+
+## Phase 5 UI
+
+`src/ui.js` (the entry point), `src/stats-display.js`, `src/probe.js`,
+and `src/gpu/readback.js` mount Phase-5 UI on the live Sim. The HTML
+shell is in `index.html` (topbar + sidebar with three tabs +
+edu-content stub + JSON-LD stub). `setupUI(simShell)` is called from
+`main.js` after `sim.init()`; it wraps `simShell.render` to drive the
+stats readback at ~12 Hz cadence (every 5 frames at 256², every 10
+at 512², every 20 at 1024²). The probe runs a 10 Hz `setInterval`
+readback independent of the render loop.
+
+### Readback pattern (`src/gpu/readback.js`)
+
+`ReadbackPool` keeps a per-byte-size pool of staging buffers with
+`MAP_READ | COPY_DST` usage. `readbackSlice(device, pool, src,
+byteOffset, byteSize)` encodes one `copyBufferToBuffer` + submit +
+`mapAsync` + `slice()` + `unmap()` cycle. `readbackBatch(...)` issues
+N copies in one encoder + one submit, then awaits all maps in
+parallel — used by stats-display to grab `(U0, U1, Bx, By, dt)` in
+one round-trip and by probe to grab a 3-row stencil window.
+
+Stats (~640 KB at 256², 12 Hz) and probe (~12 KB, 10 Hz) are both
+small enough that we compute aggregates on the CPU rather than
+building dedicated GPU reduction kernels. Phase 6 may move some
+aggregates onto the GPU when LIC kernels land.
+
+### sim.js public API (new in Phase 5)
+
+`setPreset(name)`, `setBC(edge, mode)`, `setDrivenState(partial)`,
+`setEta(eta)`, `setViewMode(mode)`, `setCFL(cfl)`, `setGamma(g)`,
+`setPressureFloor(p)`, `setRunning(r)`, `step()` (single step),
+`setSpeedScale(s)`, `setResolution(n)`, `saveState()` →
+`loadState(s)` (JSON, parameters only; no buffer snapshot).
+
+`setResolution(n)` re-instantiates `PlasmaBuffers` and
+`PlasmaRenderer` at the new interior size, then reloads the current
+preset. UI must call `stats.bindBuffers(sim.buffers)` and
+`probe.bindBuffers(sim.buffers)` to re-aim the readback paths.
 
 ## Layout (current — Phase 4)
 

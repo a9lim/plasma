@@ -48,11 +48,11 @@
 import { PlasmaBuffers } from './gpu/buffers.js';
 import { createPipelines } from './gpu/pipelines.js';
 import { PlasmaRenderer } from './gpu/render.js';
-import { makeOrszagTangPreset } from './presets.js';
+import { makeOrszagTangPreset, PRESETS } from './presets.js';
 import { VIRIDIS } from './colormaps.js';
 import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP,
-    VIEW_DENSITY, ETA_DEFAULT, BC_PERIODIC,
+    VIEW_JZ, ETA_DEFAULT, BC_PERIODIC, CFL, PRESSURE_FLOOR,
 } from './config.js';
 
 const WG = WORKGROUP;
@@ -66,14 +66,24 @@ export class Sim {
         this.n        = GRID_N;
         this.ghost    = GHOST_WIDTH;
         this.n_total  = this.n + 2 * this.ghost;
+        this.domainLength = DOMAIN_LENGTH;
         this.dx       = DOMAIN_LENGTH / this.n;
         this.gamma    = GAMMA_DEFAULT;
         this.viewMin  = 0.05;
         this.viewMax  = 1.10;
-        this.viewMode = VIEW_DENSITY;
+        this.viewMode = VIEW_JZ;
         this.eta      = ETA_DEFAULT;
+        this.cfl      = CFL;
+        this.pressureFloor = PRESSURE_FLOOR;
 
         this.stepCount = 0;
+        this.simTime   = 0;
+        this.lastDt    = 0;
+
+        // UI integration state — owned by Sim so save/load can capture it.
+        this.running     = true;
+        this.speedScale  = 1;
+        this.presetName  = 'orszag-tang';
 
         this.buffers   = null;
         this.pipelines = null;
@@ -109,14 +119,160 @@ export class Sim {
         this.viewMin = preset.viewMin ?? this.viewMin;
         this.viewMax = preset.viewMax ?? this.viewMax;
         this.eta     = preset.eta     ?? this.eta;
-        if (preset.domainLength) this.dx = preset.domainLength / this.n;
+        if (preset.domainLength) {
+            this.domainLength = preset.domainLength;
+            this.dx = preset.domainLength / this.n;
+        }
         if (preset.bc) {
             this.bcConfig = { ...this.bcConfig, ...preset.bc };
         }
+        if (preset.id) this.presetName = preset.id;
         this.buffers.uploadInitialState(preset.data);
         this.stepCount = 0;
+        this.simTime   = 0;
         this._pushUniforms();
         this.buffers.pushBC(this.bcConfig);
+    }
+
+    /**
+     * Public API — load a preset by name. Recognized names mirror the
+     * keys of `PRESETS` in `presets.js` ('sod', 'brio-wu', 'orszag-tang',
+     * 'harris'). Unknown names are a no-op.
+     */
+    setPreset(name) {
+        const fn = PRESETS[name];
+        if (!fn) {
+            console.warn(`[plasma] setPreset: unknown preset "${name}"`);
+            return;
+        }
+        const preset = fn(this.n);
+        this.loadPreset(preset);
+    }
+
+    /**
+     * Update a single BC edge mode.
+     * @param {'N'|'S'|'E'|'W'} edge
+     * @param {number} mode  BC_PERIODIC | BC_OUTFLOW | BC_REFLECTING | BC_DRIVEN
+     */
+    setBC(edge, mode) {
+        const key = ({ N: 'modeN', S: 'modeS', E: 'modeE', W: 'modeW' })[edge];
+        if (!key) return;
+        this.bcConfig = { ...this.bcConfig, [key]: mode };
+        this.buffers.pushBC(this.bcConfig);
+    }
+
+    /**
+     * Update the driven inflow primitive state. Partial — only provided
+     * fields are overwritten.
+     */
+    setDrivenState(state) {
+        this.bcConfig = {
+            ...this.bcConfig,
+            driven: { ...this.bcConfig.driven, ...state },
+        };
+        this.buffers.pushBC(this.bcConfig);
+    }
+
+    /** Update explicit resistivity. UI typically passes 0 for "ideal". */
+    setEta(eta) {
+        this.eta = eta;
+        this._pushUniforms();
+    }
+
+    /** Update the view mode enum. Pushed via uniforms on next render. */
+    setViewMode(mode) {
+        this.viewMode = mode;
+        // Pick a sensible default colormap window per view if the caller
+        // hasn't overridden. The Sim does not own a colormap-LUT switch
+        // yet; that lands in Phase 6 alongside LIC. For now we just set
+        // the linear-window endpoints.
+        switch (mode) {
+            case 0: this.viewMin = 0.05; this.viewMax = 1.10; break; // ρ
+            case 1: this.viewMin = 0.01; this.viewMax = 1.00; break; // p
+            case 2: this.viewMin = 0.0;  this.viewMax = 1.5;  break; // |v|
+            case 3: this.viewMin = 0.0;  this.viewMax = 2.0;  break; // |B|
+            case 4: this.viewMin = -3.0; this.viewMax = 3.0;  break; // Jz (signed)
+            default: break;
+        }
+        this._pushUniforms();
+    }
+
+    setCFL(cfl)         { this.cfl = cfl; /* used by compute-dt via uniforms in a later wiring */ }
+    setGamma(g)         { this.gamma = g; this._pushUniforms(); }
+    setPressureFloor(p) { this.pressureFloor = p; /* shader floor is constant in WGSL; UI exposes for future use */ }
+
+    setRunning(r)       { this.running = !!r; }
+    setSpeedScale(s)    { this.speedScale = s; }
+
+    /**
+     * Re-allocate buffers at a new interior resolution and re-load the
+     * current preset. Existing buffers are released by dropping the
+     * `PlasmaBuffers` instance; GC handles GPU resource teardown when
+     * the device is alive.
+     */
+    setResolution(n) {
+        if (n === this.n) return;
+        if (n !== 256 && n !== 512 && n !== 1024) {
+            console.warn(`[plasma] setResolution: unsupported n=${n}`);
+            return;
+        }
+        // Destroy existing buffers (best-effort — WebGPU has no formal
+        // destroy on storage buffers; the GC will reclaim).
+        this.n       = n;
+        this.n_total = n + 2 * this.ghost;
+        this.dx      = this.domainLength / n;
+        this.buffers = new PlasmaBuffers(this.device, n);
+        // Re-bind the renderer at the new buffer set.
+        this.renderer = new PlasmaRenderer(this.device, this.context, this.pipelines, this.buffers);
+        this.buffers.uploadLUT(VIRIDIS);
+        const seed = new Float32Array([1e-4]);
+        this.device.queue.writeBuffer(this.buffers.dt, 0, seed.buffer);
+        this._pushUniforms();
+        // Re-load whichever preset is current.
+        this.setPreset(this.presetName);
+    }
+
+    /**
+     * Serialize sim configuration to a JSON string. Excludes the
+     * (large) U_n buffer; on load we re-instantiate from the named
+     * preset and re-apply parameters. This is intentional — a full
+     * buffer snapshot would dwarf localStorage budgets at 512/1024,
+     * and the use-case is "save my UI state", not "rewind exactly".
+     */
+    saveState() {
+        return JSON.stringify({
+            v: 1,
+            preset: this.presetName,
+            n: this.n,
+            viewMode: this.viewMode,
+            eta: this.eta,
+            gamma: this.gamma,
+            cfl: this.cfl,
+            pressureFloor: this.pressureFloor,
+            speedScale: this.speedScale,
+            running: this.running,
+            bc: this.bcConfig,
+        });
+    }
+
+    /** Restore from `saveState()` output. */
+    loadState(s) {
+        let obj;
+        try { obj = JSON.parse(s); } catch (e) { console.warn('[plasma] loadState parse:', e); return; }
+        if (!obj || obj.v !== 1) return;
+        if (obj.n && obj.n !== this.n) this.setResolution(obj.n);
+        if (obj.preset) this.setPreset(obj.preset);
+        if (obj.viewMode !== undefined) this.setViewMode(obj.viewMode);
+        if (obj.eta !== undefined)      this.setEta(obj.eta);
+        if (obj.gamma !== undefined)    this.setGamma(obj.gamma);
+        if (obj.cfl !== undefined)      this.setCFL(obj.cfl);
+        if (obj.pressureFloor !== undefined) this.setPressureFloor(obj.pressureFloor);
+        if (obj.speedScale !== undefined)    this.setSpeedScale(obj.speedScale);
+        if (obj.running !== undefined)       this.setRunning(obj.running);
+        if (obj.bc) {
+            this.bcConfig = { ...this.bcConfig, ...obj.bc };
+            this.buffers.pushBC(this.bcConfig);
+        }
     }
 
     _pushUniforms() {
@@ -423,6 +579,10 @@ export class Sim {
 
         b.swap();
         this.stepCount += 1;
+        // simTime is advanced by the actual GPU-computed dt, which we
+        // don't read back here; UI presents `stepCount * estimated_dt`
+        // when needed, and stats-display.js does its own readback of
+        // the dt buffer for accurate clock reporting.
     }
 
     render() {

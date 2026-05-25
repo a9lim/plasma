@@ -17,6 +17,7 @@
 
 import { initDevice } from './src/gpu/device.js';
 import { Sim } from './src/sim.js';
+import { setupUI } from './src/ui.js';
 
 // ── Fixed-timestep config (mirrors geon's accumulator pattern) ──
 const PHYSICS_DT     = 1 / 128;   // seconds per physics substep
@@ -104,8 +105,12 @@ class PlasmaSim {
         const rawDt = Math.min((timestamp - this.lastTime) / 1000, MAX_FRAME_DT);
         this.lastTime = timestamp;
 
-        if (this.running) {
-            this.accumulator += rawDt;
+        // Honor sim.running (UI may have paused the sim) and apply the
+        // speed scale to the accumulator inflow rate.
+        const isRunning = this.sim && this.sim.running !== undefined ? this.sim.running : this.running;
+        const speed = (this.sim && this.sim.speedScale) || 1;
+        if (isRunning) {
+            this.accumulator += rawDt * speed;
             if (this.accumulator > ACCUMULATOR_CAP) this.accumulator = ACCUMULATOR_CAP;
             let substeps = 0;
             while (this.accumulator >= PHYSICS_DT && substeps < MAX_SUBSTEPS) {
@@ -157,6 +162,14 @@ async function main() {
     }
 
     window.plasma = sim; // debug handle
+
+    // Mount Phase-5 UI now that the sim is initialized.
+    try {
+        setupUI(sim);
+        document.body.classList.add('app-ready');
+    } catch (e) {
+        console.warn('[plasma] UI setup failed:', e);
+    }
 
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
