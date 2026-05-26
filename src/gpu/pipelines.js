@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 17;
+const SHADER_VERSION = 18;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -85,29 +85,38 @@ function reconstructPpmBGL(device) {
 }
 
 function riemannHlldBGL(device) {
+    // UCT-HLLD upgrade (Mignone+ 2010 / 2021): adds two RW storage
+    // bindings for per-face wave-speed stash (S_L, S_L*, S_R*, S_R).
+    // Reclaimed the two slots by dropping the U0_in/U1_in bindings that
+    // were declared but never read in the shader body — riemann reads
+    // all its inputs from the PPM edge buffers (edge_l_0/1, edge_r_0/1),
+    // not from cell-centered U. Net storage binding count: 10 (still at
+    // the per-pipeline cap; same as before).
     return bgl(device, 'plasma.riemannHlld.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
-        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
-        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
-        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
-        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
-        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // edge_l_0
-        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // edge_l_1
-        { binding: 7, visibility: COMPUTE, buffer: RO_STO },  // edge_r_0
-        { binding: 8, visibility: COMPUTE, buffer: RO_STO },  // edge_r_1
-        { binding: 9, visibility: COMPUTE, buffer: RW_STO },  // flux_0
-        { binding: 10, visibility: COMPUTE, buffer: RW_STO }, // flux_1
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // By_face
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // edge_l_0
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // edge_l_1
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // edge_r_0
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // edge_r_1
+        { binding: 7, visibility: COMPUTE, buffer: RW_STO },  // flux_0
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // flux_1
+        { binding: 9, visibility: COMPUTE, buffer: RW_STO },  // face_wavespeeds_x
+        { binding: 10, visibility: COMPUTE, buffer: RW_STO }, // face_wavespeeds_y
         { binding: 11, visibility: COMPUTE, buffer: UNIFORM }, // SweepDir
     ]);
 }
 
 function emfBGL(device) {
-    // Gardiner-Stone 2005 upwind CT EMF needs the cell-centered Ez at
-    // the four cells around each corner (cf. compute-emf.wgsl). Cell Ez
-    // = vy·Bx - vx·By is computed inline from the cell U0 (for vx/vy)
-    // and the two adjacent face B values per axis. Adds 3 read-only
-    // storage bindings vs the BS-arithmetic-mean version; still under
-    // the 10-per-pipeline cap (6 storage bindings total here).
+    // UCT-HLLD corner EMF (Mignone+ 2010 §4.2 / 2021 §3) — supersedes
+    // the Gardiner-Stone 2005 cell-upwind formulation. Needs per-face
+    // HLLD wave speeds (S_L, S_L*, S_R*, S_R) from riemann-hlld to
+    // build per-face α^L / α^R / ν weights, plus the cell-centered Ez
+    // and tangential B at the four corner-adjacent cells (computed
+    // inline from U0 + face B, same as the G&S version). Adds 2 RO
+    // storage bindings vs G&S — 8 storage bindings total, under the
+    // 10-per-pipeline cap.
     return bgl(device, 'plasma.emf.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
         { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // flux_x_1
@@ -116,6 +125,8 @@ function emfBGL(device) {
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // U0 (for cell vx, vy)
         { binding: 5, visibility: COMPUTE, buffer: RO_STO },  // Bx_face (for cell Bx avg)
         { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // By_face (for cell By avg)
+        { binding: 7, visibility: COMPUTE, buffer: RO_STO },  // face_wavespeeds_x
+        { binding: 8, visibility: COMPUTE, buffer: RO_STO },  // face_wavespeeds_y
     ]);
 }
 

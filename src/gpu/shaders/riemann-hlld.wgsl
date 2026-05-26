@@ -28,44 +28,74 @@
 //
 // Degenerate-branch handling unchanged from Phase 3b.
 //
-// Flux output layout (per face, two vec4<f32>):
+// ── Flux output layout (per face, two vec4<f32>) ─────────────────────
 //   flux_0 = (f_rho, f_mn, f_mt1, f_mt2)
 //   flux_1 = (f_E,   f_bt2/f_by-or-bx, fBt1=±Ez, SM_face)
 // The fourth component of flux_1 carries the HLLD contact-wave speed
 // S_M (M&K 2005 eq 38) — the face-normal contact velocity. Consumed by
-// compute-emf.wgsl as the upwind selector for the Gardiner-Stone 2005
-// CT EMF (eqns 41-45). Computed once up-front from rcL/rcR so every
-// branch (supersonic / HLL fallbacks / Branch A HLLC / full HLLD) can
-// stamp it into flux_1.w with a consistent definition. Downstream
+// compute-emf.wgsl as one ingredient (the contact-wave selector) of the
+// UCT-HLLD corner EMF (Mignone, Tzeferacos & Bodo 2010 §4.2; Mignone+
+// 2021 §3) — superseding the Gardiner-Stone 2005 cell-upwind formula
+// (which itself superseded the original BS arithmetic mean). Downstream
 // update-conserved-weighted masks flux_1 with (1,1,0,0) so the SM
 // channel costs zero in the conserved update — it only feeds CT.
 //
+// ── face_wavespeeds output (new in UCT-HLLD upgrade) ─────────────────
+//   face_wavespeeds_x[idx] = (SL, SLs, SRs, SR)  at x-faces
+//   face_wavespeeds_y[idx] = (SL, SLs, SRs, SR)  at y-faces
+// where SLs / SRs are the LEFT / RIGHT Alfvén-wave speeds (M&K 2005 eq
+// 51: S_L* = S_M − |B_n|/√ρ_L*, S_R* = S_M + |B_n|/√ρ_R*). These wave
+// speeds parameterize the LHLLD reconstruction in compute-emf.wgsl —
+// see that file's header for the per-face α^L / α^R / ν derivation.
+//
+// In branches where SLs/SRs aren't computed by the main HLLD path, we
+// stash physically sensible defaults that make compute-emf's per-face
+// LHLLD reconstruction collapse to the right limit:
+//   - Supersonic L (SL ≥ 0): SLs = SRs = SL  → α^L = 1, ν = 0 (pure-L flux)
+//   - Supersonic R (SR ≤ 0): SLs = SRs = SR  → α^R = 1, ν = 0 (pure-R flux)
+//   - Branch A (HLLC, Bn≈0): SLs = SRs = SM  → α^L/α^R split at SM; the
+//     Alfvén waves degenerate to the contact in this limit, so binding
+//     them to SM is the correct LHLLD reduction.
+//   - Branch B (wave-speed coincidence): SLs = SL, SRs = SR  → LHLLD
+//     reduces to HLL-Toro-style two-state dissipation.
+//   - Branch C (negative star pressure → HLL): same as Branch B.
+// All four branches keep SL/SR at the Davis-style outer wave speeds, so
+// compute-emf still has access to the diffusion scale even when the
+// full 5-wave LHLLD fan isn't well-defined here.
+//
 // Bindings:
 //   0 uniforms (uniform)
-//   1 U0_in     (ro)
-//   2 U1_in     (ro)
-//   3 Bx_face   (ro)
-//   4 By_face   (ro)
-//   5 edge_l_0  (ro)
-//   6 edge_l_1  (ro)
-//   7 edge_r_0  (ro)
-//   8 edge_r_1  (ro)
-//   9 flux_0    (rw)
-//  10 flux_1    (rw)
+//   1 Bx_face   (ro)
+//   2 By_face   (ro)
+//   3 edge_l_0  (ro)
+//   4 edge_l_1  (ro)
+//   5 edge_r_0  (ro)
+//   6 edge_r_1  (ro)
+//   7 flux_0    (rw)
+//   8 flux_1    (rw)
+//   9 face_wavespeeds_x  (rw)  ← new: (SL, SLs, SRs, SR) at x-faces
+//  10 face_wavespeeds_y  (rw)  ← new: (SL, SLs, SRs, SR) at y-faces
 //  11 sweep     (uniform SweepDir) — sweep_dir = 0 (x) or 1 (y)
+//
+// Storage binding count: 10 (8 RO + 2 RW for fluxes + 2 RW for face
+// wavespeeds = 10) → 10 total, at the cap. We reclaimed two slots by
+// dropping the U0_in/U1_in bindings that were declared but never read
+// in the shader body (riemann reads its inputs from edge_l_0/1 and
+// edge_r_0/1 — the PPM-reconstructed face primitives — never from U
+// directly).
 
-@group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
-@group(0) @binding(1) var<storage, read>       U0_in:     array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read>       U1_in:     array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read>       Bx_face:   array<f32>;
-@group(0) @binding(4) var<storage, read>       By_face:   array<f32>;
-@group(0) @binding(5) var<storage, read>       edge_l_0:  array<vec4<f32>>;
-@group(0) @binding(6) var<storage, read>       edge_l_1:  array<vec4<f32>>;
-@group(0) @binding(7) var<storage, read>       edge_r_0:  array<vec4<f32>>;
-@group(0) @binding(8) var<storage, read>       edge_r_1:  array<vec4<f32>>;
-@group(0) @binding(9) var<storage, read_write> flux_0:    array<vec4<f32>>;
-@group(0) @binding(10) var<storage, read_write> flux_1:   array<vec4<f32>>;
-@group(0) @binding(11) var<uniform>             sweep:    SweepDir;
+@group(0) @binding(0)  var<uniform>              U_uniforms: Uniforms;
+@group(0) @binding(1)  var<storage, read>        Bx_face:    array<f32>;
+@group(0) @binding(2)  var<storage, read>        By_face:    array<f32>;
+@group(0) @binding(3)  var<storage, read>        edge_l_0:   array<vec4<f32>>;
+@group(0) @binding(4)  var<storage, read>        edge_l_1:   array<vec4<f32>>;
+@group(0) @binding(5)  var<storage, read>        edge_r_0:   array<vec4<f32>>;
+@group(0) @binding(6)  var<storage, read>        edge_r_1:   array<vec4<f32>>;
+@group(0) @binding(7)  var<storage, read_write>  flux_0:     array<vec4<f32>>;
+@group(0) @binding(8)  var<storage, read_write>  flux_1:     array<vec4<f32>>;
+@group(0) @binding(9)  var<storage, read_write>  face_wavespeeds_x: array<vec4<f32>>;
+@group(0) @binding(10) var<storage, read_write>  face_wavespeeds_y: array<vec4<f32>>;
+@group(0) @binding(11) var<uniform>              sweep:      SweepDir;
 
 // Dimensionless threshold below which the normal-B² triggers HLLD's
 // Alfvén-degenerate fallback to HLLC. The test now reads
@@ -247,6 +277,19 @@ fn hll_flux_mhd(in_: HllInputs, axis: u32, gamma: f32) -> HLLOut {
     return out;
 }
 
+// Helper: stash (SL, SLs, SRs, SR) into the appropriate face-wavespeeds
+// buffer. Centralized to ensure every flux-write path also writes a
+// matching wavespeed entry (compute-emf reads both buffers and breaks
+// if any face is left unwritten).
+fn stash_wavespeeds(dst: u32, axis: u32, SL: f32, SLs: f32, SRs: f32, SR: f32) {
+    let ws = vec4<f32>(SL, SLs, SRs, SR);
+    if (axis == 0u) {
+        face_wavespeeds_x[dst] = ws;
+    } else {
+        face_wavespeeds_y[dst] = ws;
+    }
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_interior = U_uniforms.grid_n;
@@ -318,17 +361,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // ── Contact-wave speed S_M (M&K 2005 eq 38) ──────────────────────
     // Computed up-front so every flux-write path can stash it into
-    // flux_1.w. compute-emf.wgsl uses this as the upwind selector for
-    // the Gardiner-Stone 2005 CT EMF — the sign of the contact velocity
-    // at each face determines which adjacent cell's Ez_cell is upwind.
+    // flux_1.w. compute-emf.wgsl uses this alongside (SL, SLs, SRs, SR)
+    // from face_wavespeeds_* to construct the UCT-HLLD corner EMF.
     //
     // Formula is identical to the HLL contact-velocity estimate, so
     // it's correct for HLL fallbacks (Branches B/C) as well as HLLD's
     // main path. For supersonic faces (SL>=0 or SR<=0) the entire
     // upstream is one side anyway; SM and the actual upstream velocity
     // coincide in the limit of vanishing jump and differ only by a
-    // smooth fast-wave-speed correction otherwise — fine for the
-    // upwind selector since only sign matters in practice.
+    // smooth fast-wave-speed correction otherwise.
     let rcL_pre = AL.rho * (SL - AL.un);
     let rcR_pre = AR.rho * (SR - AR.un);
     let SM_den_pre = rcR_pre - rcL_pre;
@@ -344,12 +385,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let pfL = pack_flux(FL, axis);
         flux_0[dst] = pfL.f0;
         flux_1[dst] = vec4<f32>(pfL.f1.x, pfL.f1.y, pfL.fBt1, SM_face);
+        // Supersonic-left wave fan: SLs = SRs = SL pegs the LHLLD
+        // weights to (α^L = 1, α^R = 0, ν = 0), recovering the
+        // pure-L flux that flux_0/flux_1 already carry. Setting them
+        // to SL (vs e.g. SR) makes the dissipation term in compute-emf
+        // identically zero for any reasonable Bt jump.
+        stash_wavespeeds(dst, axis, SL, SL, SL, SR);
         return;
     }
     if (SR <= 0.0) {
         let pfR = pack_flux(FR, axis);
         flux_0[dst] = pfR.f0;
         flux_1[dst] = vec4<f32>(pfR.f1.x, pfR.f1.y, pfR.fBt1, SM_face);
+        // Supersonic-right: symmetric to above.
+        stash_wavespeeds(dst, axis, SL, SR, SR, SR);
         return;
     }
 
@@ -363,6 +412,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let h = hll_flux_mhd(hin, axis, g);
         flux_0[dst] = h.f0;
         flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, SM_face);
+        // No well-defined Alfvén structure here — set SLs=SL, SRs=SR
+        // so compute-emf's per-face LHLLD collapses to the HLL
+        // two-state form (α^L = -SL/(SR-SL), α^R = SR/(SR-SL),
+        // ν = -SL·SR/(SR-SL)). Matches what hll_flux_mhd just wrote.
+        stash_wavespeeds(dst, axis, SL, SL, SR, SR);
         return;
     }
 
@@ -381,6 +435,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let h = hll_flux_mhd(hin, axis, g);
         flux_0[dst] = h.f0;
         flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, SM_face);
+        // Same LHLLD-via-HLL fallback as Branch B.
+        stash_wavespeeds(dst, axis, SL, SL, SR, SR);
         return;
     }
 
@@ -422,6 +478,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let pfA = pack_flux(Fout, axis);
         flux_0[dst] = pfA.f0;
         flux_1[dst] = vec4<f32>(pfA.f1.x, pfA.f1.y, pfA.fBt1, SM_face);
+        // Alfvén waves degenerate (|Bn| ≈ 0): SLs = SRs = SM.
+        // compute-emf's per-face LHLLD reduces to α^L/α^R upwind by SM.
+        stash_wavespeeds(dst, axis, SL, SM, SM, SR);
         return;
     }
 
@@ -529,4 +588,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pfH = pack_flux(Fout, axis);
     flux_0[dst] = pfH.f0;
     flux_1[dst] = vec4<f32>(pfH.f1.x, pfH.f1.y, pfH.fBt1, SM_face);
+    // Full 5-wave fan: stash all four wave speeds for LHLLD weighting.
+    stash_wavespeeds(dst, axis, SL, SLs, SRs, SR);
 }
