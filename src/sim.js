@@ -1054,9 +1054,22 @@ export class Sim {
 
         const pass = encoder.beginComputePass({ label: 'plasma.rkl2' });
 
-        // Seed: dst → init, dst → A (pprev), dst → B (prev).
+        // Seed: dst → init, dst → A (pprev), dst → B (prev), dst → C (tmp).
+        //
+        // tmp must be seeded too even though the substep init/prev passes
+        // OVERWRITE its interior values — the snapshot copy at the END of
+        // the super-step (prev → dst) covers the full (N+3)² window
+        // including ghost cells, and ghosts never get touched by init or
+        // prev (their `in_*_interior` checks gate them off). After substep
+        // 1's rotation, `prev` points at what was previously `tmp`; if
+        // tmp's ghost strip was zero-initialized (buffer allocation
+        // default), the final snapshot zeros dst's ghost strip, which
+        // then drives massive ∇²B at the wall in the NEXT step's
+        // hyperbolic update and detonates Harris within ~50 steps
+        // (Session 9). Seeding tmp from dst keeps its ghost equal to
+        // whatever apply-bcs wrote when this side was last source.
         pass.setPipeline(pipelines.pipelines.applyResSnapshot);
-        for (const dest of [initSet, setA, setB]) {
+        for (const dest of [initSet, setA, setB, setC]) {
             const bg = this._applyResSnapBG(
                 handles.Bx, handles.By, handles.U1,
                 dest.Bx,    dest.By,    dest.U1,

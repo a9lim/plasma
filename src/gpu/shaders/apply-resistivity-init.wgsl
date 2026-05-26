@@ -119,9 +119,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let bz_new = one_minus * bz_0 + nu_j * pprev_bz + dt_super * gam_tilde_j * L_0;
 
-        var u1 = U1_tmp[c];
-        u1.y = bz_new;
-        U1_tmp[c] = u1;
+        // E (u1.x) has no Laplacian operator (L_E = 0), so the RKL2
+        // recurrence collapses to Y_j.E = U^n.E for all j by induction
+        // — see the algebra in the file header. Bypass the (cancellation-
+        // prone) linear combination math and write U^n.E directly from
+        // the frozen init buffer. The pad slots (z, w) match the
+        // canonical (E, Bz, 0, 0) layout produced by update-conserved-
+        // weighted.
+        //
+        // This also matters because `U1_tmp` is NOT snapshotted at
+        // super-step boot (only init/pprev/prev are seeded from dst), so
+        // on the first substep its u1.x slot is whatever stale or
+        // zero-initialized data the buffer held. A read-modify-write
+        // through `var u1 = U1_tmp[c]; u1.y = bz_new; U1_tmp[c] = u1`
+        // would silently propagate that garbage into u1.x and corrupt E
+        // across the whole interior — masking it with the energy floor
+        // downstream and breaking Harris at η > 0 (Session 9).
+        U1_tmp[c] = vec4<f32>(U1_init[c].x, bz_new, 0.0, 0.0);
     }
 
     // ── Bx_face ────────────────────────────────────────────────────

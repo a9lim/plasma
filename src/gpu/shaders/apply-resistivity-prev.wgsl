@@ -104,6 +104,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                   + U1_prev[yu].y + U1_prev[yd].y - 4.0 * bz_p;
         let L_p   = eta_c * dx2_inv * lap_p;
 
+        // E (u1.x) has no Laplacian operator (L_E = 0). The init pass
+        // for this substep wrote U^n.E into u1.x (see
+        // apply-resistivity-init.wgsl for the inductive algebra); prev
+        // only contributes to the Bz component. Read-modify-write on
+        // u1.y preserves u1.x untouched. Don't trust U1_tmp.x against
+        // an init regression — if a future change breaks init's
+        // explicit-x write, this preservation chain breaks and Harris
+        // (η > 0) NaNs again. See Session 9 retrospective.
         var u1 = U1_tmp[c];
         u1.y = u1.y + mu_j * bz_p + dt_super * mu_tilde_j * L_p;
         U1_tmp[c] = u1;
