@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plasma — CPAW convergence test | a9l.im</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="/favicon.ico">
+
+<link rel="stylesheet" href="/fonts/fonts.css">
+<script src="/shared-tokens.js"></script>
+<link rel="stylesheet" href="/shared-base.css">
+<link rel="stylesheet" href="../styles.css">
+
+<style>
+  body.sim-body { overflow: auto; padding: 24px; }
+  #wrap { max-width: 1000px; margin: 0 auto; font-family: var(--font-sans); }
+  h1 { font-family: var(--font-display); margin: 0 0 8px; }
+  .hint { color: var(--text-muted); margin: 4px 0 16px; font-size: var(--font-sm); }
+  .actions { display: flex; gap: 12px; align-items: center; margin: 16px 0; }
+  button.tool-btn { padding: 8px 16px; font-size: var(--font-base); }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px;
+          font-family: var(--font-mono); font-size: var(--font-sm);
+          font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 12px; text-align: right; }
+  th { background: var(--bg-elevated); color: var(--text); font-weight: 600;
+       border-bottom: 1px solid var(--accent); }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:nth-child(even) { background: var(--bg-elevated); }
+  tfoot td { border-top: 1px solid var(--accent); padding-top: 12px;
+             font-weight: 600; color: var(--accent); }
+  #log { font-family: var(--font-mono); font-size: var(--font-sm);
+         background: var(--bg-elevated); padding: 12px; border-radius: var(--radius);
+         margin-top: 16px; white-space: pre-wrap; min-height: 80px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: var(--radius);
+          font-family: var(--font-mono); font-size: var(--font-sm);
+          background: var(--accent); color: var(--text-on-accent); }
+  canvas#dummy { display: none; }
+  .err { color: #c02520; }
+  details { margin-top: 24px; }
+  details summary { cursor: pointer; padding: 8px 0; font-weight: 600; }
+  details p { font-size: var(--font-sm); color: var(--text-muted); line-height: 1.5; }
+  details code { font-family: var(--font-mono); font-size: 0.9em; }
+</style>
+</head>
+<body class="sim-body">
+<div id="wrap">
+  <h1>Circularly polarized Alfvén wave — convergence test</h1>
+  <p class="hint">
+    Tóth (2000); Stone+ (2008) §4.2. Smooth IC, all-periodic BCs,
+    γ = 5/3, η = 0. Wave propagates at angle α = atan(2); after one
+    period T = 1/√5 ≈ 0.4472 the analytic solution equals the IC.
+    L1 error is averaged per cell per conserved component.
+  </p>
+  <div class="actions">
+    <button id="runBtn" class="tool-btn">Run sweep</button>
+    <span id="status" class="hint">Idle — click Run sweep to start.</span>
+  </div>
+  <div id="log"></div>
+  <table id="results">
+    <thead>
+      <tr>
+        <th>N</th>
+        <th>dx</th>
+        <th>steps</th>
+        <th>dt_avg</th>
+        <th>L1 error</th>
+        <th>slope (vs N/2)</th>
+        <th>wall time</th>
+      </tr>
+    </thead>
+    <tbody id="resBody"></tbody>
+    <tfoot id="resFoot"></tfoot>
+  </table>
+
+  <details>
+    <summary>How to interpret the slope</summary>
+    <p>
+      Expected: <strong>slope ≈ 3</strong> in L1 (limited by RK3 SSP).
+      <strong>Slope ≈ 2</strong> is evidence the PPM limiter is clipping smooth
+      extrema and motivates the PPM4 (McCorquodale-Colella 2011)
+      extremum-preserving upgrade. Anything else (≪ 2 or ≫ 3) suggests
+      a numerical bug somewhere in the engine stack.
+    </p>
+  </details>
+</div>
+
+<canvas id="dummy"></canvas>
+
+<script type="module">
+import { initDevice } from '../src/gpu/device.js';
+import { Sim } from '../src/sim.js';
+import { makeAlfvenCpawPreset } from '../src/presets.js';
+import { ReadbackPool, readbackBatch } from '../src/gpu/readback.js';
+import { GHOST_WIDTH } from '../src/config.js';
+
+const log    = document.getElementById('log');
+const status = document.getElementById('status');
+const runBtn = document.getElementById('runBtn');
+const resBody = document.getElementById('resBody');
+const resFoot = document.getElementById('resFoot');
+
+function logln(msg, cls) {
+    const span = document.createElement('div');
+    if (cls) span.className = cls;
+    span.textContent = msg;
+    log.appendChild(span);
+    log.scrollTop = log.scrollHeight;
+}
+
+function setStatus(s) { status.textContent = s; }
+
+function fmt(v, digits=4) {
+    if (!isFinite(v)) return String(v);
+    return v.toExponential(digits);
+}
+
+/**
+ * Reconstruct the analytic CPAW solution at t=T (which equals t=0 by
+ * periodicity) on the interior cells of an (N+4) ghost-padded grid.
+ * Returns the same four typed arrays the preset returns.
+ */
+function analyticCPAW(n) {
+    return makeAlfvenCpawPreset(n);
+}
+
+/**
+ * Compute L1 error vs analytic solution. Averaged over interior cells
+ * × 8 conserved components: (ρ, ρv_x, ρv_y, ρv_z, E, B_x, B_y, B_z).
+ *
+ * Cell-centered B_x / B_y for the error metric uses the face-averaged
+ * value (matches the engine's cons_to_prim_mhd contract). Numeric face
+ * B is averaged on the (i, j) cell from face slots [i, j] and [i+1, j]
+ * / [i, j+1] respectively.
+ */
+function l1Error(n, ghost, num, ref) {
+    const nT = n + 2 * ghost;
+    const U0_num = new Float32Array(num.U0);
+    const U1_num = new Float32Array(num.U1);
+    const Bx_num = new Float32Array(num.Bx_face);
+    const By_num = new Float32Array(num.By_face);
+
+    const U0_ref = ref.data.U0;
+    const U1_ref = ref.data.U1;
+    const Bx_ref = ref.data.Bx_face;
+    const By_ref = ref.data.By_face;
+
+    const bxIdx = (i, j) => j * (nT + 1) + i;
+    const byIdx = (i, j) => j * nT + i;
+    const cIdx  = (i, j) => j * nT + i;
+
+    let sum = 0;
+    let count = 0;
+    for (let j = ghost; j < ghost + n; j++) {
+        for (let i = ghost; i < ghost + n; i++) {
+            const c = cIdx(i, j);
+            // U0 = (ρ, ρv_x, ρv_y, ρv_z)
+            for (let k = 0; k < 4; k++) {
+                sum += Math.abs(U0_num[4*c + k] - U0_ref[4*c + k]);
+            }
+            // U1 = (E, B_z, _, _). Only first two are conserved.
+            sum += Math.abs(U1_num[4*c + 0] - U1_ref[4*c + 0]);
+            sum += Math.abs(U1_num[4*c + 1] - U1_ref[4*c + 1]);
+
+            // Cell-centered B_x / B_y via face average.
+            const bx_num_c = 0.5 * (Bx_num[bxIdx(i, j)] + Bx_num[bxIdx(i+1, j)]);
+            const by_num_c = 0.5 * (By_num[byIdx(i, j)] + By_num[byIdx(i, j+1)]);
+            const bx_ref_c = 0.5 * (Bx_ref[bxIdx(i, j)] + Bx_ref[bxIdx(i+1, j)]);
+            const by_ref_c = 0.5 * (By_ref[byIdx(i, j)] + By_ref[byIdx(i, j+1)]);
+            sum += Math.abs(bx_num_c - bx_ref_c);
+            sum += Math.abs(by_num_c - by_ref_c);
+
+            count += 8;
+        }
+    }
+    return sum / count;
+}
+
+/**
+ * Run one resolution: instantiate fresh Sim at N, load CPAW preset,
+ * step until simTime >= T, read back state, compute L1.
+ */
+async function runOne(adapter, device, format, N, T) {
+    const canvas = document.getElementById('dummy');
+    const context = canvas.getContext('webgpu');
+    context.configure({ device, format, alphaMode: 'premultiplied' });
+
+    const sim = new Sim(device, context, format, { hasTimestamp: false });
+    await sim.init();
+    sim.setRunning(false);
+
+    // setResolution destroys + reloads at the new N (defaults to 256).
+    // It only allows 256 / 512 / 1024 — patch in support for smaller
+    // sizes by setting fields directly + reinstantiating buffers.
+    sim.n = N;
+    sim.n_total = N + 2 * sim.ghost;
+    sim.dx = sim.domainLength / N;
+    // Re-instantiate buffers + renderer at the new N. Mirrors the path
+    // inside setResolution() but skips its 256/512/1024 guard.
+    const { PlasmaBuffers } = await import('../src/gpu/buffers.js');
+    const { PlasmaRenderer } = await import('../src/gpu/render.js');
+    const { VIRIDIS } = await import('../src/colormaps.js');
+    sim.buffers = new PlasmaBuffers(device, N);
+    sim.renderer = new PlasmaRenderer(device, context, sim.pipelines, sim.buffers);
+    sim.buffers.uploadLUT(VIRIDIS);
+    device.queue.writeBuffer(sim.buffers.dt, 0, new Float32Array([1e-4]).buffer);
+    sim._pushUniforms();
+    sim._pushLicUniforms();
+
+    // Now load the CPAW preset at this N and rebuild bind groups.
+    sim.loadPreset(makeAlfvenCpawPreset(N));
+    sim._buildBindGroupCache();
+
+    const pool = new ReadbackPool(device);
+    const ghost = sim.ghost;
+    const nT    = N + 2 * ghost;
+    const cellsT = nT * nT;
+    const xfaces = (nT + 1) * nT;
+    const yfaces = nT * (nT + 1);
+
+    // Hot loop: step until simTime ≈ T. We need to halt at exactly T —
+    // overshooting by even one CFL step introduces an O(dt) phase error
+    // that dominates the spatial truncation error at low N and corrupts
+    // the convergence slope (the "DT_MAX clamp" trap: at N=32 with
+    // CFL=0.4, the natural dt ~ 1e-2 is comparable to T/45, so a single
+    // overshoot is ~2% of T).
+    //
+    // Engine path normally calls compute-dt at the START of step() and
+    // overwrites the dt buffer. To cap the final step at exactly T -
+    // simTime, we (a) probe the natural CFL dt by stepping once + read-
+    // back, (b) detect when simTime+dt would overshoot, (c) for that
+    // final step, manually write the cap to dt and run only the RK3
+    // pass (skipping compute-dt's overwrite). We expose a tiny
+    // _encodeRK3OnlyStep() helper that mirrors sim.step()'s second pass.
+    const encodeRK3OnlyStep = () => {
+        const encoder = device.createCommandEncoder({ label: 'plasma.test.rk3' });
+        const pass = encoder.beginComputePass({ label: 'plasma.test.rk3.pass' });
+        const side = sim.buffers._side;
+        sim._encodeStage(pass, 1, side);
+        sim._encodeStage(pass, 2, side);
+        sim._encodeStage(pass, 3, side);
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+        sim.buffers.swap();
+        sim.stepCount += 1;
+    };
+
+    const t0 = performance.now();
+    let steps = 0;
+    let sumDt = 0;
+    const maxSteps = 100000;
+
+    while (sim.simTime < T && steps < maxSteps) {
+        // Probe the natural dt without stepping: run compute-dt
+        // standalone, read it back.
+        const probeEnc = device.createCommandEncoder({ label: 'plasma.test.probe' });
+        sim._encodeComputeDt(probeEnc);
+        device.queue.submit([probeEnc.finish()]);
+        const probeOut = await readbackBatch(device, pool, [
+            { buf: sim.buffers.dt, byteOffset: 0, byteSize: 16 },
+        ]);
+        const naturalDt = new Float32Array(probeOut[0])[0];
+        const remaining = T - sim.simTime;
+
+        if (naturalDt <= remaining) {
+            // Natural step — dt buffer is already correct from probe;
+            // just run RK3.
+            encodeRK3OnlyStep();
+            sumDt += naturalDt;
+            sim.simTime += naturalDt;
+        } else {
+            // Final step — clamp dt to land exactly on T.
+            device.queue.writeBuffer(sim.buffers.dt, 0,
+                new Float32Array([remaining]).buffer);
+            encodeRK3OnlyStep();
+            sumDt += remaining;
+            sim.simTime += remaining;
+        }
+        steps++;
+    }
+
+    // Read back current-state buffers (now living on U_n after the last
+    // step's swap()).
+    const bytesPerCellV4 = cellsT * 16;
+    const bytesXFace     = xfaces * 4;
+    const bytesYFace     = yfaces * 4;
+    const reads = await readbackBatch(device, pool, [
+        { buf: sim.buffers.U0_n, byteOffset: 0, byteSize: bytesPerCellV4 },
+        { buf: sim.buffers.U1_n, byteOffset: 0, byteSize: bytesPerCellV4 },
+        { buf: sim.buffers.Bx_n, byteOffset: 0, byteSize: bytesXFace },
+        { buf: sim.buffers.By_n, byteOffset: 0, byteSize: bytesYFace },
+    ]);
+
+    const num = {
+        U0: reads[0],
+        U1: reads[1],
+        Bx_face: reads[2],
+        By_face: reads[3],
+    };
+    const ref = analyticCPAW(N);
+    const L1 = l1Error(N, ghost, num, ref);
+
+    const wallMs = performance.now() - t0;
+    return {
+        N,
+        dx: sim.dx,
+        steps,
+        dtAvg: sumDt / Math.max(1, steps),
+        L1,
+        wallSec: wallMs / 1000,
+        simTime: sim.simTime,
+    };
+}
+
+async function runSweep() {
+    runBtn.disabled = true;
+    log.textContent = '';
+    resBody.replaceChildren();
+    resFoot.replaceChildren();
+    setStatus('Initializing WebGPU...');
+
+    let adapter, device, format;
+    try {
+        ({ adapter, device, format } = await initDevice());
+    } catch (e) {
+        setStatus('WebGPU init failed: ' + e.message);
+        logln('FATAL: ' + e.message, 'err');
+        runBtn.disabled = false;
+        return;
+    }
+    logln(`WebGPU ready. Device: ${adapter.info?.description || '(unknown adapter)'}`);
+
+    const T = 1.0 / Math.sqrt(5.0);
+    logln(`Target time T = λ/v_A = 1/√5 = ${T.toFixed(7)}`);
+
+    const sizes = [32, 64, 128, 256];
+    const results = [];
+
+    for (const N of sizes) {
+        setStatus(`Running N=${N}...`);
+        logln(`Starting N=${N}`);
+        try {
+            const r = await runOne(adapter, device, format, N, T);
+            results.push(r);
+            logln(
+              `N=${N}: L1 = ${fmt(r.L1)},  dt_avg = ${fmt(r.dtAvg, 3)},  ` +
+              `${r.steps} steps,  ${r.wallSec.toFixed(2)}s,  simTime=${r.simTime.toFixed(5)}`
+            );
+            appendRow(r, results);
+        } catch (e) {
+            logln(`N=${N} FAILED: ${e.message}`, 'err');
+            console.error(e);
+            break;
+        }
+        await new Promise(r => setTimeout(r, 50));
+    }
+
+    if (results.length >= 2) {
+        const fit = leastSquaresLogLog(results.map(r => r.dx),
+                                       results.map(r => r.L1));
+        const row = document.createElement('tr');
+        const labelCell = document.createElement('td');
+        labelCell.colSpan = 5;
+        labelCell.textContent = `Least-squares slope over ${results.length} resolutions (log L1 vs log dx):`;
+        const slopeCell = document.createElement('td');
+        const pill = document.createElement('span');
+        pill.className = 'pill';
+        pill.textContent = fit.slope.toFixed(3);
+        slopeCell.appendChild(pill);
+        const noteCell = document.createElement('td');
+        noteCell.textContent = interpret(fit.slope);
+        row.appendChild(labelCell);
+        row.appendChild(slopeCell);
+        row.appendChild(noteCell);
+        resFoot.appendChild(row);
+        logln(`Best-fit slope (log L1 vs log dx): ${fit.slope.toFixed(4)}`);
+        logln(`Interpretation: ${interpret(fit.slope)}`);
+    }
+    setStatus('Done.');
+    runBtn.disabled = false;
+}
+
+function appendRow(r, all) {
+    const idx = all.length - 1;
+    let slopeText = '—';
+    if (idx >= 1) {
+        const prev = all[idx - 1];
+        // L1 should decrease as N grows; slope = log(L1_prev / L1_curr) / log(N_curr / N_prev).
+        const ratio = prev.L1 / r.L1;
+        const factor = r.N / prev.N;
+        const slope = Math.log(ratio) / Math.log(factor);
+        slopeText = slope.toFixed(3);
+    }
+    const tr = document.createElement('tr');
+    const cells = [
+        String(r.N),
+        fmt(r.dx),
+        String(r.steps),
+        fmt(r.dtAvg, 3),
+        fmt(r.L1),
+        slopeText,
+        `${r.wallSec.toFixed(2)}s`,
+    ];
+    for (const c of cells) {
+        const td = document.createElement('td');
+        td.textContent = c;
+        tr.appendChild(td);
+    }
+    resBody.appendChild(tr);
+}
+
+function leastSquaresLogLog(xs, ys) {
+    // y = a · x^p   →   log y = log a + p · log x
+    const lx = xs.map(Math.log);
+    const ly = ys.map(Math.log);
+    const n = lx.length;
+    const meanX = lx.reduce((a, b) => a + b, 0) / n;
+    const meanY = ly.reduce((a, b) => a + b, 0) / n;
+    let num = 0, den = 0;
+    for (let i = 0; i < n; i++) {
+        num += (lx[i] - meanX) * (ly[i] - meanY);
+        den += (lx[i] - meanX) * (lx[i] - meanX);
+    }
+    return { slope: num / den };
+}
+
+function interpret(slope) {
+    if (slope >= 2.7) return 'order 3 (textbook) — RK3 SSP + PPM not clipping';
+    if (slope >= 1.7) return 'order 2 — limiter likely clipping smooth extrema; PPM4 upgrade would unlock 3rd order';
+    if (slope >= 0.7) return 'order 1 — something else dominates (BC error? bug?)';
+    return 'sub-linear — investigate (boundary leak, fp32 noise floor, or bug)';
+}
+
+runBtn.addEventListener('click', runSweep);
+</script>
+</body>
+</html>

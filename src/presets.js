@@ -357,9 +357,174 @@ export function makeHarrisPreset(n = GRID_N) {
     };
 }
 
+/**
+ * Circularly polarized Alfvén wave — canonical MHD convergence test
+ * (Tóth 2000; Stone+ 2008 §4.2). Smooth, periodic, exact analytic
+ * solution: the IC translates rigidly along k at the Alfvén speed v_A
+ * and returns to itself every period T = λ/v_A.
+ *
+ *  ── Setup (Tóth 2000) ────────────────────────────────────────────
+ *  Domain          : [0, 1]² square, all periodic BCs.
+ *  Wave angle      : α = atan(2)  →  cos α = 1/√5, sin α = 2/√5.
+ *                    Wave vector  k_hat = (cos α, sin α).
+ *  Phase variable  : φ(x, y) = 2π(x + 2y).
+ *                    Implicit wavelength λ = 1/√5 along k; this packs
+ *                    exactly ONE wavelength along k between (0,0) and
+ *                    (1, 2), so the field is periodic on [0,1]² with
+ *                    period 1 in x and period 1/2 in y.
+ *  Background      : ρ = 1, p = 0.1, γ = 5/3.
+ *                    B = B_∥ k_hat with B_∥ = 1.
+ *  Perturbation    : A = 0.1 (amplitude).
+ *                    δB_⊥1 = A sin φ   in the (x,y)-plane ⊥ to k.
+ *                    δB_⊥2 = A cos φ   along z.
+ *                    Alfvén polarization for +k propagation:
+ *                       δv_⊥ = -δB_⊥ / √ρ.
+ *  Alfvén speed    : v_A = B_∥ / √ρ = 1.
+ *  Period          : T = λ / v_A = 1/√5 ≈ 0.4472136.
+ *
+ *  ── Rotation to lab frame ─────────────────────────────────────────
+ *  Unit vectors:  k̂   = ( cos α,  sin α, 0)
+ *                 ⊥1  = (-sin α,  cos α, 0)
+ *                 ⊥2  = ( 0,      0,     1)
+ *
+ *  B_x = cos α - sin α · A sin φ
+ *  B_y = sin α + cos α · A sin φ
+ *  B_z = A cos φ
+ *  v_x = +sin α · A sin φ           (since δv_⊥1 = -A sin φ → v_x = -sin α · δv_⊥1 = +sin α · A sin φ)
+ *  v_y = -cos α · A sin φ
+ *  v_z = -A cos φ
+ *
+ *  Check ∇·B = ∂_x B_x + ∂_y B_y
+ *            = -sin α · A cos φ · ∂_x φ + cos α · A cos φ · ∂_y φ
+ *            = A cos φ · (-sin α · 2π + cos α · 4π)
+ *            = A cos φ · 2π · (-2/√5 + 2/√5) = 0  ✓
+ *
+ *  ── Vector potential (for discretely divergence-free face B) ──────
+ *  In 2.5D we have B_⊥z (cell-centered) and B_xy (face). A_z gives B_xy:
+ *       B_x = +∂A_z/∂y,  B_y = -∂A_z/∂x.
+ *  Solve:
+ *       A_z(x, y) = y cos α - x sin α + (A / (2π √5)) · cos φ
+ *  Verify:
+ *       ∂A_z/∂y = cos α + (A/(2π√5)) · (-sin φ) · 4π
+ *               = cos α - (2A/√5) sin φ = cos α - sin α · A sin φ  ✓
+ *       -∂A_z/∂x = sin α + (A/(2π√5)) · sin φ · 2π
+ *               = sin α + (A/√5) sin φ = sin α + cos α · A sin φ   ✓
+ *  Face B from corner-sampled A_z:
+ *       Bx_face[i, j] = (A_z(x_face_i, y_corner_top) - A_z(x_face_i, y_corner_bot)) / dy
+ *       By_face[i, j] = -(A_z(x_corner_right, y_face_j) - A_z(x_corner_left, y_face_j)) / dx
+ *  Cell-centered B_z is exact (no vector potential needed in 2D for B_z).
+ *  Cell-centered B_x / B_y for the energy budget use the analytic
+ *  expression evaluated at the cell center; this is consistent with the
+ *  shader's downstream face-average reconstruction to O(dx²).
+ */
+export function makeAlfvenCpawPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L     = 1.0;
+    const dx    = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    // Wave geometry. atan(2) is the canonical Tóth choice — it makes the
+    // box accommodate an integer wavelength along k.
+    const alpha   = Math.atan(2);
+    const cosA    = Math.cos(alpha);     // 1/√5
+    const sinA    = Math.sin(alpha);     // 2/√5
+    const A       = 0.1;                 // perturbation amplitude
+    const B_par   = 1.0;
+    const rho0    = 1.0;
+    const p0      = 0.1;
+    const v_A     = B_par / Math.sqrt(rho0);  // = 1
+    const lambda  = 1.0 / Math.sqrt(5.0);     // along k
+    const verifyTime = lambda / v_A;          // T = 1/√5 ≈ 0.4472136
+    const TWO_PI  = 2.0 * Math.PI;
+    // phase(x, y) = 2π · (x + 2 y) — equivalent to 2π ξ/λ.
+
+    // Position helpers. Domain [0, 1]² in physical coords; interior cell
+    // (i, j) sits at center ((i-ghost+½)·dx, (j-ghost+½)·dx).
+    const xCellOf = (i) => (i - ghost + 0.5) * dx;
+    const yCellOf = (j) => (j - ghost + 0.5) * dx;
+    // Faces (LEFT/DOWN ownership): Bx_face[i, j] at (x = (i-ghost)·dx,
+    //                                                y = (j-ghost+½)·dx).
+    //                              By_face[i, j] at (x = (i-ghost+½)·dx,
+    //                                                y = (j-ghost)·dx).
+    const xFaceOf = (i) => (i - ghost) * dx;
+    const yFaceOf = (j) => (j - ghost) * dx;
+
+    // Analytic A_z at a point. Used to derive face B via finite differences
+    // at the same locations the discrete CT update would interpret them —
+    // this guarantees ∇·B = 0 to machine precision on the discrete face grid.
+    const Az = (x, y) => {
+        const phi = TWO_PI * (x + 2.0 * y);
+        return y * cosA - x * sinA + (A / (TWO_PI * Math.sqrt(5.0))) * Math.cos(phi);
+    };
+
+    // Cell-centered primitives + total B (analytic, used for energy).
+    for (let j = 0; j < nT; j++) {
+        const y_c = yCellOf(j);
+        for (let i = 0; i < nT; i++) {
+            const x_c = xCellOf(i);
+            const phi = TWO_PI * (x_c + 2.0 * y_c);
+            const sphi = Math.sin(phi);
+            const cphi = Math.cos(phi);
+            const bx_c = cosA - sinA * A * sphi;
+            const by_c = sinA + cosA * A * sphi;
+            const bz   = A * cphi;
+            const vx   =  sinA * A * sphi;
+            const vy   = -cosA * A * sphi;
+            const vz   = -A * cphi;
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, vx, vy, vz, p0, bx_c, by_c, bz, gamma);
+        }
+    }
+
+    // Face B from discrete curl of A_z — guarantees ∇·B_face = 0 to fp32
+    // noise. The "corner" locations are the four corners of the face's
+    // owning cell, but for an edge-aligned face the relevant corners are
+    // on either side along the perpendicular axis.
+    //
+    // Bx_face[i, j] lives at x = xFaceOf(i), spans y ∈ [yFaceOf(j),
+    // yFaceOf(j+1)] = [(j-ghost)·dx, (j-ghost+1)·dx]:
+    //   Bx = (A_z(x, y_top) - A_z(x, y_bot)) / dy
+    for (let j = 0; j < nT; j++) {
+        const y_bot = yFaceOf(j);
+        const y_top = yFaceOf(j + 1);
+        for (let i = 0; i <= nT; i++) {
+            const x = xFaceOf(i);
+            Bx_face[bxFaceIdx(i, j, nT)] = (Az(x, y_top) - Az(x, y_bot)) / dx;
+        }
+    }
+    // By_face[i, j] at y = yFaceOf(j), spans x ∈ [xFaceOf(i), xFaceOf(i+1)]:
+    //   By = -(A_z(x_right, y) - A_z(x_left, y)) / dx
+    for (let j = 0; j <= nT; j++) {
+        const y = yFaceOf(j);
+        for (let i = 0; i < nT; i++) {
+            const x_left  = xFaceOf(i);
+            const x_right = xFaceOf(i + 1);
+            By_face[byFaceIdx(i, j, nT)] = -(Az(x_right, y) - Az(x_left, y)) / dx;
+        }
+    }
+
+    return {
+        id: 'alfven-cpaw', label: 'Circularly polarized Alfvén wave',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        // |B| view ranges 0..√(1+A²) ≈ 1.005; bracket the steady value.
+        viewMin: 0.95, viewMax: 1.05,
+        verifyTime,
+        // Convergence-test metadata for tests/alfven-convergence.html.
+        cpaw: { alpha, cosA, sinA, A, lambda, B_par, rho0, p0, v_A, gamma },
+    };
+}
+
 export const PRESETS = {
     sod: makeSodPreset,
     'brio-wu': makeBrioWuPreset,
     'orszag-tang': makeOrszagTangPreset,
     'harris': makeHarrisPreset,
+    'alfven-cpaw': makeAlfvenCpawPreset,
 };
