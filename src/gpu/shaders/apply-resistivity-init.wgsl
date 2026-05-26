@@ -2,13 +2,48 @@
 // Pass 1 of one RKL2 substep. Computes
 //     Y_tmp = (1 − μ_j − ν_j) · U^n + ν_j · Y_{j-2}
 //             + γ̃_j · Δt · L(U^n)
-// L(U^n) is recomputed each substep (cheap 5-point stencil; one extra
-// pass over Y_init per cell). η_local is sampled from the FROZEN init
-// state J_z — for anomalous resistivity, U_uniforms.eta_anom_alpha > 0
-// activates the |J|>J_crit boost; α = 0 returns the uniform base η.
+// L is the resistive operator. For the FACE-CENTERED magnetic field
+// (Bx, By), L is the **curl(η J)** form on the Yee staggered grid:
+//     ∂Bx/∂t |_res = −∂_y(η J_z)              (Bx lives on x-faces)
+//     ∂By/∂t |_res = +∂_x(η J_z)              (By lives on y-faces)
+//     ∂Bz/∂t |_res = η ∇²Bz                   (cell-centered)
+// where J_z lives at cell corners (same staggering as Ez_edge) and
+// η_corner is sampled at the same corners. This is the canonical
+// Athena++/PLUTO resistivity recipe (Athena++ `src/diffusion/
+// diffusion_b.cpp`, PLUTO `Src/MHD/Resistive/res_flux.c`). On the
+// discrete Yee grid the curl form is **identically ∇·B-preserving** by
+// the same divergence-cleaning argument as ideal-MHD CT: every face
+// receives a curl-of-an-edge-centered quantity, so summing the four
+// face updates of any cell telescopes to zero contribution to ∇·B.
 //
-// Companion to apply-resistivity-prev.wgsl. See apply-resistivity.wgsl
-// for the full RKL2 method overview, recurrence, and host orchestration.
+// For uniform η on a divergence-free B the curl form reduces
+// algebraically to η ∇²B (proven by the discrete identity
+// ∂²x Bx + ∂x∂y By = 0 under discrete ∂x Bx + ∂y By = 0). The previous
+// component-wise η ∇²B implementation (Session 8 → 10) was correct in
+// continuous math but accumulated a non-zero ∇·B term at the discrete
+// level whenever the input field had any divergence (fp32 noise + BC
+// inconsistency), and the leak compounded across RKL2 substeps. The
+// curl form is structurally immune to this. See HANDOFF Session 10's
+// "remaining fourth issue (next session) — divB leak at corner cells"
+// for the bisect that surfaced this.
+//
+// For non-uniform η (anomalous resistivity), the curl form is the
+// ONLY discretization that preserves ∇·B — η ∇²B picks up an
+// uncontrolled ∇η × J cross term. The anomalous closure η(|J|) is
+// evaluated at the corner using the corner J_z directly (more accurate
+// than the cell-centered approximation the old code used).
+//
+// Cell-centered Bz keeps the per-component η ∇²Bz Laplacian. Bz has
+// no associated face-staggered Bz (B is the (Bx_face, By_face, Bz_cell)
+// triple in 2.5D), so the curl-on-Yee argument doesn't bind it; Bz is
+// a passive scalar advected by the resistive operator (∇·B is unaware
+// of Bz in 2D).
+//
+// E (u1.x) has no Laplacian operator (L_E = 0) — the RKL2 recurrence
+// applied to E collapses to Y_j.E = U^n.E for all j by induction. The
+// kernel writes U^n.E directly from U1_init to bypass cancellation-
+// prone arithmetic and to defend against U1_tmp.x stale-buffer
+// contamination (Session 9 retrospective).
 //
 // For j = 1: ν_j = 0, μ_j = 0, γ̃_j = 0  → Y_tmp = U^n. The follow-on
 // `apply-resistivity-prev` then adds the μ̃_1 · Δt · L(Y_0) term.
@@ -22,7 +57,7 @@
 //                        but the shader reads the FRESH dt_super from
 //                        dt_buf[0] instead — see binding 12 comment.)
 //   2  sts_coeffs      (ro storage — packed (μ, ν, μ̃, γ̃) per substep)
-//   3  Bx_init  (ro)
+//   3  Bx_init  (ro)   — frozen U^n face B (value + J_z for L(U^n) + η anomalous)
 //   4  By_init  (ro)
 //   5  U1_init  (ro)
 //   6  Bx_pprev (ro)
@@ -36,25 +71,8 @@
 //                       at the start of EACH macro step (before any
 //                       RKL2 substep runs). Reading from here instead of
 //                       sts_meta.dt_super eliminates the CPU-side
-//                       _lastDtHyp staleness path that detonates Harris
-//                       in tight render loops: when consecutive step()
-//                       calls have no microtask break, the async
-//                       readback of dt_buf into _lastDtHyp never
-//                       completes, so sts_meta.dt_super stays at its
-//                       1e-4 initial value while the actual dt_hyp has
-//                       grown to ~1e-3. RKL2's recurrence then applies
-//                       only ~1/10 of the needed resistive diffusion
-//                       per macro step → current sheet thins
-//                       unphysically → NaN cascade within ~50 steps.
-//                       Per-substep diffusion contract: Δt_super in
-//                       the recurrence equals dt_hyp (the hyperbolic
-//                       step). The substep count s is still CPU-sized
-//                       from the lagged _lastDtParabolic ratio — when
-//                       the parabolic CFL has actually tightened, the
-//                       CPU s is OVER-sized relative to the strict
-//                       requirement, which is the safe-fail direction
-//                       (RKL2 is unconditionally stable for s ≥
-//                       s_critical). See Session 10 / 9 retrospective.
+//                       _lastDtHyp staleness path that detonated Harris
+//                       in tight render loops.
 
 struct StsMeta {
     substep_idx: u32,
@@ -90,26 +108,57 @@ struct DtUniform {
 @group(0) @binding(11) var<storage, read_write> U1_tmp:     array<vec4<f32>>;
 @group(0) @binding(12) var<uniform>             dt_buf:     DtUniform;
 
-// |J_z(ix, iy)| from frozen init face B — central differences on
-// face-averaged cell-centered B. Reads (ix±1, iy±1) face cells.
-fn jz_mag_init(ix: u32, iy: u32, n_total: u32, dx_inv: f32) -> f32 {
-    let by_R = 0.5 * (By_init[by_face_down_idx(ix + 1u, iy, n_total)]
-                    + By_init[by_face_up_idx  (ix + 1u, iy, n_total)]);
-    let by_L = 0.5 * (By_init[by_face_down_idx(ix - 1u, iy, n_total)]
-                    + By_init[by_face_up_idx  (ix - 1u, iy, n_total)]);
-    let bx_U = 0.5 * (Bx_init[bx_face_left_idx (ix, iy + 1u, n_total)]
-                    + Bx_init[bx_face_right_idx(ix, iy + 1u, n_total)]);
-    let bx_D = 0.5 * (Bx_init[bx_face_left_idx (ix, iy - 1u, n_total)]
-                    + Bx_init[bx_face_right_idx(ix, iy - 1u, n_total)]);
+// J_z at cell corner (cx, cy) from FROZEN init face B. The corner
+// (cx, cy) sits at the BOTTOM-LEFT of cell (cx, cy), exactly co-located
+// with Ez_edge. Yee-natural stencil:
+//   J_z = (∂_x By − ∂_y Bx)
+//       = ((By[cx, cy] − By[cx-1, cy]) − (Bx[cx, cy] − Bx[cx, cy-1])) / dx
+fn jz_init_corner(cx: u32, cy: u32, n_total: u32, dx_inv: f32) -> f32 {
+    let by_R = By_init[by_face_idx(cx,      cy, n_total)];
+    let by_L = By_init[by_face_idx(cx - 1u, cy, n_total)];
+    let bx_U = Bx_init[bx_face_idx(cx, cy,      n_total)];
+    let bx_D = Bx_init[bx_face_idx(cx, cy - 1u, n_total)];
+    return ((by_R - by_L) - (bx_U - bx_D)) * dx_inv;
+}
+
+// η · J_z at cell corner (cx, cy). η_corner is sampled from the
+// anomalous closure evaluated AT THE CORNER using the corner J_z
+// directly. For uniform η (α = 0) this just multiplies by U.eta.
+fn ez_res_init_corner(cx: u32, cy: u32, n_total: u32, dx_inv: f32) -> f32 {
+    let jz = jz_init_corner(cx, cy, n_total, dx_inv);
+    let alpha = U_uniforms.eta_anom_alpha;
+    var eta_c = U_uniforms.eta;
+    if (alpha > 0.0) {
+        eta_c = anomalous_eta(abs(jz), U_uniforms.eta, alpha,
+                              U_uniforms.eta_anom_jcrit);
+    }
+    return eta_c * jz;
+}
+
+// Cell-centered η for the Bz Laplacian. The Bz update keeps the
+// per-component η ∇²Bz form; in 2D Bz doesn't couple to ∇·B so the
+// curl-on-Yee argument doesn't bind it. η at the cell center uses the
+// face-averaged J_z magnitude (same recipe as Session 8's anomalous
+// implementation) — cell-centered is the natural staggering for a
+// cell-centered Laplacian.
+fn jz_mag_cell_init(ix: u32, iy: u32, n_total: u32, dx_inv: f32) -> f32 {
+    let by_R = 0.5 * (By_init[by_face_idx(ix + 1u, iy, n_total)]
+                    + By_init[by_face_idx(ix + 1u, iy + 1u, n_total)]);
+    let by_L = 0.5 * (By_init[by_face_idx(ix - 1u, iy, n_total)]
+                    + By_init[by_face_idx(ix - 1u, iy + 1u, n_total)]);
+    let bx_U = 0.5 * (Bx_init[bx_face_idx(ix, iy + 1u, n_total)]
+                    + Bx_init[bx_face_idx(ix + 1u, iy + 1u, n_total)]);
+    let bx_D = 0.5 * (Bx_init[bx_face_idx(ix, iy - 1u, n_total)]
+                    + Bx_init[bx_face_idx(ix + 1u, iy - 1u, n_total)]);
     let dby_dx = (by_R - by_L) * 0.5 * dx_inv;
     let dbx_dy = (bx_U - bx_D) * 0.5 * dx_inv;
     return abs(dby_dx - dbx_dy);
 }
 
-fn eta_local_init(ix: u32, iy: u32, n_total: u32, dx_inv: f32) -> f32 {
+fn eta_cell_init(ix: u32, iy: u32, n_total: u32, dx_inv: f32) -> f32 {
     let alpha = U_uniforms.eta_anom_alpha;
     if (alpha <= 0.0) { return U_uniforms.eta; }
-    let jmag = jz_mag_init(ix, iy, n_total, dx_inv);
+    let jmag = jz_mag_cell_init(ix, iy, n_total, dx_inv);
     return anomalous_eta(jmag, U_uniforms.eta, alpha, U_uniforms.eta_anom_jcrit);
 }
 
@@ -121,13 +170,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dx_inv     = 1.0 / U_uniforms.dx;
     let dx2_inv    = dx_inv * dx_inv;
     // Read fresh Δt_super straight from the GPU dt buffer (Session 10
-    // RKL2 dt-feedback fix). compute-dt populates dt_buf[0] at the start
-    // of every macro step before this kernel runs. sts_meta.dt_super
-    // would be the lagged value from the host's last successful readback
-    // of dt_buf — under tight render loops without microtask breaks that
-    // readback never completes and dt_super stays stuck at its initial
-    // value, dramatically under-applying η ∇²B over the macro step and
-    // detonating Harris.
+    // RKL2 dt-feedback fix).
     let dt_super   = dt_buf.dt_hyp;
     if (sts_meta.s_total == 0u) { return; }
 
@@ -141,19 +184,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ix = gid.x + ghost - 1u;
     let iy = gid.y + ghost - 1u;
 
+    // Bz update: strictly interior cells.
     let in_cell_interior =
         ix >= ghost && ix < ghost + n_interior &&
         iy >= ghost && iy < ghost + n_interior;
-    let in_bx_interior =
-        ix > ghost && ix < ghost + n_interior &&
+    // Face updates: include the boundary faces (ix == ghost and
+    // ix == ghost + n_interior for Bx; iy mirror for By). Updating the
+    // boundary face with the curl form is what makes ∇·B identically
+    // preserved at boundary cells too — the four-face telescoping
+    // argument needs every face of every interior cell to receive a
+    // curl contribution. (HANDOFF Session 10 documented that excluding
+    // boundary faces lets ∇·B leak at boundary cells per substep.)
+    let in_bx_face =
+        ix >= ghost && ix <= ghost + n_interior &&
         iy >= ghost && iy < ghost + n_interior;
-    let in_by_interior =
+    let in_by_face =
         ix >= ghost && ix < ghost + n_interior &&
-        iy > ghost && iy < ghost + n_interior;
+        iy >= ghost && iy <= ghost + n_interior;
 
-    if (!(in_cell_interior || in_bx_interior || in_by_interior)) { return; }
+    if (!(in_cell_interior || in_bx_face || in_by_face)) { return; }
 
-    // ── Bz ─────────────────────────────────────────────────────────
+    // ── Bz (cell-centered, η ∇²Bz) ─────────────────────────────────
     if (in_cell_interior) {
         let c  = cell_idx_total(ix,      iy,      n_total);
         let xl = cell_idx_total(ix - 1u, iy,      n_total);
@@ -161,7 +212,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let yd = cell_idx_total(ix,      iy - 1u, n_total);
         let yu = cell_idx_total(ix,      iy + 1u, n_total);
 
-        let eta_c = eta_local_init(ix, iy, n_total, dx_inv);
+        let eta_c = eta_cell_init(ix, iy, n_total, dx_inv);
         let bz_0  = U1_init[c].y;
         let lap_0 = U1_init[xr].y + U1_init[xl].y
                   + U1_init[yu].y + U1_init[yd].y - 4.0 * bz_0;
@@ -170,62 +221,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let bz_new = one_minus * bz_0 + nu_j * pprev_bz + dt_super * gam_tilde_j * L_0;
 
-        // E (u1.x) has no Laplacian operator (L_E = 0), so the RKL2
-        // recurrence collapses to Y_j.E = U^n.E for all j by induction
-        // — see the algebra in the file header. Bypass the (cancellation-
-        // prone) linear combination math and write U^n.E directly from
-        // the frozen init buffer. The pad slots (z, w) match the
-        // canonical (E, Bz, 0, 0) layout produced by update-conserved-
-        // weighted.
-        //
-        // This also matters because `U1_tmp` is NOT snapshotted at
-        // super-step boot (only init/pprev/prev are seeded from dst), so
-        // on the first substep its u1.x slot is whatever stale or
-        // zero-initialized data the buffer held. A read-modify-write
-        // through `var u1 = U1_tmp[c]; u1.y = bz_new; U1_tmp[c] = u1`
-        // would silently propagate that garbage into u1.x and corrupt E
-        // across the whole interior — masking it with the energy floor
-        // downstream and breaking Harris at η > 0 (Session 9).
+        // E (u1.x) has L_E = 0 ⇒ Y_j.E = U^n.E for all j. Write U^n.E
+        // directly from frozen U1_init; ALSO defends against U1_tmp's
+        // stale-buffer contamination on substep 1 (Session 9 fix).
         U1_tmp[c] = vec4<f32>(U1_init[c].x, bz_new, 0.0, 0.0);
     }
 
-    // ── Bx_face ────────────────────────────────────────────────────
-    if (in_bx_interior) {
-        let c  = bx_face_idx(ix,      iy,      n_total);
-        let xl = bx_face_idx(ix - 1u, iy,      n_total);
-        let xr = bx_face_idx(ix + 1u, iy,      n_total);
-        let yd = bx_face_idx(ix,      iy - 1u, n_total);
-        let yu = bx_face_idx(ix,      iy + 1u, n_total);
+    // ── Bx_face: ∂_t Bx = −∂_y(η J_z) ──────────────────────────────
+    if (in_bx_face) {
+        let c = bx_face_idx(ix, iy, n_total);
+        // Ez_res at the two corners that bracket this x-face in y.
+        // Corner (ix, iy)   is the BOTTOM-LEFT of cell (ix, iy)
+        //                      = bottom corner of Bx_face[ix, iy].
+        // Corner (ix, iy+1) is its top corner.
+        let ez_bot = ez_res_init_corner(ix, iy,      n_total, dx_inv);
+        let ez_top = ez_res_init_corner(ix, iy + 1u, n_total, dx_inv);
+        let L_0    = -(ez_top - ez_bot) * dx_inv;
 
-        let eta_l = eta_local_init(ix - 1u, iy, n_total, dx_inv);
-        let eta_r = eta_local_init(ix,      iy, n_total, dx_inv);
-        let eta_f = 0.5 * (eta_l + eta_r);
-
-        let v_0   = Bx_init[c];
-        let lap_0 = Bx_init[xr] + Bx_init[xl] + Bx_init[yu] + Bx_init[yd] - 4.0 * v_0;
-        let L_0   = eta_f * dx2_inv * lap_0;
-        let pprev = Bx_pprev[c];
-
-        Bx_tmp[c] = one_minus * v_0 + nu_j * pprev + dt_super * gam_tilde_j * L_0;
+        let v_0    = Bx_init[c];
+        let pprev  = Bx_pprev[c];
+        Bx_tmp[c]  = one_minus * v_0 + nu_j * pprev + dt_super * gam_tilde_j * L_0;
     }
 
-    // ── By_face ────────────────────────────────────────────────────
-    if (in_by_interior) {
-        let c  = by_face_idx(ix,      iy,      n_total);
-        let xl = by_face_idx(ix - 1u, iy,      n_total);
-        let xr = by_face_idx(ix + 1u, iy,      n_total);
-        let yd = by_face_idx(ix,      iy - 1u, n_total);
-        let yu = by_face_idx(ix,      iy + 1u, n_total);
+    // ── By_face: ∂_t By = +∂_x(η J_z) ──────────────────────────────
+    if (in_by_face) {
+        let c = by_face_idx(ix, iy, n_total);
+        // Corner (ix,   iy) is the BOTTOM-LEFT of cell (ix, iy)
+        //                      = left  corner of By_face[ix, iy].
+        // Corner (ix+1, iy) is its right corner.
+        let ez_lft = ez_res_init_corner(ix,      iy, n_total, dx_inv);
+        let ez_rgt = ez_res_init_corner(ix + 1u, iy, n_total, dx_inv);
+        let L_0    = (ez_rgt - ez_lft) * dx_inv;
 
-        let eta_d = eta_local_init(ix, iy - 1u, n_total, dx_inv);
-        let eta_u = eta_local_init(ix, iy,      n_total, dx_inv);
-        let eta_f = 0.5 * (eta_d + eta_u);
-
-        let v_0   = By_init[c];
-        let lap_0 = By_init[xr] + By_init[xl] + By_init[yu] + By_init[yd] - 4.0 * v_0;
-        let L_0   = eta_f * dx2_inv * lap_0;
-        let pprev = By_pprev[c];
-
-        By_tmp[c] = one_minus * v_0 + nu_j * pprev + dt_super * gam_tilde_j * L_0;
+        let v_0    = By_init[c];
+        let pprev  = By_pprev[c];
+        By_tmp[c]  = one_minus * v_0 + nu_j * pprev + dt_super * gam_tilde_j * L_0;
     }
 }

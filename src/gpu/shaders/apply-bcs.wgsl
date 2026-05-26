@@ -784,30 +784,66 @@ fn fill_bx_face(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
     let dst = bx_face_idx(ix, iy, n_total);
 
     if (mode == BC_PERIODIC) {
+        // The mode picker forces PERIODIC here when (a) both axes are
+        // periodic (non-corner or both-periodic corner — wrap both),
+        // OR (b) on_w/e_wall is true at the X boundary face. In case
+        // (b) the X axis is periodic by construction (mode_w/e
+        // picked it), but the Y axis BC is independent — at a corner
+        // (iy in v-ghost) we must compose with v_mode. Pre-Session-11
+        // this branch wrapped Y unconditionally, which corrupted the
+        // boundary-face ghost stripe at the four corner cells where
+        // periodic-x met outflow-y in Harris (see HANDOFF Session 10
+        // "remaining fourth issue").
         var src_i = ix;
         var src_j = iy;
         if (ix < ghost) { src_i = ix + n_interior; }
         else if (ix > ghost + n_interior) { src_i = ix - n_interior; }
-        if (iy < ghost) { src_j = iy + n_interior; }
-        else if (iy >= ghost + n_interior) { src_j = iy - n_interior; }
-        // Boundary faces: under periodic wrap, the W and E boundary
-        // faces are the SAME face. We canonicalize the W wall as
-        // authoritative: ALL boundary periodic invocations read from
-        // the W boundary face (ix = ghost). The E wall invocation then
-        // writes the same value back, ensuring both are in sync.
-        if (on_w_wall || on_e_wall) { src_i = ghost; }
+        let on_wall = on_w_wall || on_e_wall;
+        if (iy < ghost) {
+            if (on_wall && v_mode != BC_PERIODIC) {
+                // Compose Y outflow (zero-gradient) with X periodic.
+                src_j = ghost;
+            } else {
+                src_j = iy + n_interior;
+            }
+        } else if (iy >= ghost + n_interior) {
+            if (on_wall && v_mode != BC_PERIODIC) {
+                src_j = ghost + n_interior - 1u;
+            } else {
+                src_j = iy - n_interior;
+            }
+        }
+        // Boundary faces canonicalize to W boundary under periodic
+        // (W and E boundary x-faces are the SAME physical face).
+        if (on_wall) { src_i = ghost; }
         Bx_face[dst] = Bx_face[bx_face_idx(src_i, src_j, n_total)];
         return;
     }
 
     if (mode == BC_OUTFLOW) {
+        // Compose per-axis BC at corner ghost cells. The picked OUTFLOW
+        // mode applies to the chosen-owning axis; the orthogonal axis
+        // may be PERIODIC (in which case we wrap, not clamp). Without
+        // this composition, periodic-x on a y-outflow boundary at corner
+        // ghost cells reads from the WRONG column, breaking ∇·B
+        // preservation in the resistive update (HANDOFF Session 10).
         var src_i = ix;
         var src_j = iy;
-        if (ix < ghost) { src_i = ghost; }
-        else if (ix > ghost + n_interior) { src_i = ghost + n_interior; }
+        if (ix < ghost) {
+            if (h_mode == BC_PERIODIC) { src_i = ix + n_interior; }
+            else { src_i = ghost; }
+        } else if (ix > ghost + n_interior) {
+            if (h_mode == BC_PERIODIC) { src_i = ix - n_interior; }
+            else { src_i = ghost + n_interior; }
+        }
         // boundary face stays put (it IS the interior boundary).
-        if (iy < ghost) { src_j = ghost; }
-        else if (iy >= ghost + n_interior) { src_j = ghost + n_interior - 1u; }
+        if (iy < ghost) {
+            if (v_mode == BC_PERIODIC) { src_j = iy + n_interior; }
+            else { src_j = ghost; }
+        } else if (iy >= ghost + n_interior) {
+            if (v_mode == BC_PERIODIC) { src_j = iy - n_interior; }
+            else { src_j = ghost + n_interior - 1u; }
+        }
         Bx_face[dst] = Bx_face[bx_face_idx(src_i, src_j, n_total)];
         return;
     }
@@ -872,25 +908,56 @@ fn fill_by_face(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
     let dst = by_face_idx(ix, iy, n_total);
 
     if (mode == BC_PERIODIC) {
+        // Symmetric to fill_bx_face's PERIODIC branch — compose with
+        // h_mode at S/N boundary face corners when X is non-periodic.
         var src_i = ix;
         var src_j = iy;
-        if (ix < ghost) { src_i = ix + n_interior; }
-        else if (ix >= ghost + n_interior) { src_i = ix - n_interior; }
         if (iy < ghost) { src_j = iy + n_interior; }
         else if (iy > ghost + n_interior) { src_j = iy - n_interior; }
+        let on_wall = on_s_wall || on_n_wall;
+        if (ix < ghost) {
+            if (on_wall && h_mode != BC_PERIODIC) {
+                src_i = ghost;
+            } else {
+                src_i = ix + n_interior;
+            }
+        } else if (ix >= ghost + n_interior) {
+            if (on_wall && h_mode != BC_PERIODIC) {
+                src_i = ghost + n_interior - 1u;
+            } else {
+                src_i = ix - n_interior;
+            }
+        }
         // Canonicalize boundary y-faces: S wall is authoritative.
-        if (on_s_wall || on_n_wall) { src_j = ghost; }
+        if (on_wall) { src_j = ghost; }
         By_face[dst] = By_face[by_face_idx(src_i, src_j, n_total)];
         return;
     }
 
     if (mode == BC_OUTFLOW) {
+        // Compose per-axis BC at corner cells — for Harris this is the
+        // primary fix: at By boundary faces in the E-ghost column (or
+        // W-ghost), the on_s/n_wall priority picks OUTFLOW from
+        // mode_s/n, but the X axis is PERIODIC and the src column
+        // index must be wrapped, not clamped to the rightmost/leftmost
+        // interior column. See HANDOFF Session 10 "remaining fourth
+        // issue" + Session 11.
         var src_i = ix;
         var src_j = iy;
-        if (ix < ghost) { src_i = ghost; }
-        else if (ix >= ghost + n_interior) { src_i = ghost + n_interior - 1u; }
-        if (iy < ghost) { src_j = ghost; }
-        else if (iy > ghost + n_interior) { src_j = ghost + n_interior; }
+        if (ix < ghost) {
+            if (h_mode == BC_PERIODIC) { src_i = ix + n_interior; }
+            else { src_i = ghost; }
+        } else if (ix >= ghost + n_interior) {
+            if (h_mode == BC_PERIODIC) { src_i = ix - n_interior; }
+            else { src_i = ghost + n_interior - 1u; }
+        }
+        if (iy < ghost) {
+            if (v_mode == BC_PERIODIC) { src_j = iy + n_interior; }
+            else { src_j = ghost; }
+        } else if (iy > ghost + n_interior) {
+            if (v_mode == BC_PERIODIC) { src_j = iy - n_interior; }
+            else { src_j = ghost + n_interior; }
+        }
         By_face[dst] = By_face[by_face_idx(src_i, src_j, n_total)];
         return;
     }
