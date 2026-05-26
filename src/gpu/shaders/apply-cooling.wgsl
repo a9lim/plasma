@@ -16,13 +16,29 @@
 // Bremsstrahlung has Λ ∝ √T at high T — the dominant cooling channel
 // for fully-ionized H/He at T ≳ 10⁷ K.
 //
-// Integration: explicit forward Euler over Δt = dt_hyp. For the
-// breadth pass we accept that this is *not* unconditionally stable —
-// when n²Λ Δt becomes a significant fraction of (γ-1)·p, the energy
-// can over-shoot below the pressure floor in one step. The proper fix
-// (Townsend 2009 exact integration with a piecewise-power-law Λ) is a
-// later upgrade. For now we clamp the energy decrement so the cell
-// can never drop below the pressure-floor energy in a single step.
+// Integration (Session 15 — Townsend-style exact integration for the
+// single-power-law cooling shape):
+//
+//   dT/dt = -(γ-1) ρ Λ_0 · √((T − T_floor) / T_ref)
+//
+// Substitute s = √((T − T_floor) / T_ref) ⇒ T − T_floor = T_ref · s².
+// Differentiating both sides w.r.t. t:
+//
+//   dT/dt = 2 · T_ref · s · ds/dt
+//   -(γ-1) ρ Λ_0 · s = 2 · T_ref · s · ds/dt
+//   ds/dt = -(γ-1) ρ Λ_0 / (2 · T_ref)             ← constant in t
+//
+// So s evolves linearly in time. Exact solution over an arbitrary Δt:
+//
+//   s(t)  = max(s(0) − C · t, 0)            C = (γ-1) ρ Λ_0 / (2 T_ref)
+//   T(t)  = T_floor + T_ref · s(t)²
+//
+// When s(t) hits 0 the cell pins at T_floor — no further cooling. This
+// is unconditionally stable for any Δt (no FE timestep bound), and
+// recovers the explicit-FE answer in the limit Δt → 0. Townsend 2009
+// generalizes this construction to a piecewise-power-law Λ(T) on a
+// tabulated grid; for our single √T shape the analytic form lives
+// inline.
 //
 // Bindings:
 //   0 uniforms (uniform)
@@ -80,19 +96,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // T = p / ρ in code units (Boltzmann's constant absorbed).
     let T = p / rho;
 
-    let dT = max(T - U_uniforms.cooling_T_floor, 0.0);
-    let lambda_T = U_uniforms.cooling_lambda0 * sqrt(dT / U_uniforms.cooling_T_ref);
+    let dT_excess = T - U_uniforms.cooling_T_floor;
+    // Already at/below floor → cooling source is zero. Don't touch E.
+    if (dT_excess <= 0.0) { return; }
 
-    // Λ(T) is energy/time/n². dE/dt = -n²Λ. With n = ρ:
-    let cooling_rate = rho * rho * lambda_T;
-    let dt = dt_buf.dt;
-    var dE = cooling_rate * dt;
+    let T_ref = max(U_uniforms.cooling_T_ref, 1.0e-30);
+    let s0 = sqrt(dT_excess / T_ref);
+    let C  = (U_uniforms.gamma - 1.0) * rho
+           * U_uniforms.cooling_lambda0 / (2.0 * T_ref);
+    let s1 = max(s0 - C * dt_buf.dt, 0.0);
+    let T_new = U_uniforms.cooling_T_floor + T_ref * s1 * s1;
+    let p_new = max(rho * T_new, p_floor);
+    let E_new = ke + mb + p_new / (U_uniforms.gamma - 1.0);
 
-    // Clamp so we cannot drop below the pressure-floor energy in one
-    // step. E_min = KE + ½|B|² + p_floor/(γ-1).
-    let E_min = ke + mb + p_floor / (U_uniforms.gamma - 1.0);
-    let max_dec = max(E - E_min, 0.0);
-    if (dE > max_dec) { dE = max_dec; }
-
-    U1[c] = vec4<f32>(E - dE, bz, u1.z, u1.w);
+    U1[c] = vec4<f32>(E_new, bz, u1.z, u1.w);
 }

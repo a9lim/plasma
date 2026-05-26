@@ -65,8 +65,10 @@ function dtBGL(device) {
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
         { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // wavespeed atomic
-        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // dt_buf (4 f32 slots)
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // dt_buf (now 8 f32 slots)
         { binding: 7, visibility: COMPUTE, buffer: RW_STO },  // eta_max atomic
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },  // hall_speed atomic (Session 15)
+        { binding: 9, visibility: COMPUTE, buffer: RW_STO },  // cond_speed atomic (Session 15)
     ]);
 }
 
@@ -244,6 +246,7 @@ function viewBGL(device) {
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
         { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // field
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },  // phi (Session 15: VIEW_PHI)
     ]);
 }
 
@@ -341,8 +344,8 @@ function applyCoolingBGL(device) {
     ]);
 }
 
-// Poisson solver — Jacobi ping-pong. Two entry points share the BGL:
-// `reset_avg` (1×1) seeds ρ̄, `iterate` (N²) does one sweep.
+// Poisson solver — periodic Jacobi ping-pong. Mean density is a two-stage
+// reduction before `iterate` so the periodic compatibility condition is real.
 function solvePoissonBGL(device) {
     return bgl(device, 'plasma.solvePoisson.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
@@ -350,6 +353,7 @@ function solvePoissonBGL(device) {
         { binding: 2, visibility: COMPUTE, buffer: RO_STO },   // phi_in
         { binding: 3, visibility: COMPUTE, buffer: RW_STO },   // phi_out
         { binding: 4, visibility: COMPUTE, buffer: RW_STO },   // rho_mean (1 f32)
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },   // rho_mean_partials
     ]);
 }
 
@@ -364,7 +368,8 @@ function applyGravityBGL(device) {
     ]);
 }
 
-// Anisotropic thermal conduction. Reads U0/B for T, writes U1.E.
+// Anisotropic thermal conduction. First computes a frozen-state dE scratch,
+// then applies it to U1 so neighbor temperatures are deterministic.
 function applyConductionBGL(device) {
     return bgl(device, 'plasma.applyConduction.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
@@ -373,10 +378,12 @@ function applyConductionBGL(device) {
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },   // Bx_face
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },   // By_face
         { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // conduction_dE
     ]);
 }
 
-// Hall MHD correction. Reads U0 (for ρ), reads+writes face B + U1 (for Bz).
+// Hall MHD correction. Computes corner E_H from a frozen state, then applies
+// CT and repairs total energy so Hall-updated B does not masquerade as heat.
 function applyHallBGL(device) {
     return bgl(device, 'plasma.applyHall.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
@@ -385,6 +392,8 @@ function applyHallBGL(device) {
         { binding: 3, visibility: COMPUTE, buffer: RW_STO },   // By_face
         { binding: 4, visibility: COMPUTE, buffer: RW_STO },   // U1 (Bz)
         { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // hall_E
+        { binding: 7, visibility: COMPUTE, buffer: RW_STO },   // hall_mb0
     ]);
 }
 
@@ -596,10 +605,15 @@ export async function createPipelines(device, format) {
         compute: { module: coolingModule, entryPoint: 'main' },
     });
     const poissonPipeLayout = mkPipeLayout(poissonLayout);
-    const solvePoissonResetAvg = device.createComputePipeline({
-        label: 'plasma.solve-poisson.reset-avg',
+    const solvePoissonReduceMean = device.createComputePipeline({
+        label: 'plasma.solve-poisson.reduce-mean',
         layout: poissonPipeLayout,
-        compute: { module: poissonModule, entryPoint: 'reset_avg' },
+        compute: { module: poissonModule, entryPoint: 'reduce_mean' },
+    });
+    const solvePoissonFinalizeMean = device.createComputePipeline({
+        label: 'plasma.solve-poisson.finalize-mean',
+        layout: poissonPipeLayout,
+        compute: { module: poissonModule, entryPoint: 'finalize_mean' },
     });
     const solvePoissonIterate = device.createComputePipeline({
         label: 'plasma.solve-poisson.iterate',
@@ -611,15 +625,30 @@ export async function createPipelines(device, format) {
         layout: mkPipeLayout(gravityLayout),
         compute: { module: gravityModule, entryPoint: 'main' },
     });
-    const applyConduction = device.createComputePipeline({
-        label: 'plasma.apply-conduction',
+    const computeConductionDelta = device.createComputePipeline({
+        label: 'plasma.apply-conduction.compute-delta',
         layout: mkPipeLayout(conductionLayout),
-        compute: { module: conductionModule, entryPoint: 'main' },
+        compute: { module: conductionModule, entryPoint: 'compute_delta' },
+    });
+    const applyConductionDelta = device.createComputePipeline({
+        label: 'plasma.apply-conduction.apply-delta',
+        layout: mkPipeLayout(conductionLayout),
+        compute: { module: conductionModule, entryPoint: 'apply_delta' },
+    });
+    const computeHallEmf = device.createComputePipeline({
+        label: 'plasma.apply-hall.compute-emf',
+        layout: mkPipeLayout(hallLayout),
+        compute: { module: hallModule, entryPoint: 'compute_emf' },
     });
     const applyHall = device.createComputePipeline({
         label: 'plasma.apply-hall',
         layout: mkPipeLayout(hallLayout),
-        compute: { module: hallModule, entryPoint: 'main' },
+        compute: { module: hallModule, entryPoint: 'apply_update' },
+    });
+    const repairHallEnergy = device.createComputePipeline({
+        label: 'plasma.apply-hall.repair-energy',
+        layout: mkPipeLayout(hallLayout),
+        compute: { module: hallModule, entryPoint: 'repair_energy' },
     });
 
     return {
@@ -661,10 +690,10 @@ export async function createPipelines(device, format) {
             conservationTile, conservationFinalize,
             // Extended physics
             applyCooling,
-            solvePoissonResetAvg, solvePoissonIterate,
+            solvePoissonReduceMean, solvePoissonFinalizeMean, solvePoissonIterate,
             applyGravity,
-            applyConduction,
-            applyHall,
+            computeConductionDelta, applyConductionDelta,
+            computeHallEmf, applyHall, repairHallEnergy,
         },
     };
 }

@@ -119,9 +119,14 @@
                         <h2 class="group-label">Preset</h2>
                         <select id="ctrl-preset" class="sim-select" aria-label="Preset">
                             <option value="orszag-tang" selected>Orszag-Tang vortex</option>
+                            <option value="orszag-tang-extended">Orszag-Tang + extended physics</option>
                             <option value="harris">Harris current sheet</option>
                             <option value="brio-wu">Brio-Wu shock tube</option>
                             <option value="sod">Sod shock tube</option>
+                            <option value="hall-whistler">Hall whistler dispersion</option>
+                            <option value="conduction-front">Anisotropic conduction front</option>
+                            <option value="cooling-instability">Cooling instability</option>
+                            <option value="jeans-instability">Jeans instability</option>
                         </select>
                     </div>
 
@@ -133,6 +138,9 @@
                             <option value="0">ρ (density)</option>
                             <option value="2">|v| (velocity magnitude)</option>
                             <option value="1">p (pressure)</option>
+                            <option value="5">T (temperature)</option>
+                            <option value="6">|q| (heat flux)</option>
+                            <option value="7">φ (grav. potential)</option>
                         </select>
                         <p class="panel-hint">β, vorticity and Schlieren view modes ship with the LIC pass in Phase 6.</p>
                     </div>

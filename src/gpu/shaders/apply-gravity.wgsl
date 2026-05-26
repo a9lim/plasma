@@ -12,8 +12,10 @@
 //
 // (No source on ρ itself; mass is conserved.)
 //
-// Integration: explicit forward Euler over dt_hyp. Stable for any
-// reasonable g — gravitational dynamics is generally well-conditioned.
+// Integration: explicit source kick over dt_hyp. Momentum is forward Euler;
+// the energy work uses the time-centered velocity for this kick, so a uniform
+// acceleration preserves the kinetic-energy change implied by the momentum
+// update instead of creating/destroying thermal energy.
 //
 // Bindings:
 //   0 uniforms (uniform)
@@ -61,12 +63,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         gy = gy + U_uniforms.gravity_gy;
     }
     if (do_self) {
-        // g = -∇φ. Central differences on the cell-centered potential.
+        // g = -∇φ. Periodic central differences on the cell-centered
+        // potential; the Poisson solve stores only interior φ values and
+        // does not rely on ghost cells.
         let dx = U_uniforms.dx;
-        let phi_l = phi[cell_idx_total(ix - 1u, iy,      n_total)];
-        let phi_r = phi[cell_idx_total(ix + 1u, iy,      n_total)];
-        let phi_d = phi[cell_idx_total(ix,      iy - 1u, n_total)];
-        let phi_u = phi[cell_idx_total(ix,      iy + 1u, n_total)];
+        let gx_l = (gid.x + n_interior - 1u) % n_interior;
+        let gx_r = (gid.x + 1u) % n_interior;
+        let gy_d = (gid.y + n_interior - 1u) % n_interior;
+        let gy_u = (gid.y + 1u) % n_interior;
+        let phi_l = phi[cell_idx_total(ghost + gx_l, iy,             n_total)];
+        let phi_r = phi[cell_idx_total(ghost + gx_r, iy,             n_total)];
+        let phi_d = phi[cell_idx_total(ix,             ghost + gy_d, n_total)];
+        let phi_u = phi[cell_idx_total(ix,             ghost + gy_u, n_total)];
         gx = gx - (phi_r - phi_l) / (2.0 * dx);
         gy = gy - (phi_u - phi_d) / (2.0 * dx);
     }
@@ -74,8 +82,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dt = dt_buf.dt;
     let dpx = rho * gx * dt;
     let dpy = rho * gy * dt;
-    // Energy work: ρ(v·g) dt. Use the OLD v (forward Euler).
-    let dE = rho * (vx * gx + vy * gy) * dt;
+    let vx_mid = vx + 0.5 * gx * dt;
+    let vy_mid = vy + 0.5 * gy * dt;
+    let dE = rho * (vx_mid * gx + vy_mid * gy) * dt;
 
     U0[c] = vec4<f32>(u0.x, u0.y + dpx, u0.z + dpy, u0.w);
     U1[c] = vec4<f32>(u1.x + dE, u1.y, u1.z, u1.w);

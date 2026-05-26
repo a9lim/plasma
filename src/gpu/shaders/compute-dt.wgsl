@@ -1,15 +1,16 @@
 // ─── compute-dt.wgsl ─────────────────────────────────────────────────
 // Three entry points (reset / reduce / finalize). Per-cell signal speed
-// uses the fast magnetosonic speed (hyperbolic CFL). Session 8 also
-// reduces a per-cell anomalous-η_max (when α > 0; when α = 0 it reduces
-// to the uniform η_0) so the encoder can compute the RKL2 substep count
-// `s` from the parabolic CFL diagnostic:
+// uses the fast magnetosonic speed plus explicit source-term timestep
+// constraints for opt-in extended physics. Session 8 also reduces a per-cell
+// anomalous-η_max (when α > 0; when α = 0 it reduces to the uniform η_0) so
+// the encoder can compute the RKL2 substep count `s` from the parabolic CFL
+// diagnostic:
 //
-//   dt_hyp        = CFL · dx / ((|v_x|+c_fast,x) + (|v_y|+c_fast,y))
-//                                                   (CFL from U_uniforms.cfl)
+//   dt            = CFL · dx / max_signal
+//   max_signal    = MHD wave speed plus active Hall/conduction/cooling/gravity
+//                   constraints recast as equivalent signal speeds
 //   eta_max       = max over interior of η_local(|J|)
-//   dt_parabolic  = 0.5 · dx² / eta_max           (RKL2 forward-Euler bound)
-//   dt            = clamp(dt_hyp, [DT_MIN, DT_MAX])    ← hyperbolic only
+//   dt_parabolic  = 0.25 · dx² / eta_max          (RKL2 forward-Euler bound)
 //                   dt_parabolic is reported as a diagnostic in dt_buf[1]
 //                   for the host-side RKL2 substep-count calculation.
 //
@@ -25,30 +26,44 @@
 //   2 U1_in      (ro)
 //   3 Bx_face    (ro)
 //   4 By_face    (ro)
-//   5 wavespeed  (atomic<u32>)
-//   6 dt_buf     (rw)   — slot 0: dt_hyp;  slot 1: dt_parabolic;  slots 2-3: pad
+//   5 wavespeed  (atomic<u32>)  — MHD signal-speed reduction
+//   6 dt_buf     (rw)   — slot 0: dt_hyp;  slot 1: dt_parabolic;
+//                          slot 2: eta_max;  slot 3: hall_speed_max;
+//                          slot 4: cond_speed_max (Session 15)
 //   7 eta_max_buf(atomic<u32>) — global η_max bit-pattern, reduce target
+//   8 hall_speed_buf (atomic<u32>) — Session 15: max(v_A·d_i/dx) for Hall
+//                                    sub-cycling. Host reads dt_buf[3] to
+//                                    size N_hall.
+//   9 cond_speed_buf (atomic<u32>) — Session 15: max(4·χ/dx) for conduction
+//                                    sub-cycling. Host reads dt_buf[4] to
+//                                    size N_cond.
 
 @group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
-@group(0) @binding(1) var<storage, read>           U0_in:       array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read>           U1_in:       array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read>           Bx_face:     array<f32>;
-@group(0) @binding(4) var<storage, read>           By_face:     array<f32>;
-@group(0) @binding(5) var<storage, read_write>     wavespeed:   atomic<u32>;
-@group(0) @binding(6) var<storage, read_write>     dt_buf:      array<f32, 4>;
-@group(0) @binding(7) var<storage, read_write>     eta_max_buf: atomic<u32>;
+@group(0) @binding(1) var<storage, read>           U0_in:          array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>           U1_in:          array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read>           Bx_face:        array<f32>;
+@group(0) @binding(4) var<storage, read>           By_face:        array<f32>;
+@group(0) @binding(5) var<storage, read_write>     wavespeed:      atomic<u32>;
+@group(0) @binding(6) var<storage, read_write>     dt_buf:         array<f32, 8>;
+@group(0) @binding(7) var<storage, read_write>     eta_max_buf:    atomic<u32>;
+@group(0) @binding(8) var<storage, read_write>     hall_speed_buf: atomic<u32>;
+@group(0) @binding(9) var<storage, read_write>     cond_speed_buf: atomic<u32>;
 
 const DT_MIN: f32 = 1.0e-8;
 const DT_MAX: f32 = 1.0e-2;
 
 @compute @workgroup_size(1, 1, 1)
 fn reset() {
-    atomicStore(&wavespeed,   0u);
-    atomicStore(&eta_max_buf, 0u);
+    atomicStore(&wavespeed,      0u);
+    atomicStore(&eta_max_buf,    0u);
+    atomicStore(&hall_speed_buf, 0u);
+    atomicStore(&cond_speed_buf, 0u);
 }
 
 var<workgroup> tile_max_wave: atomic<u32>;
 var<workgroup> tile_max_eta:  atomic<u32>;
+var<workgroup> tile_max_hall: atomic<u32>;
+var<workgroup> tile_max_cond: atomic<u32>;
 
 // |J_z(ix, iy)| from face B — same recipe as view-field and the
 // resistivity passes. Reads ix±1 / iy±1; caller must guarantee range.
@@ -74,6 +89,8 @@ fn reduce(
     if (lid == 0u) {
         atomicStore(&tile_max_wave, 0u);
         atomicStore(&tile_max_eta,  0u);
+        atomicStore(&tile_max_hall, 0u);
+        atomicStore(&tile_max_cond, 0u);
     }
     workgroupBarrier();
 
@@ -92,6 +109,7 @@ fn reduce(
         let idx = cell_idx_total(ix, iy, n_total);
         let pf  = U_uniforms.pressure_floor;
         let P  = cons_to_prim_mhd(U0_in[idx], U1_in[idx], bx, by, U_uniforms.gamma, pf);
+        let rho = max(P.rho, DENSITY_FLOOR);
         let cfx = fast_mag_speed(P, U_uniforms.gamma, 0u, pf);
         let cfy = fast_mag_speed(P, U_uniforms.gamma, 1u, pf);
         let sx = abs(P.vx) + cfx;
@@ -99,7 +117,70 @@ fn reduce(
         // Unsplit 2D finite-volume CFL. The previous max(sx, sy) estimate
         // is a 1D bound; diagonal waves and genuinely 2D MHD flows need the
         // sum so the x and y flux updates cannot jointly overrun a cell.
-        let s  = sx + sy;
+        var s  = sx + sy;
+
+        // ── Extended-physics timestep limits ───────────────────────
+        // Recast each local bound as an equivalent speed so the existing
+        // global max reduction still returns one scalar. These terms are only
+        // active when their physics flag and scalar coefficient are active.
+        let dx = U_uniforms.dx;
+        let cfl_safe = max(U_uniforms.cfl, 1.0e-6);
+        let flags = U_uniforms.physics_flags;
+        let b2 = P.bx*P.bx + P.by*P.by + P.bz*P.bz;
+
+        // Hall whistler speed — reduced separately so the host can size
+        // a Hall sub-cycle inside one macro Δt. We do NOT add this to the
+        // macro signal-speed sum (Session 15): with sub-cycling the macro
+        // step only needs to respect the hyperbolic CFL, while Hall runs
+        // N_hall times with dt_sub = dt_macro / N_hall.
+        if (flag_set(flags, FLAG_HALL) && U_uniforms.hall_di > 0.0) {
+            let vA = sqrt(max(b2 / rho, 0.0));
+            let s_hall = vA * U_uniforms.hall_di / max(dx, 1.0e-30);
+            let s_hall_safe = select(0.0, s_hall, s_hall >= 0.0 && s_hall == s_hall);
+            atomicMax(&tile_max_hall, bitcast<u32>(s_hall_safe));
+        }
+
+        // Conduction parabolic speed — reduced separately so the host
+        // can size a conduction sub-cycle inside one macro Δt. We do
+        // NOT add this to the macro signal-speed sum (Session 15):
+        // sub-cycling means the macro step respects only the
+        // hyperbolic CFL, while conduction runs N_cond times with
+        // dt_sub = dt_macro / N_cond.
+        // 2D explicit heat diffusion bound: dt ≤ dx² / (4χ),
+        // χ = (γ-1)·κ/ρ. As an equivalent speed: 4χ/dx.
+        if (flag_set(flags, FLAG_CONDUCTION) && U_uniforms.conduction_kappa > 0.0) {
+            let chi = max(U_uniforms.gamma - 1.0, 1.0e-6)
+                    * U_uniforms.conduction_kappa / rho;
+            let s_cond = 4.0 * chi / max(dx, 1.0e-30);
+            let s_cond_safe = select(0.0, s_cond, s_cond >= 0.0 && s_cond == s_cond);
+            atomicMax(&tile_max_cond, bitcast<u32>(s_cond_safe));
+        }
+
+        // Cooling no longer contributes a Δt bound — Session 15's
+        // `apply-cooling.wgsl` uses an exact analytic integrator for the
+        // single-power-law Λ(T) ∝ √(T−T_floor) shape (Townsend 2009 spirit)
+        // that is unconditionally stable for any Δt. See the apply-cooling
+        // header for the derivation.
+
+        if (flag_set(flags, FLAG_GRAVITY_EXT)) {
+            let g_ext = sqrt(U_uniforms.gravity_gx * U_uniforms.gravity_gx
+                           + U_uniforms.gravity_gy * U_uniforms.gravity_gy);
+            if (g_ext > 0.0) {
+                // Acceleration should not move material more than O(dx) in a
+                // source kick: dt <= 0.25 sqrt(dx/|g|).
+                let s_g = 4.0 * cfl_safe * sqrt(max(dx * g_ext, 0.0));
+                s = s + select(0.0, s_g, s_g >= 0.0 && s_g == s_g);
+            }
+        }
+
+        if (flag_set(flags, FLAG_GRAVITY_SELF) && U_uniforms.gravity_G > 0.0) {
+            // Local freefall/plasma-frequency-like bound for explicit
+            // self-gravity coupling: dt <= 0.25 / sqrt(4πGρ).
+            let omega_g = sqrt(max(4.0 * 3.141592653589793 * U_uniforms.gravity_G * rho, 0.0));
+            let s_self_g = 4.0 * cfl_safe * dx * omega_g;
+            s = s + select(0.0, s_self_g, s_self_g >= 0.0 && s_self_g == s_self_g);
+        }
+
         let s_safe = select(0.0, s, s >= 0.0 && s == s);
         atomicMax(&tile_max_wave, bitcast<u32>(s_safe));
 
@@ -125,8 +206,12 @@ fn reduce(
     if (lid == 0u) {
         let mw = atomicLoad(&tile_max_wave);
         let me = atomicLoad(&tile_max_eta);
-        atomicMax(&wavespeed,   mw);
-        atomicMax(&eta_max_buf, me);
+        let mh = atomicLoad(&tile_max_hall);
+        let mc = atomicLoad(&tile_max_cond);
+        atomicMax(&wavespeed,      mw);
+        atomicMax(&eta_max_buf,    me);
+        atomicMax(&hall_speed_buf, mh);
+        atomicMax(&cond_speed_buf, mc);
     }
 }
 
@@ -171,5 +256,14 @@ fn finalize() {
     }
     dt_buf[1] = dt_par;
     dt_buf[2] = eta_max;     // diagnostic for the host / stats panel
-    dt_buf[3] = 0.0;
+
+    // hall_speed_max — Session 15. Reduces v_A·d_i/dx over interior
+    // cells; host divides dt_hyp by this to size the Hall sub-cycle.
+    let h_bits = atomicLoad(&hall_speed_buf);
+    dt_buf[3] = max(bitcast<f32>(h_bits), 0.0);
+
+    // cond_speed_max — Session 15. Reduces 4·χ/dx over interior cells;
+    // host uses dt_hyp·cond_speed_max to size the conduction sub-cycle.
+    let c_bits = atomicLoad(&cond_speed_buf);
+    dt_buf[4] = max(bitcast<f32>(c_bits), 0.0);
 }

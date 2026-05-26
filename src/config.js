@@ -53,12 +53,17 @@ export const DT_MIN = 1e-8;
 export const ETA_DEFAULT = 1e-3;
 
 // View-mode enum. Phase 3a adds |B| and Jz for the MHD view; Phase 5+ adds
-// the remaining options (β, vorticity, Schlieren).
+// the remaining options (β, vorticity, Schlieren). Session 15 adds three
+// extended-physics views — temperature, heat-flux magnitude, gravitational
+// potential — so cooling / conduction / self-gravity are directly visible.
 export const VIEW_DENSITY  = 0;
 export const VIEW_PRESSURE = 1;
 export const VIEW_VMAG     = 2;
 export const VIEW_BMAG     = 3;
 export const VIEW_JZ       = 4;
+export const VIEW_T        = 5;  // T = p / ρ
+export const VIEW_QMAG     = 6;  // |q| heat flux magnitude (anisotropic Spitzer)
+export const VIEW_PHI      = 7;  // gravitational potential φ
 
 // Normalization window for the default density view. Sod expects ρ ∈ [0.125,
 // 1.0] initially; we give a small margin in both directions.
@@ -108,9 +113,20 @@ export const FLAG_HALL         = 1 << 4;  // Hall MHD correction to face B
 export const FLAG_POSITIVITY   = 1 << 5;  // stronger positivity guard
 export const FLAG_EMF_UPWIND   = 1 << 6;  // GS upwind EMF (vs BS arithmetic mean)
 
+// Baseline flags used by the canonical verification presets. Positivity and
+// upwind CT are numerical guards for the ideal/resistive MHD core; cooling,
+// gravity, conduction, and Hall are opt-in source physics.
+export const BASE_PHYSICS_FLAGS = FLAG_POSITIVITY | FLAG_EMF_UPWIND;
+export const EXTENDED_SOURCE_FLAGS = FLAG_COOLING
+                                   | FLAG_GRAVITY_EXT
+                                   | FLAG_GRAVITY_SELF
+                                   | FLAG_CONDUCTION
+                                   | FLAG_HALL;
+export const EXTENDED_PHYSICS_FLAGS = BASE_PHYSICS_FLAGS | EXTENDED_SOURCE_FLAGS;
+
 // EMF mode enum (slot 29: emf_mode).
-export const EMF_MODE_BS_MEAN  = 0;  // Balsara-Spicer arithmetic mean (current default)
-export const EMF_MODE_GS_UPWIND = 1; // Gardiner-Stone 2005 upwind
+export const EMF_MODE_BS_MEAN  = 0;  // Balsara-Spicer arithmetic mean (legacy fallback)
+export const EMF_MODE_GS_UPWIND = 1; // Gardiner-Stone 2005 upwind default
 
 // bc_uniforms storage-buffer layout:
 //   u32 mode[4]  — N, S, E, W

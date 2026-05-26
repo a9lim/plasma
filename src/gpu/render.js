@@ -82,6 +82,7 @@ export class PlasmaRenderer {
                 { binding: 3, resource: { buffer: Bx_n } },
                 { binding: 4, resource: { buffer: By_n } },
                 { binding: 5, resource: { buffer: b.field } },
+                { binding: 6, resource: { buffer: b.phi } },
             ],
         });
         this._viewBG.a = mk(b.U0_a, b.U1_a, b.Bx_a, b.By_a);

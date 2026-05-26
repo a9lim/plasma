@@ -18,6 +18,9 @@
 import {
     BC_PERIODIC, BC_OUTFLOW, BC_REFLECTING, BC_DRIVEN,
     VIEW_DENSITY, VIEW_PRESSURE, VIEW_VMAG, VIEW_BMAG, VIEW_JZ,
+    VIEW_T, VIEW_QMAG, VIEW_PHI,
+    FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
+    FLAG_POSITIVITY, EMF_MODE_BS_MEAN, EMF_MODE_GS_UPWIND,
 } from './config.js';
 import { StatsDisplay } from './stats-display.js';
 import { Probe } from './probe.js';
@@ -85,6 +88,35 @@ export function setupUI(simShell) {
 
     // ── Advanced settings dropdown ────────────────────────────
     if (settingsBtn && typeof _settings !== 'undefined') {
+        // Snap-to-0 log slider helper for the extended-physics scalars.
+        // The shaders early-return when their corresponding scalar is 0
+        // OR their flag bit is clear, so we drive both: the value sets
+        // the scalar, and "off" at the bottom of the range additionally
+        // clears the flag. Raising a slider out of "off" re-arms the
+        // corresponding source-physics flag so the preset's choice of
+        // FLAG_* doesn't trap the user.
+        const epSlider = (label, getScalar, setScalar, flag, opts = {}) => {
+            const { lo = -6, hi = 0, step = 0.25 } = opts;
+            const cur = getScalar();
+            const offBoundary = lo - 0.05;
+            const valueAt = cur > 0 ? Math.log10(cur) : (lo - 0.5);
+            return {
+                type: 'slider', label,
+                min: lo - 0.5, max: hi, step,
+                value: valueAt,
+                format: v => (v <= offBoundary ? 'off' : '1e' + v.toFixed(2)),
+                onChange: v => {
+                    if (v <= offBoundary) {
+                        setScalar(0);
+                        sim.setPhysicsFlag(flag, false);
+                    } else {
+                        setScalar(Math.pow(10, v));
+                        sim.setPhysicsFlag(flag, true);
+                    }
+                },
+            };
+        };
+
         _settings.create(settingsBtn, [
             { type: 'slider', label: 'CFL', min: 0.1, max: 0.8, step: 0.05,
               value: sim.cfl, format: v => v.toFixed(2),
@@ -107,13 +139,44 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'η-anom J_crit', min: 1, max: 100, step: 1,
               value: sim.etaAnomJcrit, format: v => v.toFixed(0),
               onChange: v => sim.setEtaAnomJcrit(v) },
+
+            // ── Extended physics (Session 15) ───────────────────
+            // Each scalar slider is log10 with a snap-to-0/"off" at the
+            // bottom that also clears the corresponding FLAG_* bit. EMF
+            // mode is a separate two-button group; positivity guard is
+            // a toggle (no scalar).
+            epSlider('Hall d_i (log10)',
+                () => sim.hallDi, v => sim.setHallDi(v),
+                FLAG_HALL, { lo: -4 }),
+            epSlider('Cooling Λ₀ (log10)',
+                () => sim.coolingLambda0, v => sim.setCoolingLambda0(v),
+                FLAG_COOLING, { lo: -4 }),
+            epSlider('Conduction κ∥ (log10)',
+                () => sim.conductionKappa, v => sim.setConductionKappa(v),
+                FLAG_CONDUCTION, { lo: -6 }),
+            { type: 'slider', label: 'κ⊥ / κ∥', min: 0, max: 1, step: 0.05,
+              value: sim.conductionIsoFrac, format: v => v.toFixed(2),
+              onChange: v => sim.setConductionIsoFrac(v) },
+            epSlider('Self-gravity G (log10)',
+                () => sim.gravityG, v => sim.setGravityG(v),
+                FLAG_GRAVITY_SELF, { lo: -4, hi: 2 }),
+            { type: 'mode', label: 'EMF', dataAttr: 'emf-mode',
+              buttons: [
+                  { value: String(EMF_MODE_BS_MEAN),   label: 'BS mean',  active: sim.emfMode === EMF_MODE_BS_MEAN },
+                  { value: String(EMF_MODE_GS_UPWIND), label: 'GS upwind', active: sim.emfMode === EMF_MODE_GS_UPWIND },
+              ],
+              onChange: v => sim.setEmfMode(parseInt(v, 10)) },
+            { type: 'toggle', label: 'Positivity guard',
+              checked: (sim.physicsFlags & FLAG_POSITIVITY) !== 0,
+              onChange: on => sim.setPhysicsFlag(FLAG_POSITIVITY, on) },
+
             { type: 'slider', label: 'LIC intensity', min: 0, max: 2, step: 0.05,
               value: sim.licIntensity, format: v => v.toFixed(2),
               onChange: v => sim.setLicIntensity(v) },
             { type: 'slider', label: 'LIC drift', min: 0, max: 4, step: 0.1,
               value: sim.licDriftX, format: v => v.toFixed(1) + ' px/s',
               onChange: v => sim.setLicDrift(v, sim.licDriftY) },
-        ], { width: 300 });
+        ], { width: 320 });
     }
 
     // ── About panel ───────────────────────────────────────────
@@ -365,7 +428,10 @@ function _buildShortcuts(simShell, sim, stats, probe) {
     };
     const stepOnce = () => { if (!sim.running) sim.step(); };
     const cycleView = () => {
-        const order = [VIEW_JZ, VIEW_BMAG, VIEW_DENSITY, VIEW_VMAG, VIEW_PRESSURE];
+        const order = [
+            VIEW_JZ, VIEW_BMAG, VIEW_DENSITY, VIEW_VMAG, VIEW_PRESSURE,
+            VIEW_T, VIEW_QMAG, VIEW_PHI,
+        ];
         const idx = order.indexOf(sim.viewMode);
         const next = order[(idx + 1) % order.length];
         sim.setViewMode(next);

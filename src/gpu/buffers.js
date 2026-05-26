@@ -81,6 +81,9 @@ export class PlasmaBuffers {
         const u_f32_xface_bytes = xfaces * F32_BYTES;
         const u_f32_yface_bytes = yfaces * F32_BYTES;
         const u_f32_edge_bytes  = edges  * F32_BYTES;
+        const u_f32_cell_bytes  = cellsT * F32_BYTES;
+        const u_v4_edge_bytes   = edges  * VEC4_BYTES;
+        this.cellScalarBytes = u_f32_cell_bytes;
 
         const mkStorage = (label, size, extra = 0) => device.createBuffer({
             label, size,
@@ -226,14 +229,15 @@ export class PlasmaBuffers {
             size: 16,
             usage: GPUBufferUsage.STORAGE,
         });
-        // dt buffer expanded to 4 f32 slots (Session 8 — RKL2):
+        // dt buffer (32 B = 8 × f32):
         //   [0] dt_hyp        (hyperbolic dt used by RK3 + RKL2 super-step)
         //   [1] dt_parabolic  (forward-Euler resistive bound; diagnostic only)
         //   [2] eta_max       (per-cell anomalous-η maximum; diagnostic)
-        //   [3] _pad
-        // Slots 1-3 are diagnostic; consumers (update-conserved-weighted,
-        // update-b-weighted, stats-display) all read slot 0 as before.
-        // Sized to 32 B (4 × f32 + nothing) — uniform binding still valid.
+        //   [3] hall_speed    (Session 15 — max v_A·d_i/dx; for sub-cycling)
+        //   [4] cond_speed    (Session 15 — max 4·χ/dx; for sub-cycling)
+        //   [5..7] reserved   (future per-step diagnostic / sizing slots)
+        // Consumers (update-conserved-weighted, update-b-weighted,
+        // stats-display) all read slot 0 as before.
         this.dt = device.createBuffer({
             label: 'plasma.dt',
             size: 32,
@@ -256,6 +260,45 @@ export class PlasmaBuffers {
         // reads it back to populate dt_buf[1] / [2].
         this.eta_max_buf = device.createBuffer({
             label: 'plasma.eta_max',
+            size: 16,
+            usage: GPUBufferUsage.STORAGE,
+        });
+
+        // Hall whistler-speed reduction target (Session 15). Same atomic
+        // pattern as eta_max_buf. compute-dt's finalize writes the result
+        // into dt_buf[3] for host readback → Hall sub-cycle sizing.
+        this.hall_speed_buf = device.createBuffer({
+            label: 'plasma.hall_speed_max',
+            size: 16,
+            usage: GPUBufferUsage.STORAGE,
+        });
+
+        // Hall sub-step Δt — host writes dt_macro / N_hall here before
+        // each macro step. apply-hall reads this instead of the macro
+        // dt_buf so its CT update uses the smaller sub-step interval.
+        this.hall_dt = device.createBuffer({
+            label: 'plasma.hall_dt',
+            size: 32,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM
+                 | GPUBufferUsage.COPY_DST,
+        });
+
+        // Conduction sub-step Δt — mirror of hall_dt for the conduction
+        // sub-cycle (Session 15). apply-conduction reads this instead
+        // of dt_buf so its frozen-state delta computation uses the
+        // smaller sub-step interval.
+        this.cond_dt = device.createBuffer({
+            label: 'plasma.cond_dt',
+            size: 32,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM
+                 | GPUBufferUsage.COPY_DST,
+        });
+
+        // Conduction parabolic-speed reduction target. Same atomic
+        // pattern as eta_max_buf and hall_speed_buf. compute-dt's
+        // finalize writes the result into dt_buf[4] for host readback.
+        this.cond_speed_buf = device.createBuffer({
+            label: 'plasma.cond_speed_max',
             size: 16,
             usage: GPUBufferUsage.STORAGE,
         });
@@ -415,20 +458,34 @@ export class PlasmaBuffers {
                  | GPUBufferUsage.COPY_SRC,
         });
 
+        // ── Extended-physics scratch buffers ────────────────────────
+        // Conduction and Hall are split into frozen-state compute/apply
+        // passes. These scratch buffers carry the source deltas/EMFs across
+        // dispatches so no invocation reads a neighbor that another invocation
+        // is mutating in the same dispatch.
+        this.conduction_dE = mkStorage('plasma.conduction_dE', u_f32_cell_bytes);
+        this.hall_E        = mkStorage('plasma.hall_E',        u_v4_edge_bytes);
+        this.hall_mb0      = mkStorage('plasma.hall_mb0',      u_f32_cell_bytes);
+
         // ── Self-gravity Poisson buffers (extended physics) ────────
         // phi / phi_next form a Jacobi ping-pong for ∇²φ = 4πGρ.
         // Same ghost-padded shape as cell-centered storage. Cleared at
         // init and stays effectively zero until gravity_G > 0.
-        this.phi      = mkStorage('plasma.phi',      cellsT * F32_BYTES);
-        this.phi_next = mkStorage('plasma.phi_next', cellsT * F32_BYTES);
+        this.phi      = mkStorage('plasma.phi',      u_f32_cell_bytes);
+        this.phi_next = mkStorage('plasma.phi_next', u_f32_cell_bytes);
         // rho_mean — single f32 holding ρ̄ for the periodic Poisson
-        // compatibility condition. (For the breadth pass we sample
-        // the center cell; a proper reduction is a follow-up.)
+        // compatibility condition. rho_mean_partials holds one tile sum per
+        // 8×8 workgroup before a tiny finalize pass accumulates the mean.
         this.rho_mean = device.createBuffer({
             label: 'plasma.rho_mean',
             size:  16,  // 1 f32 padded to 16 B for alignment
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
+        this.poisson_tiles_per_axis = Math.ceil(n / 8);
+        this.rho_mean_partials = mkStorage(
+            'plasma.rho_mean_partials',
+            this.poisson_tiles_per_axis * this.poisson_tiles_per_axis * F32_BYTES,
+        );
 
         // ── Conservation diagnostics (Session 8) ───────────────────
         // Two-pass reduction: per-tile partials → final 7 scalars.
@@ -558,6 +615,28 @@ export class PlasmaBuffers {
         q.writeBuffer(this.Bx_b, 0, Bx_face.buffer, Bx_face.byteOffset, Bx_face.byteLength);
         q.writeBuffer(this.By_a, 0, By_face.buffer, By_face.byteOffset, By_face.byteLength);
         q.writeBuffer(this.By_b, 0, By_face.buffer, By_face.byteOffset, By_face.byteLength);
+        this.clearExtendedScratch();
+    }
+
+    /**
+     * Clear source-term scratch and Poisson state after preset/resolution loads.
+     * This prevents a self-gravity solve from warm-starting against a previous
+     * preset's potential or reusing stale Hall/conduction temporaries.
+     */
+    clearExtendedScratch() {
+        const encoder = this.device.createCommandEncoder({ label: 'plasma.clearExtendedScratch' });
+        encoder.clearBuffer(this.conduction_dE);
+        encoder.clearBuffer(this.hall_E);
+        encoder.clearBuffer(this.hall_mb0);
+        encoder.clearBuffer(this.phi);
+        encoder.clearBuffer(this.phi_next);
+        encoder.clearBuffer(this.rho_mean);
+        encoder.clearBuffer(this.rho_mean_partials);
+        // Session 15: sub-cycle dt buffers + their reduction targets.
+        encoder.clearBuffer(this.hall_dt);
+        encoder.clearBuffer(this.cond_dt);
+        encoder.clearBuffer(this.cond_speed_buf);
+        this.device.queue.submit([encoder.finish()]);
     }
 
     /**

@@ -55,11 +55,28 @@ import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP,
     VIEW_JZ, ETA_DEFAULT, BC_PERIODIC, CFL, PRESSURE_FLOOR,
     LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, DT_MAX,
-    FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
-    FLAG_POSITIVITY, FLAG_EMF_UPWIND, EMF_MODE_GS_UPWIND,
+    FLAG_GRAVITY_SELF, FLAG_HALL, FLAG_CONDUCTION,
+    BASE_PHYSICS_FLAGS, EXTENDED_SOURCE_FLAGS,
+    EMF_MODE_GS_UPWIND,
 } from './config.js';
 
 const WG = WORKGROUP;
+const DEFAULT_PHYSICS_STATE = Object.freeze({
+    physicsFlags: BASE_PHYSICS_FLAGS,
+    emfMode: EMF_MODE_GS_UPWIND,
+    hallDi: 0.02,
+    hallSubstepsMax: 8,
+    coolingLambda0: 0.01,
+    coolingTFloor: 1.0e-4,
+    coolingTRef: 1.0,
+    conductionKappa: 1.0e-3,
+    conductionIsoFrac: 0.1,
+    conductionSatFrac: 0.0,
+    gravityGx: 0.0,
+    gravityGy: 0.0,
+    gravityG: 1.0e-3,
+    gravityPoissonIters: 30,
+});
 
 export class Sim {
     constructor(device, context, format, opts = {}) {
@@ -106,40 +123,20 @@ export class Sim {
         this._lastDtHyp        = 1.0e-4;
         this._lastDtParabolic  = 1.0e30;
         this._lastEtaMax       = 0;
+        this._lastHallSpeedMax = 0;
+        this._lastHallSubsteps = 1;
+        this._lastCondSpeedMax = 0;
+        this._lastCondSubsteps = 1;
         this._lastSuperStepS   = 1;
         this._dtReadbackBusy   = false;
         this._dtReadbackPool   = null;  // lazy-init in init()
         this._pendingTimeSteps = 0;
 
-        // ── Extended physics state (breadth pass — Hall, cooling,
-        //    conduction, gravity, EMF mode toggle).
-        //
-        // All ON by default per locked decision. Scales picked small
-        // enough to be visible but not catastrophic on the existing
-        // 1×1-domain presets (Sod, Brio-Wu, Orszag-Tang, Harris).
-        // Stability is NOT promised — Hall ignores whistler CFL,
-        // conduction ignores parabolic CFL, cooling is explicit. If
-        // anything detonates, dial individual scalars to 0 via the
-        // setters or strip a flag from `physicsFlags`.
-        this.physicsFlags = FLAG_COOLING
-                          | FLAG_GRAVITY_SELF
-                          | FLAG_CONDUCTION
-                          | FLAG_HALL
-                          | FLAG_POSITIVITY
-                          | FLAG_EMF_UPWIND;
-        this.emfMode             = EMF_MODE_GS_UPWIND;
-        this.hallDi              = 0.02;    // ~5 cells at N=256 (resolved Hall scale)
-        this.hallSubstepsMax     = 8;
-        this.coolingLambda0      = 0.01;
-        this.coolingTFloor       = 1.0e-4;
-        this.coolingTRef         = 1.0;
-        this.conductionKappa     = 1.0e-3;
-        this.conductionIsoFrac   = 0.1;     // mostly along B, 10% perp
-        this.conductionSatFrac   = 0.0;
-        this.gravityGx           = 0.0;
-        this.gravityGy           = 0.0;
-        this.gravityG            = 1.0e-3;
-        this.gravityPoissonIters = 30;
+        // ── Extended physics state. Canonical verification presets run the
+        // ideal/resistive MHD core with numerical guards only; cooling,
+        // gravity, conduction, and Hall are opt-in through preset.physics or
+        // the explicit setters.
+        this._applyPhysicsConfig();
 
         // UI integration state — owned by Sim so save/load can capture it.
         this.running     = true;
@@ -214,8 +211,29 @@ export class Sim {
         this._buildBindGroupCache();
     }
 
+    _applyPhysicsConfig(physics = {}) {
+        Object.assign(this, DEFAULT_PHYSICS_STATE);
+        if (!physics) return;
+        const flags = physics.physicsFlags ?? physics.flags;
+        if (flags !== undefined) this.physicsFlags = flags >>> 0;
+        if (physics.emfMode !== undefined)             this.emfMode = physics.emfMode | 0;
+        if (physics.hallDi !== undefined)              this.hallDi = +physics.hallDi || 0;
+        if (physics.hallSubstepsMax !== undefined)     this.hallSubstepsMax = Math.max(1, physics.hallSubstepsMax | 0);
+        if (physics.coolingLambda0 !== undefined)      this.coolingLambda0 = Math.max(0, +physics.coolingLambda0 || 0);
+        if (physics.coolingTFloor !== undefined)       this.coolingTFloor = Math.max(0, +physics.coolingTFloor || 0);
+        if (physics.coolingTRef !== undefined)         this.coolingTRef = Math.max(1e-30, +physics.coolingTRef || 1);
+        if (physics.conductionKappa !== undefined)     this.conductionKappa = Math.max(0, +physics.conductionKappa || 0);
+        if (physics.conductionIsoFrac !== undefined)   this.conductionIsoFrac = Math.min(1, Math.max(0, +physics.conductionIsoFrac || 0));
+        if (physics.conductionSatFrac !== undefined)   this.conductionSatFrac = Math.max(0, +physics.conductionSatFrac || 0);
+        if (physics.gravityGx !== undefined)           this.gravityGx = +physics.gravityGx || 0;
+        if (physics.gravityGy !== undefined)           this.gravityGy = +physics.gravityGy || 0;
+        if (physics.gravityG !== undefined)            this.gravityG = Math.max(0, +physics.gravityG || 0);
+        if (physics.gravityPoissonIters !== undefined) this.gravityPoissonIters = Math.max(0, physics.gravityPoissonIters | 0);
+    }
+
     loadPreset(preset) {
         this.gamma   = preset.gamma   ?? this.gamma;
+        if (preset.viewMode !== undefined) this.viewMode = preset.viewMode | 0;
         this.viewMin = preset.viewMin ?? this.viewMin;
         this.viewMax = preset.viewMax ?? this.viewMax;
         // Floor coeff must be set BEFORE dx (in case the preset changes
@@ -232,6 +250,7 @@ export class Sim {
         if (preset.bc) {
             this.bcConfig = { ...this.bcConfig, ...preset.bc };
         }
+        this._applyPhysicsConfig(preset.physics);
         if (preset.id) this.presetName = preset.id;
         this.buffers.uploadInitialState(preset.data);
         this.stepCount = 0;
@@ -240,6 +259,10 @@ export class Sim {
         this._lastDtHyp       = 1.0e-4;
         this._lastDtParabolic = 1.0e30;
         this._lastEtaMax      = 0;
+        this._lastHallSpeedMax = 0;
+        this._lastHallSubsteps = 1;
+        this._lastCondSpeedMax = 0;
+        this._lastCondSubsteps = 1;
         this._pendingTimeSteps = 0;
         this._pushUniforms();
         this.buffers.pushBC(this.bcConfig);
@@ -341,6 +364,9 @@ export class Sim {
             case 2: this.viewMin = 0.0;  this.viewMax = 1.5;  break; // |v|
             case 3: this.viewMin = 0.0;  this.viewMax = 2.0;  break; // |B|
             case 4: this.viewMin = -3.0; this.viewMax = 3.0;  break; // Jz (signed)
+            case 5: this.viewMin = 0.0;  this.viewMax = 1.0;  break; // T (p/ρ)
+            case 6: this.viewMin = 0.0;  this.viewMax = 1.0e-3; break; // |q| (κ_∥·dT/dx scale)
+            case 7: this.viewMin = -5e-3; this.viewMax = 5e-3; break; // φ (signed)
             default: break;
         }
         this._pushUniforms();
@@ -443,6 +469,22 @@ export class Sim {
             running: this.running,
             bc: this.bcConfig,
             licIntensity: this.licIntensity,
+            physics: {
+                physicsFlags: this.physicsFlags,
+                emfMode: this.emfMode,
+                hallDi: this.hallDi,
+                hallSubstepsMax: this.hallSubstepsMax,
+                coolingLambda0: this.coolingLambda0,
+                coolingTFloor: this.coolingTFloor,
+                coolingTRef: this.coolingTRef,
+                conductionKappa: this.conductionKappa,
+                conductionIsoFrac: this.conductionIsoFrac,
+                conductionSatFrac: this.conductionSatFrac,
+                gravityGx: this.gravityGx,
+                gravityGy: this.gravityGy,
+                gravityG: this.gravityG,
+                gravityPoissonIters: this.gravityPoissonIters,
+            },
         });
     }
 
@@ -465,6 +507,10 @@ export class Sim {
         if (obj.bc) {
             this.bcConfig = { ...this.bcConfig, ...obj.bc };
             this.buffers.pushBC(this.bcConfig);
+        }
+        if (obj.physics) {
+            this._applyPhysicsConfig(obj.physics);
+            this._pushUniforms();
         }
         if (obj.licIntensity !== undefined) this.setLicIntensity(obj.licIntensity);
     }
@@ -546,6 +592,8 @@ export class Sim {
                 { binding: 5, resource: { buffer: b.wavespeed } },
                 { binding: 6, resource: { buffer: b.dt } },
                 { binding: 7, resource: { buffer: b.eta_max_buf } },
+                { binding: 8, resource: { buffer: b.hall_speed_buf } },
+                { binding: 9, resource: { buffer: b.cond_speed_buf } },
             ],
         });
     }
@@ -1315,6 +1363,7 @@ export class Sim {
                 { binding: 2, resource: { buffer: phi_in } },
                 { binding: 3, resource: { buffer: phi_out } },
                 { binding: 4, resource: { buffer: b.rho_mean } },
+                { binding: 5, resource: { buffer: b.rho_mean_partials } },
             ],
         });
     }
@@ -1345,7 +1394,12 @@ export class Sim {
                 { binding: 2, resource: { buffer: U1 } },
                 { binding: 3, resource: { buffer: Bx } },
                 { binding: 4, resource: { buffer: By } },
-                { binding: 5, resource: { buffer: b.dt } },
+                // Session 15: conduction reads its own sub-step dt buffer
+                // so _encodeExtendedPhysics can loop the conduction
+                // compute_delta/apply_delta pair N_cond times within a
+                // single macro Δt. Mirror of the Hall sub-cycle pattern.
+                { binding: 5, resource: { buffer: b.cond_dt } },
+                { binding: 6, resource: { buffer: b.conduction_dE } },
             ],
         });
     }
@@ -1361,9 +1415,23 @@ export class Sim {
                 { binding: 2, resource: { buffer: Bx } },
                 { binding: 3, resource: { buffer: By } },
                 { binding: 4, resource: { buffer: U1 } },
-                { binding: 5, resource: { buffer: b.dt } },
+                // Session 15: Hall reads its own sub-step dt buffer so
+                // _encodeExtendedPhysics can run N_hall iterations within
+                // a single macro Δt without rewriting dt_buf.
+                { binding: 5, resource: { buffer: b.hall_dt } },
+                { binding: 6, resource: { buffer: b.hall_E } },
+                { binding: 7, resource: { buffer: b.hall_mb0 } },
             ],
         });
+    }
+
+    _encodeApplyBcsDst(encoder, side, label) {
+        const pass = encoder.beginComputePass({ label });
+        const gTotalP1 = Math.ceil((this.n_total + 1) / WG);
+        pass.setPipeline(this.pipelines.pipelines.applyBcs);
+        pass.setBindGroup(0, this._bgCache.stage3[side].applyBcsDst);
+        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+        pass.end();
     }
 
     /**
@@ -1371,11 +1439,11 @@ export class Sim {
      * All operate on the side's stage-3 destination buffers (which
      * alias U_next before the post-step swap). Each pass is gated by
      * the corresponding bit in `physicsFlags` — when nothing is
-     * enabled this is effectively a no-op (skip flags fire inside the
-     * shaders so we keep dispatch encoding simple).
+     * enabled this returns false without encoding. Numerical-only flags
+     * (positivity, upwind EMF) are not treated as source physics here.
      */
-    _encodeExtendedPhysics(encoder, side) {
-        if (this.physicsFlags === 0) return;
+    _encodeExtendedPhysics(encoder, side, hallSubsteps = 1, condSubsteps = 1) {
+        if ((this.physicsFlags & EXTENDED_SOURCE_FLAGS) === 0) return false;
         const b = this.buffers;
         const { pipelines } = this;
 
@@ -1387,16 +1455,21 @@ export class Sim {
         const gInterior = Math.ceil(N / WG);
         const gN1       = Math.ceil((N + 1) / WG);
 
+        this._encodeApplyBcsDst(encoder, side, 'plasma.extended.preApplyBcsDst');
+
         // ── Self-gravity Poisson solve (Jacobi ping-pong) ──────────
         // Runs FIRST so gravity acceleration uses the freshly-updated φ.
         // Cooling / conduction / Hall don't depend on φ so their order
         // among themselves doesn't matter for the breadth pass.
-        const selfGravOn = (this.physicsFlags & (1 << 2)) !== 0 && this.gravityG > 0;
+        const selfGravOn = (this.physicsFlags & FLAG_GRAVITY_SELF) !== 0 && this.gravityG > 0;
+        let gravityPhi = b.phi;
         if (selfGravOn) {
             const poissonPass = encoder.beginComputePass({ label: 'plasma.poisson' });
-            // Seed ρ̄ once per macro step.
-            poissonPass.setPipeline(pipelines.pipelines.solvePoissonResetAvg);
+            // Compute the actual domain mean density before Jacobi iteration.
+            poissonPass.setPipeline(pipelines.pipelines.solvePoissonReduceMean);
             poissonPass.setBindGroup(0, this._poissonBG(handles.U0, b.phi, b.phi_next));
+            poissonPass.dispatchWorkgroups(gInterior, gInterior, 1);
+            poissonPass.setPipeline(pipelines.pipelines.solvePoissonFinalizeMean);
             poissonPass.dispatchWorkgroups(1, 1, 1);
             // Iterate Jacobi. Ping-pong by alternating bind groups.
             poissonPass.setPipeline(pipelines.pipelines.solvePoissonIterate);
@@ -1408,27 +1481,59 @@ export class Sim {
                 poissonPass.dispatchWorkgroups(gInterior, gInterior, 1);
             }
             poissonPass.end();
+            gravityPhi = (iters & 1) ? b.phi_next : b.phi;
         }
 
         // ── Source-term + correction passes ────────────────────────
         const pass = encoder.beginComputePass({ label: 'plasma.extendedPhysics' });
         // Gravity source — momentum + energy.
         pass.setPipeline(pipelines.pipelines.applyGravity);
-        pass.setBindGroup(0, this._gravityBG(handles.U0, handles.U1, b.phi));
+        pass.setBindGroup(0, this._gravityBG(handles.U0, handles.U1, gravityPhi));
         pass.dispatchWorkgroups(gInterior, gInterior, 1);
         // Cooling — local energy sink.
         pass.setPipeline(pipelines.pipelines.applyCooling);
         pass.setBindGroup(0, this._coolingBG(handles.U0, handles.U1, handles.Bx, handles.By));
         pass.dispatchWorkgroups(gInterior, gInterior, 1);
-        // Anisotropic conduction — energy diffusion.
-        pass.setPipeline(pipelines.pipelines.applyConduction);
-        pass.setBindGroup(0, this._conductionBG(handles.U0, handles.U1, handles.Bx, handles.By));
+        // Anisotropic conduction — Session 15: sub-cycled with N_cond
+        // iterations of the compute_delta + apply_delta pair. Each
+        // iteration: compute frozen-T heat-flux delta from the current
+        // U1 into conduction_dE, then add it back to U1. The two
+        // dispatches share one bind group (cond_dt is host-seeded once
+        // per macro step, same value across all sub-cycle iterations).
+        const condBG = this._conductionBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        for (let c = 0; c < Math.max(1, condSubsteps | 0); c++) {
+            pass.setPipeline(pipelines.pipelines.computeConductionDelta);
+            pass.setBindGroup(0, condBG);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+            pass.setPipeline(pipelines.pipelines.applyConductionDelta);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        }
+        // Hall correction — frozen corner E, CT update, then total-energy
+        // repair. Session 15: sub-cycled with N_hall iterations using
+        // dt_sub from b.hall_dt (host-seeded before submit). The three
+        // dispatches per iteration share one bind group (hallBG) since
+        // hall_dt is bound at construction time. Iteration boundary is
+        // sequential within one compute pass — each iteration's
+        // compute_emf reads the previous iteration's apply_update output
+        // through the U0/U1/face-B storage, no cross-invocation reads
+        // within a single dispatch.
+        const hallBG = this._hallBG(handles.U0, handles.Bx, handles.By, handles.U1);
+        for (let h = 0; h < Math.max(1, hallSubsteps | 0); h++) {
+            pass.setPipeline(pipelines.pipelines.computeHallEmf);
+            pass.setBindGroup(0, hallBG);
+            pass.dispatchWorkgroups(gN1, gN1, 1);
+            pass.setPipeline(pipelines.pipelines.applyHall);
+            pass.dispatchWorkgroups(gN1, gN1, 1);
+            pass.setPipeline(pipelines.pipelines.repairHallEnergy);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        }
+        // Any source can change pressure support; clamp once against the final B.
+        pass.setPipeline(pipelines.pipelines.energyFloor);
+        pass.setBindGroup(0, this._energyFloorBG(handles.U0, handles.U1, handles.Bx, handles.By));
         pass.dispatchWorkgroups(gInterior, gInterior, 1);
-        // Hall correction — face B + Bz update via corner Hall E.
-        pass.setPipeline(pipelines.pipelines.applyHall);
-        pass.setBindGroup(0, this._hallBG(handles.U0, handles.Bx, handles.By, handles.U1));
-        pass.dispatchWorkgroups(gN1, gN1, 1);
         pass.end();
+        this._encodeApplyBcsDst(encoder, side, 'plasma.extended.postApplyBcsDst');
+        return true;
     }
 
     _resistiveSizingBounds() {
@@ -1447,6 +1552,76 @@ export class Sim {
             dtSuper: DT_MAX,
             dtParabolic: Math.min(this._lastDtParabolic, hostDtPar),
         };
+    }
+
+    /**
+     * Hall sub-cycling sizing (Session 15 — Tóth 2008 spirit).
+     *
+     * The Hall term is dispersive (whistler waves) with stability bound
+     *   Δt_sub ≤ 1 / (v_A · d_i / dx) = 1 / hall_speed_max
+     * The macro Δt only respects the hyperbolic CFL; we run the Hall
+     * 3-pass sequence N_hall times within one macro step with dt_sub =
+     * dt_macro / N_hall to maintain stability.
+     *
+     * Inputs:
+     *   - `_lastHallSpeedMax` from the previous step's `compute-dt`
+     *     reduction (one-frame-stale, fine because Hall speed evolves
+     *     slowly compared to one step).
+     *   - `_lastDtHyp` from same readback.
+     *   - `hallSubstepsMax` user-supplied cap (uniform).
+     *
+     * Returns:
+     *   { nSubsteps, dtSub } where nSubsteps ≥ 1.
+     */
+    _hallSizing(dtMacro) {
+        if ((this.physicsFlags & FLAG_HALL) === 0) {
+            return { nSubsteps: 1, dtSub: dtMacro };
+        }
+        if (this.hallDi <= 0 || this._lastHallSpeedMax <= 0) {
+            return { nSubsteps: 1, dtSub: dtMacro };
+        }
+        // Each sub-step must satisfy dt_sub · hall_speed_max ≤ 1.
+        // Add a 50% safety margin and cap by user-configured max.
+        const safety = 0.5;
+        const ideal = dtMacro * this._lastHallSpeedMax / safety;
+        const maxN = Math.max(1, this.hallSubstepsMax | 0);
+        const n = Math.min(maxN, Math.max(1, Math.ceil(ideal)));
+        return { nSubsteps: n, dtSub: dtMacro / n };
+    }
+
+    /**
+     * Conduction sub-cycling sizing (Session 15).
+     *
+     * Anisotropic conduction is parabolic with explicit-FE stability
+     * bound dt_sub ≤ 1 / (4χ/dx) = 1 / cond_speed_max, where χ = (γ-1)
+     * κ/ρ. Sub-cycling has the same shape as the Hall pattern — the
+     * compute_delta/apply_delta pair runs N_cond times within one macro
+     * Δt with dt_sub = dt_macro / N_cond.
+     *
+     * A future iteration could fold the conduction operator into the
+     * existing RKL2 super-step alongside resistivity (Phase 9 #4 in
+     * docs/HANDOFF.md), which would give an O(√N_cond) rather than
+     * O(N_cond) cost scaling. For N_cond ≤ 20 — the typical range —
+     * the constant-factor win from sub-cycling competes with RKL2 and
+     * avoids the 10-binding cap reshuffling that proper RKL2 folding
+     * would require.
+     *
+     * Cap: the user-supplied `hallSubstepsMax` is reused as a shared
+     * sub-step ceiling for both Hall and conduction (since both expose
+     * similar runaway risks). Could split if needed.
+     */
+    _conductionSizing(dtMacro) {
+        if ((this.physicsFlags & FLAG_CONDUCTION) === 0) {
+            return { nSubsteps: 1, dtSub: dtMacro };
+        }
+        if (this.conductionKappa <= 0 || this._lastCondSpeedMax <= 0) {
+            return { nSubsteps: 1, dtSub: dtMacro };
+        }
+        const safety = 0.5;
+        const ideal = dtMacro * this._lastCondSpeedMax / safety;
+        const maxN = Math.max(1, this.hallSubstepsMax | 0);
+        const n = Math.min(maxN, Math.max(1, Math.ceil(ideal)));
+        return { nSubsteps: n, dtSub: dtMacro / n };
     }
 
     step() {
@@ -1498,8 +1673,27 @@ export class Sim {
 
         // Pass 3.5 (breadth pass): extended physics — cooling, gravity,
         // anisotropic conduction, Hall. Each is gated by a bit in
-        // `physicsFlags`; full no-op when nothing is enabled.
-        this._encodeExtendedPhysics(encoder, side);
+        // `physicsFlags`; full no-op when nothing is enabled. Session 15:
+        // Hall is sub-cycled inside one macro Δt; sizing uses last step's
+        // hall_speed_max (one-frame-stale). One writeBuffer per macro
+        // step seeds hall_dt with dt_sub = dt_macro / N_hall.
+        const hallSizing = this._hallSizing(this._lastDtHyp);
+        if ((this.physicsFlags & FLAG_HALL) !== 0 && this.hallDi > 0) {
+            const hallDtSeed = new Float32Array([hallSizing.dtSub, 0, 0, 0]);
+            this.device.queue.writeBuffer(this.buffers.hall_dt, 0, hallDtSeed.buffer);
+        }
+        this._lastHallSubsteps = hallSizing.nSubsteps;
+
+        const condSizing = this._conductionSizing(this._lastDtHyp);
+        if ((this.physicsFlags & FLAG_CONDUCTION) !== 0 && this.conductionKappa > 0) {
+            const condDtSeed = new Float32Array([condSizing.dtSub, 0, 0, 0]);
+            this.device.queue.writeBuffer(this.buffers.cond_dt, 0, condDtSeed.buffer);
+        }
+        this._lastCondSubsteps = condSizing.nSubsteps;
+
+        this._encodeExtendedPhysics(encoder, side,
+                                    hallSizing.nSubsteps,
+                                    condSizing.nSubsteps);
 
         // Pass 4: conservation diagnostics reduction over the just-
         // written destination state (stage 3 dst === U_next at this
@@ -1559,7 +1753,7 @@ export class Sim {
         if (!this._dtReadbackPool) return;
         this._dtReadbackBusy = true;
         readbackSlice(this.device, this._dtReadbackPool,
-                      this.buffers.dt, 0, 12)
+                      this.buffers.dt, 0, 20)
             .then(ab => {
                 const arr = new Float32Array(ab);
                 const pending = this._pendingTimeSteps;
@@ -1574,6 +1768,8 @@ export class Sim {
                 }
                 if (Number.isFinite(arr[1]) && arr[1] > 0) this._lastDtParabolic = arr[1];
                 if (Number.isFinite(arr[2])) this._lastEtaMax = arr[2];
+                if (Number.isFinite(arr[3]) && arr[3] >= 0) this._lastHallSpeedMax = arr[3];
+                if (Number.isFinite(arr[4]) && arr[4] >= 0) this._lastCondSpeedMax = arr[4];
             })
             .catch(e => {
                 // Validation errors on stale buffers can fire during

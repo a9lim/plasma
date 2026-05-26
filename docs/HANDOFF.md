@@ -29,7 +29,7 @@ point at the corresponding `sessions/session-N.md`.
 | 6     | Animated LIC visualization                 | done     |
 | 7     | Polish (content, perturbation, JSON-LD, OG)| **partial** |
 | 8     | Parent-repo wiring                         | **todo** |
-| 9     | Extended physics (Hall, cooling, conduction, self-gravity, EMF toggle, positivity guard) — **breadth pass only** | **partial** — see [Session 14](sessions/session-14.md) and the "Phase 9" section below |
+| 9     | Extended physics (Hall, cooling, conduction, self-gravity, EMF toggle, positivity guard) | **partial** — see [Session 14](sessions/session-14.md) + [Session 15](sessions/session-15.md) + the "Phase 9" section below |
 
 **Verification status**: OT live-verified at N=256 and N=1024 across
 the full η range up to 1.0 (Session 13 — the RKL2 substep-count fixes
@@ -39,15 +39,14 @@ retested after Sessions 2-13 — should be safe (Sod is pure hydro, no
 RKL2 path; Brio-Wu is η=0, no RKL2 path) but worth a smoke test.
 N=512 also not directly verified.
 
-**Post-Session 14 caveat**: all the verification above is from BEFORE
-the extended-physics breadth pass. Session 14 turned six new features
-(Hall, cooling, conduction, self-gravity, GS-upwind EMF, positivity
-guard) ON BY DEFAULT for every preset, with no stability promises.
-The OT / Harris / Sod / Brio-Wu live-verification numbers above no
-longer hold — they refer to a code path that is no longer the default
-path. To re-verify base MHD without the breadth-pass layer, call
-`sim.physicsFlags = 0; sim.emfMode = 0; sim._pushUniforms()` after
-sim init.
+**Session 15 update**: the post-Session 14 caveat is gone. Canonical
+verification presets (Sod, Brio-Wu, OT, Harris, Alfvén CPAW, acoustic)
+now opt into `BASE_PHYSICS_FLAGS` only (positivity + GS upwind EMF) and
+explicitly skip the extended-physics source terms. The full Session 14
+stack ships behind the new `orszag-tang-extended` preset. To exercise
+the breadth pass on a known IC, select that preset; to re-run the
+Session 13 baseline, select any of the canonical presets — no manual
+flag-zeroing needed.
 
 ## Phase 7 — Polish
 
@@ -346,18 +345,19 @@ context) can plug in:
 
 Session 14 landed first-pass implementations of Hall, cooling,
 anisotropic conduction, self-gravity, positivity guard, and the
-GS-upwind EMF toggle — all ON by default. Physics correctness was
-the priority; everything else was deferred. The follow-up work is
-to fix each sharp edge documented in `apply-*.wgsl` headers. In
-recommended order (small + foundational first, marquee last):
+GS-upwind EMF toggle — all ON by default. Session 15 (Codex pass +
+follow-up) addressed the structural sharp edges: race-elimination
+splits, real Poisson reduction, BC consistency, per-preset opt-in.
+The remaining work is the items that need real physics decisions
+(sub-cycling vs HDS for Hall, RKL2 extension for conduction,
+Townsend table layout, UI design, validation presets).
 
-### 1. Validation presets and view modes
+### 1. Validation presets and view modes ✅ (Session 15)
 
-Without dedicated tests / views, none of the new features are
+Without dedicated tests / views, none of the new features were
 *visible* enough to know whether they're doing the right thing.
-Add view modes for `T` (temperature), `|q|` (heat flux), and `φ`
-(gravitational potential) — small additions to `view-field.wgsl`.
-Add validation presets:
+`view-field.wgsl` gained T, |q|, φ view modes; `presets.js` gained
+four isolation presets:
 
 * **Hall whistler dispersion** — single-mode plane wave, measure
   phase velocity, compare to ω = k·v_A·√(1 + (k·d_i)²) (Tóth, Ma,
@@ -370,35 +370,61 @@ Add validation presets:
 * **Jeans instability** — small density perturbation under
   self-gravity; measure growth rate vs. Jeans λ.
 
-### 2. apply-bcs after extended physics
+### 2. apply-bcs after extended physics ✅ (Session 15 — Codex pass)
 
-Currently the extended-physics passes modify cells + face B + Bz
-without canonicalizing ghost cells afterward. Run `apply-bcs` once
-more after `_encodeExtendedPhysics` so the post-step state has
-consistent ghosts. Mirror the post-RKL2 pattern in
-`_encodeResistivitySuperStep`.
+`_encodeApplyBcsDst` now wraps `_encodeExtendedPhysics` on both
+sides — once before so the Poisson / Hall stencils read consistent
+ghosts, once after so the post-step state is canonical for the
+next RK3 stage. Targets the right destination side via the bind-
+group cache.
 
-### 3. Hall sub-cycling
+### 3. Hall sub-cycling ✅ (Session 15)
 
-Highest-impact stability fix. Hall is dispersive (whistler waves),
-so RKL2's parabolic super-time-stepping doesn't directly apply.
-Right move is Tóth 2008 Hall sub-cycle inside a single hyperbolic
-Δt, with the sub-step CFL set by `dt ≤ dx² / (v_A·d_i)`. Either:
+Tóth 2008-style explicit Hall sub-cycle inside one hyperbolic
+macro Δt. The Hall whistler-like timescale `v_A·d_i/dx` is reduced
+separately in `compute-dt.wgsl` (not added to the macro signal-
+speed sum, so the macro step only respects the hyperbolic CFL).
+Host reads `dt_buf[3] = hall_speed_max` one-step-lagged, computes
+`N_hall = ceil(dt_macro · hall_speed_max / safety)` capped at
+`hallSubstepsMax`, seeds `dt_sub = dt_macro / N_hall` into
+`b.hall_dt` via `queue.writeBuffer` before submit, and
+`_encodeExtendedPhysics` loops the `compute_emf →
+apply_update → repair_energy` 3-pass sequence `N_hall` times.
 
-* explicit sub-cycle with a CPU-counted N (mirrors the RKL2 host
-  orchestration in sim.js), or
-* O'Sullivan & Downes 2006 Hall Diffusion Scheme — hyperbolizes
-  the Hall term so the standard CFL covers it. More code but
-  cleaner.
+The `hall_dt` buffer is bound at apply-hall's binding 5 instead of
+the macro `dt_buf`, so the same shader code runs at sub-step
+intervals without per-iteration buffer writes. Within a single
+compute pass, WebGPU's dispatch ordering ensures each iteration's
+`compute_emf` sees the prior iteration's `apply_update` writes.
 
-### 4. Conduction into RKL2
+Open question: O'Sullivan & Downes 2006 Hall Diffusion Scheme
+(hyperbolizes the Hall term so the standard CFL covers it without
+sub-cycling) — more code but cleaner. Deferred until a workload
+actually saturates the sub-cycle cap.
 
-Anisotropic conduction IS parabolic — it can ride on top of the
-existing RKL2 super-time-stepping machinery alongside resistivity.
-The clean integration: extend `apply-resistivity-init.wgsl` and
-`apply-resistivity-prev.wgsl` to compute the conduction operator
-L(E) alongside the resistive curl(η J) on B. Adds two more storage
-bindings to those shaders; check the per-stage 10-binding cap.
+### 4. Conduction sub-cycling ✅ (Session 15 — see note)
+
+Note: the original plan in this slot was to fold conduction
+parabolic L(E) into the existing RKL2 super-step alongside
+resistivity. That ran into the 10-storage-binding cap on
+`apply-resistivity-init.wgsl` — adding T/U0 inputs for `χ = (γ-1)
+κ/ρ` would have required a multi-shader BGL reshuffle, and the
+moving target Y_{j-1}.E means L(E) can't be precomputed once per
+macro step. The fold remains a future option if the
+implementation finds room.
+
+What landed instead: conduction sub-cycling, exactly the same
+shape as Hall sub-cycling. `compute-dt.wgsl` reduces `4·χ/dx`
+separately (not added to the macro signal-speed sum), host
+computes `N_cond = ceil(dt_macro · cond_speed_max / safety)`
+capped at `hallSubstepsMax` (shared cap for both sub-cycles), and
+`_encodeExtendedPhysics` loops the `compute_delta + apply_delta`
+pair `N_cond` times with `dt_sub` seeded into `b.cond_dt`.
+
+For typical κ values N_cond stays small (5-20), so the O(N_cond)
+sub-cycle cost is competitive with RKL2's O(√N_cond) without the
+binding-cap complexity. If a future workload pushes N_cond above
+~30, RKL2 folding becomes worth the implementation cost.
 
 ### 5. Townsend cooling integration
 
@@ -406,21 +432,38 @@ Explicit FE biases the cooling timestep. Townsend 2009 exact
 integration with a piecewise-power-law Λ(T) is the canonical fix
 — shader needs a small precomputed CDF table (one upload at init).
 
-### 6. Real ρ̄ reduction for Poisson
+_Partial interim (Session 15 — Codex pass): cooling Δt is now
+bounded in `compute-dt.wgsl` by the explicit `0.25 · eth /
+cooling_rate` limit. Cures the worst overshoots but still biased._
 
-Mirror compute-dt's per-tile shared-atomic reduction shape to
-compute the actual cell-averaged density. The center-cell stub
-breaks compatibility for asymmetric mass distributions.
+### 6. Real ρ̄ reduction for Poisson ✅ (Session 15 — Codex pass)
 
-### 7. Hall split into corner-buffer + CT-update
+`solve-poisson.wgsl` now exposes `reduce_mean` (8×8 tile sums via
+workgroup-shared accumulator) + `finalize_mean` (small serial sum
+of tile partials → `rho_mean[0]`). New `rho_mean_partials` storage
+buffer holds the per-tile sums. The center-cell stub is gone;
+periodic compatibility holds for asymmetric mass distributions.
 
-Two-pass structure to eliminate the within-pass race condition:
+The Jacobi iterate also moved to inline periodic indexing rather
+than relying on ghost cells, so the Poisson solve no longer
+depends on `apply-bcs` filling ghosts of `phi`.
 
-* `compute-hall-emf.wgsl` — write corner E_H_z (and the in-plane
-  components for the Bz update) into a new buffer, no face B reads
-  from any other invocation's writes.
-* `apply-hall-ct.wgsl` — read the corner E_H buffer, update face
-  Bx/By and cell Bz from the curl.
+### 7. Hall split into corner-buffer + CT-update ✅ (Session 15 — Codex pass)
+
+Three ordered dispatches per Hall update (sharing one bind group +
+two new scratch buffers `hall_E`, `hall_mb0`):
+
+* `compute_emf` — corner-centered E_H written into `hall_E`;
+  pre-Hall cell magnetic energy snapshotted into `hall_mb0`.
+* `apply_update` — reads frozen `hall_E`, applies CT curl to face
+  Bx/By and the 2.5D Bz update.
+* `repair_energy` — adds Δ(½|B|²) = (½|B|²_new − `hall_mb0`) to
+  total E so the Hall B update doesn't masquerade as spurious
+  heating/cooling.
+
+The race-prone in-place EMF evaluation is gone. Conduction got the
+same treatment (`compute_delta` + `apply_delta` with the
+`conduction_dE` scratch buffer).
 
 ### 8. UI surface
 
@@ -433,14 +476,32 @@ Sliders + toggles in the advanced settings dropdown:
 * Mode group for EMF mode (BS / GS upwind)
 * Toggle row for positivity guard
 
-### 9. Per-preset extended-physics defaults
+### 9. Per-preset extended-physics defaults ✅ (Session 15 — Codex pass)
 
-Currently every preset gets the same set of feature defaults.
-Real physics asks for preset-specific values — Harris cares about
-Hall reconnection, not cooling; Brio-Wu doesn't want self-gravity
-in its 1D MHD shock tube; Sod doesn't have B for Hall to act on.
-Extend the preset object schema with optional `extendedPhysics` to
-override the global defaults per preset.
+Preset schema gained an optional `physics` field. All canonical
+verification presets (`sod`, `brio-wu`, `orszag-tang`, `harris`,
+`alfven-cpaw`, `acoustic-wave-hydro`) declare `physics: {
+physicsFlags: BASE_PHYSICS_FLAGS }` to keep just the numerical
+guards (positivity + GS upwind). The new `orszag-tang-extended`
+preset opts into the full Session 14 stack with the same scalars
+that were the old global defaults. `Sim._applyPhysicsConfig`
+absorbs the preset's `physics` block on every `loadPreset`; save/
+load round-trips the full physics state. Adding per-preset values
+to the four new validation presets above closes the remaining
+"every preset gets the same defaults" gap.
+
+### 10. Energy-floor cleanup pass (Session 15 — Codex pass, bonus)
+
+Not on the original punch list but landed: a final `energy-floor`
+dispatch at the end of `_encodeExtendedPhysics` clamps E against
+the final B so that any combination of cooling + gravity + Hall +
+conduction sources leaves the cell in a physically-consistent
+state. Also: gravity's energy-work term now uses the time-centered
+velocity (`v_mid = v + ½ g Δt`) instead of `v_old`, eliminating
+the spurious heating that pure forward Euler introduces. And
+`buffers.clearExtendedScratch()` runs on preset/resolution load
+so the Poisson solve doesn't warm-start against a previous
+preset's φ.
 
 ## References
 

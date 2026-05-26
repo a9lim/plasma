@@ -17,10 +17,10 @@
 //
 // applied as a smooth blend  q ← q · 1 / sqrt(1 + (|q|/q_sat)²).
 //
-// Integration: explicit forward Euler over dt_hyp. NOT stability-checked
-// against the parabolic CFL — the breadth pass writes the equations
-// cleanly; a follow-up will fold this into the existing RKL2 super-step
-// machinery alongside resistivity.
+// Integration: explicit forward Euler over the globally source-limited dt.
+// The host compute-dt pass includes a conduction diffusion bound. This shader
+// is split into compute_delta/apply_delta so all heat fluxes are evaluated
+// from a frozen U/B state before U1.E is mutated.
 //
 // Discretization: cell-centered T from cons_to_prim_mhd, face-centered
 // ∇T via central difference between the two neighbour cell values, then
@@ -30,10 +30,11 @@
 // Bindings:
 //   0 uniforms (uniform)
 //   1 U0       (ro) — ρ, momentum (for KE in cons→prim)
-//   2 U1       (rw) — energy gets the conduction source
+//   2 U1       (rw) — read for T in compute_delta, written in apply_delta
 //   3 Bx_face  (ro)
 //   4 By_face  (ro)
 //   5 dt_buf   (uniform)
+//   6 dE       (rw) — one scalar energy delta per cell
 
 struct DtUniform {
     dt: f32, _pad0: f32, _pad1: f32, _pad2: f32,
@@ -45,6 +46,7 @@ struct DtUniform {
 @group(0) @binding(3) var<storage, read>       Bx_face:    array<f32>;
 @group(0) @binding(4) var<storage, read>       By_face:    array<f32>;
 @group(0) @binding(5) var<uniform>             dt_buf:     DtUniform;
+@group(0) @binding(6) var<storage, read_write> dE_cond:    array<f32>;
 
 // Cell-centered temperature T = p / ρ in code units.
 fn cell_T(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
@@ -139,7 +141,7 @@ fn q_y_face(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn compute_delta(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!flag_set(U_uniforms.physics_flags, FLAG_CONDUCTION)) { return; }
     if (U_uniforms.conduction_kappa <= 0.0)                  { return; }
 
@@ -167,6 +169,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // dE/dt = -∇·q. (Heat flux is the energy flux; divergence subtracts from local energy.)
     let dE = -divq * dt;
 
+    dE_cond[c] = dE;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn apply_delta(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (!flag_set(U_uniforms.physics_flags, FLAG_CONDUCTION)) { return; }
+    if (U_uniforms.conduction_kappa <= 0.0)                  { return; }
+
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
+
+    if (gid.x >= n_interior || gid.y >= n_interior) { return; }
+    let ix = gid.x + ghost;
+    let iy = gid.y + ghost;
+    let c  = cell_idx_total(ix, iy, n_total);
+
     let u1 = U1[c];
-    U1[c] = vec4<f32>(u1.x + dE, u1.y, u1.z, u1.w);
+    U1[c] = vec4<f32>(u1.x + dE_cond[c], u1.y, u1.z, u1.w);
 }

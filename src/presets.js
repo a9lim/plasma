@@ -34,7 +34,8 @@
 
 import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, PRESSURE_FLOOR, ETA_DEFAULT,
-    BC_PERIODIC, BC_OUTFLOW,
+    BC_PERIODIC, BC_OUTFLOW, BASE_PHYSICS_FLAGS, EXTENDED_PHYSICS_FLAGS,
+    FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
 } from './config.js';
 
 /** Cell-centered flat index in ghost-padded storage. */
@@ -134,6 +135,7 @@ export function makeSodPreset(n = GRID_N) {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
             modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
         },
+        physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
         viewMin: 0.05, viewMax: 1.10, verifyTime: 0.2,
     };
@@ -189,6 +191,7 @@ export function makeBrioWuPreset(n = GRID_N) {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
             modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
         },
+        physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
         viewMin: 0.05, viewMax: 1.10, verifyTime: 0.1,
     };
@@ -248,6 +251,7 @@ export function makeOrszagTangPreset(n = GRID_N) {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
             modeE: BC_PERIODIC, modeW: BC_PERIODIC,
         },
+        physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
         viewMin: 1.0, viewMax: 6.0, verifyTime: 0.5,
         // η floor coefficient — see sim.getEtaMin(). Set to 0: the
@@ -267,6 +271,34 @@ export function makeOrszagTangPreset(n = GRID_N) {
         // tradeoff. If a future preset has worse degradation
         // characteristics, set a nonzero coeff here.
         etaFloorCoeff: 0,
+    };
+}
+
+/**
+ * Orszag-Tang with the opt-in extended physics stack enabled. Kept separate
+ * from the canonical Orszag-Tang preset so validation remains adiabatic MHD.
+ */
+export function makeOrszagTangExtendedPreset(n = GRID_N) {
+    const preset = makeOrszagTangPreset(n);
+    return {
+        ...preset,
+        id: 'orszag-tang-extended',
+        label: 'Orszag-Tang + extended physics',
+        physics: {
+            physicsFlags: EXTENDED_PHYSICS_FLAGS,
+            hallDi: 0.02,
+            hallSubstepsMax: 8,
+            coolingLambda0: 0.01,
+            coolingTFloor: 1.0e-4,
+            coolingTRef: 1.0,
+            conductionKappa: 1.0e-3,
+            conductionIsoFrac: 0.1,
+            conductionSatFrac: 0.0,
+            gravityGx: 0.0,
+            gravityGy: 0.0,
+            gravityG: 1.0e-3,
+            gravityPoissonIters: 30,
+        },
     };
 }
 
@@ -358,6 +390,7 @@ export function makeHarrisPreset(n = GRID_N) {
             modeN: BC_OUTFLOW,  modeS: BC_OUTFLOW,
             modeE: BC_PERIODIC, modeW: BC_PERIODIC,
         },
+        physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
         viewMin: -3.0, viewMax: 3.0,   // Jz view default
         verifyTime: 10.0,              // reconnection becomes visible
@@ -519,6 +552,7 @@ export function makeAlfvenCpawPreset(n = GRID_N) {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
             modeE: BC_PERIODIC, modeW: BC_PERIODIC,
         },
+        physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
         // |B| view ranges 0..√(1+A²) ≈ 1.005; bracket the steady value.
         viewMin: 0.95, viewMax: 1.05,
@@ -610,6 +644,7 @@ export function makeAcousticWaveHydroPreset(n = GRID_N, amplitudeOverride) {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
             modeE: BC_PERIODIC, modeW: BC_PERIODIC,
         },
+        physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
         // ρ ranges 1 ± A → bracket the background tightly.
         viewMin: rho0 - 2 * A, viewMax: rho0 + 2 * A,
@@ -619,11 +654,325 @@ export function makeAcousticWaveHydroPreset(n = GRID_N, amplitudeOverride) {
     };
 }
 
+/**
+ * Hall whistler dispersion test (Session 15).
+ *
+ * Right-hand circularly polarized whistler wave on a uniform background.
+ * In pure Hall MHD, the dispersion relation is
+ *
+ *   ω² = k² v_A² (1 + (k · d_i)²)
+ *
+ * (Tóth, Ma, Gombosi 2008, eq 11). With v_A = 1 and k·d_i ~ 1 the whistler
+ * branch deviates strongly from the Alfvén branch ω = k·v_A — that's the
+ * signature the test is designed to expose.
+ *
+ * Setup:
+ *   ρ = 1, p = 1, γ = 5/3 ⇒ c_s² = 5/3.
+ *   B₀ = (1, 0, 0).  v_A = |B|/√ρ = 1.
+ *   Perturbation: right-circular in y/z plane carried by a single mode
+ *   with k_n wavelengths per box.
+ *     δB_y =  A·cos(k·x)        δB_z =  A·sin(k·x)
+ *     δv_y = -A·cos(k·x)/√ρ     δv_z = -A·sin(k·x)/√ρ
+ *   A = 1e-3 (deep linear). k_n = 4. d_i = 0.05 ⇒ k·d_i ≈ 1.26 at k_n = 4.
+ */
+export function makeHallWhistlerPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L     = 1.0;
+    const dx    = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0   = 1.0;
+    const B0   = 1.0;
+    const A    = 1e-3;
+    const k_n  = 4;
+    const TWO_PI = 2.0 * Math.PI;
+    const k    = TWO_PI * k_n / L;
+    const d_i  = 0.05;
+    const v_A  = B0 / Math.sqrt(rho0);
+    const omega_whistler = k * v_A * Math.sqrt(1.0 + (k * d_i) ** 2);
+
+    const xCellOf = (i) => (i - ghost + 0.5) * dx;
+    const xFaceOf = (i) => (i - ghost) * dx;
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            const x = xCellOf(i);
+            const c = Math.cos(k * x);
+            const s = Math.sin(k * x);
+            const bx_c = B0;
+            const by_c = A * c;
+            const bz   = A * s;
+            const vy   = -A * c / Math.sqrt(rho0);
+            const vz   = -A * s / Math.sqrt(rho0);
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, 0, vy, vz, p0, bx_c, by_c, bz, gamma);
+        }
+    }
+
+    // Face B: Bx is uniform B0; By is sinusoidal in x at face locations.
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i <= nT; i++) {
+            Bx_face[bxFaceIdx(i, j, nT)] = B0;
+        }
+    }
+    for (let j = 0; j <= nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            // By_face at corner-cell midpoint along x = xCellOf(i) is fine
+            // because the perturbation is independent of y.
+            const x = xCellOf(i);
+            By_face[byFaceIdx(i, j, nT)] = A * Math.cos(k * x);
+        }
+    }
+
+    return {
+        id: 'hall-whistler', label: 'Hall whistler dispersion',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_HALL,
+            hallDi: d_i,
+            hallSubstepsMax: 8,
+            // Defaults for the rest stay quiet.
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 3,  // VIEW_BMAG — wave amplitude is visible in |B|
+        viewMin: B0 - 3 * A, viewMax: B0 + 3 * A,
+        verifyTime: TWO_PI / omega_whistler,
+        whistler: { k, d_i, v_A, omega_alfven: k * v_A, omega_whistler, A, k_n },
+    };
+}
+
+/**
+ * Thermal conduction front (Session 15).
+ *
+ * Isolated hot spot in an otherwise uniform medium with a uniform
+ * magnetic field along x̂. Anisotropic Spitzer conduction with
+ * κ_⊥ / κ_∥ = 0.1 should spread the spot ~10× faster along x than along
+ * y. The 1D analytic Green's function for unbounded heat diffusion is
+ * a Gaussian of width σ(t) = √(σ₀² + 2χ·t) with χ = (γ−1)·κ/ρ.
+ *
+ * Setup:
+ *   ρ = 1, B = (1, 0, 0), v = 0, γ = 5/3.
+ *   T_cold = 1, T_hot = 2.
+ *   p(x, y) = ρ · T_cold + (T_hot − T_cold)·exp(−r²/2σ₀²), σ₀ = 0.05·L.
+ */
+export function makeConductionFrontPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L     = 1.0;
+    const dx    = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const T_cold = 1.0;
+    const T_hot  = 2.0;
+    const sigma0 = 0.05 * L;
+    const B0     = 1.0;
+    const cx = 0.5 * L;
+    const cy = 0.5 * L;
+
+    const xCellOf = (i) => (i - ghost + 0.5) * dx;
+    const yCellOf = (j) => (j - ghost + 0.5) * dx;
+
+    for (let j = 0; j < nT; j++) {
+        const y = yCellOf(j);
+        const dy = y - cy;
+        for (let i = 0; i < nT; i++) {
+            const x = xCellOf(i);
+            const dxr = x - cx;
+            const r2 = dxr * dxr + dy * dy;
+            const T = T_cold + (T_hot - T_cold) * Math.exp(-r2 / (2 * sigma0 * sigma0));
+            const p = rho0 * T;
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, 0, 0, 0, p, B0, 0, 0, gamma);
+        }
+    }
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i <= nT; i++) {
+            Bx_face[bxFaceIdx(i, j, nT)] = B0;
+        }
+    }
+    // By_face stays zero.
+
+    return {
+        id: 'conduction-front', label: 'Anisotropic conduction front',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_CONDUCTION,
+            conductionKappa:   1.0e-2,
+            conductionIsoFrac: 0.1,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 5,  // VIEW_T — temperature spread is the test signal
+        viewMin: T_cold, viewMax: T_hot,
+        verifyTime: 0.1,
+        conductionFront: {
+            T_cold, T_hot, sigma0, kappa_par: 1.0e-2, iso_frac: 0.1,
+        },
+    };
+}
+
+/**
+ * Thermal cooling instability (Session 15).
+ *
+ * Uniform gas with multi-mode density perturbations under bremsstrahlung-
+ * shape cooling Λ(T) = Λ₀ · √(T/T_ref). For Λ above the local thermal
+ * timescale the gas fragments: hotter regions cool faster (dE/dt = -ρ² Λ
+ * but in the bremsstrahlung-shape we use, the rate goes as √T, so the
+ * cooling time t_cool = p/(γ−1) / (ρ² Λ) = T/((γ−1) ρ Λ₀ √(T/T_ref))
+ * decreases as √T — hotter loses energy faster, driving condensation).
+ *
+ * Setup:
+ *   ρ = 1 + A·noise(x, y), p = 1, B = 0, v = 0, γ = 5/3.
+ *   Λ₀ = 0.1 (supercritical for the box geometry).
+ *
+ * The noise is deterministic — a sum of three low-k modes — so the test
+ * is reproducible.
+ */
+export function makeCoolingInstabilityPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L     = 1.0;
+    const dx    = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0   = 1.0;
+    const A    = 0.05;
+    const TWO_PI = 2.0 * Math.PI;
+    const xCellOf = (i) => (i - ghost + 0.5) * dx;
+    const yCellOf = (j) => (j - ghost + 0.5) * dx;
+
+    const primAt = (iw, jw) => {
+        const x = (iw + 0.5) * dx;
+        const y = (jw + 0.5) * dx;
+        // Three coprime modes — interferes into a clumpy field.
+        const s = Math.sin(TWO_PI * 3 * x) * Math.cos(TWO_PI * 2 * y)
+                + Math.sin(TWO_PI * 5 * (x + y)) * 0.7
+                + Math.cos(TWO_PI * 4 * (x - y)) * 0.5;
+        return {
+            rho: rho0 * (1 + A * s),
+            vx: 0, vy: 0, vz: 0,
+            p: p0,
+            bx_c: 0, by_c: 0, bz: 0,
+        };
+    };
+    fillCellGhostPeriodic(U0, U1, gamma, nT, ghost, n, primAt);
+    // B ≡ 0 → all face arrays stay zero.
+
+    return {
+        id: 'cooling-instability', label: 'Cooling instability',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_COOLING,
+            coolingLambda0: 0.1,
+            coolingTFloor:  1.0e-3,
+            coolingTRef:    1.0,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 0,  // VIEW_DENSITY — fragmentation shows up as ρ clumps
+        viewMin: rho0 * (1 - 2 * A), viewMax: rho0 * (1 + 2 * A),
+        verifyTime: 0.5,
+    };
+}
+
+/**
+ * Jeans instability (Session 15).
+ *
+ * Small-amplitude density perturbation under self-gravity. Linear
+ * dispersion for hydrodynamic Jeans modes:
+ *
+ *   ω² = k² c_s² − 4πG ρ₀
+ *
+ * Unstable (ω² < 0 ⇒ exponential growth) when
+ *   k < k_J ≡ √(4πG ρ₀ / c_s²)    (wavelength > λ_J)
+ *
+ * Setup chosen so the chosen mode is solidly unstable:
+ *   ρ = ρ₀ · (1 + A·sin(2π x/L)), A = 1e-2, λ = L = 1.
+ *   c_s² = γ p₀ / ρ₀ = 5/3, k = 2π/L.
+ *   With G = 10:
+ *     4πG ρ₀ = 40π ≈ 125.7,    k² c_s² = (2π)²·5/3 ≈ 65.8.
+ *     ω² = 65.8 − 125.7 ≈ −59.9  ⇒  growth rate γ_g = √59.9 ≈ 7.74.
+ */
+export function makeJeansInstabilityPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L     = 1.0;
+    const dx    = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0   = 1.0;
+    const A    = 1.0e-2;
+    const TWO_PI = 2.0 * Math.PI;
+    const k    = TWO_PI / L;
+    const G    = 10.0;
+    const cs2  = gamma * p0 / rho0;
+    const omega2 = k * k * cs2 - 4 * Math.PI * G * rho0;
+    const growthRate = omega2 < 0 ? Math.sqrt(-omega2) : 0;
+    const lambdaJ = Math.sqrt(Math.PI * cs2 / (G * rho0));
+
+    const xCellOf = (i) => (i - ghost + 0.5) * dx;
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            const x = xCellOf(i);
+            const rho = rho0 * (1 + A * Math.sin(k * x));
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho, 0, 0, 0, p0, 0, 0, 0, gamma);
+        }
+    }
+    // B ≡ 0.
+
+    return {
+        id: 'jeans-instability', label: 'Jeans instability',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_GRAVITY_SELF,
+            gravityG: G,
+            gravityPoissonIters: 64,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 0,  // VIEW_DENSITY — growth is in ρ
+        viewMin: rho0 * (1 - 3 * A), viewMax: rho0 * (1 + 3 * A),
+        // Should grow by ~e in t ≈ 1/γ_g.
+        verifyTime: growthRate > 0 ? 1.0 / growthRate : 1.0,
+        jeans: { k, G, cs2, growthRate, lambdaJ, A },
+    };
+}
+
 export const PRESETS = {
     sod: makeSodPreset,
     'brio-wu': makeBrioWuPreset,
     'orszag-tang': makeOrszagTangPreset,
+    'orszag-tang-extended': makeOrszagTangExtendedPreset,
     'harris': makeHarrisPreset,
     'alfven-cpaw': makeAlfvenCpawPreset,
     'acoustic-wave-hydro': makeAcousticWaveHydroPreset,
+    'hall-whistler': makeHallWhistlerPreset,
+    'conduction-front': makeConductionFrontPreset,
+    'cooling-instability': makeCoolingInstabilityPreset,
+    'jeans-instability': makeJeansInstabilityPreset,
 };
