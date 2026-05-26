@@ -114,14 +114,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // any sign), we use `x == x` (false for NaN) to gate the value.
 
     // Momentum: zero if non-finite (interpretation: "no motion").
-    let mx = select(0.0, u0_raw.y, u0_raw.y == u0_raw.y);
-    let my = select(0.0, u0_raw.z, u0_raw.z == u0_raw.z);
-    let mz = select(0.0, u0_raw.w, u0_raw.w == u0_raw.w);
+    var mx = select(0.0, u0_raw.y, u0_raw.y == u0_raw.y);
+    var my = select(0.0, u0_raw.z, u0_raw.z == u0_raw.z);
+    var mz = select(0.0, u0_raw.w, u0_raw.w == u0_raw.w);
 
     // Density: clamp to [floor, large]. NaN → floor.
     let rho = clamp(u0_raw.x, DENSITY_FLOOR, 1.0e30);
 
-    // KE from sanitized momentum and density. Guaranteed finite.
+    // ── Momentum sanitization for the floored-density case ─────────────
+    // Session 12 retrospective (fifth Harris bug): when ρ_raw falls below
+    // DENSITY_FLOOR at a cell, the bare floor write keeps momentum at
+    // whatever HLLD produced. Next stage / next step reads v = m / ρ_floor,
+    // which can be huge — KE = m²/(2ρ_floor) = huge, vMax → 1000+, CFL
+    // forces dt → DT_MIN, sim explodes. This is what kills tight-loop
+    // Harris at step ~150 even with the curl(η J) + corner BC fix landed
+    // in Session 11. Mechanism is downstream of (not caused by) sheet
+    // thinning: the sheet IS supposed to thin via reconnection, but the
+    // outflow region from the X-point should never see ρ → floor under
+    // any physical solver — it's a numerical artifact from HLLD over-
+    // depleting density at the X-point. The proper fix would be HLLD
+    // positivity-preservation (Janhunen 2000-style) but that's a deep
+    // re-write. Stop-gap: scale momentum to keep v ≤ V_MAX_SANE when
+    // ρ is floored. V_MAX_SANE = 10 ≈ 3×c_f (Harris background Alfvén
+    // speed ~2.2, fast speed ~3.5). At ρ_floor = 1e-6 this caps KE per
+    // cell at ½·1e-6·100 = 5e-5 — negligible vs background pressure
+    // contribution, so the sanitization doesn't bias physics in cells
+    // that didn't need it.
+    let V_MAX_SANE: f32 = 10.0;
+    let v_inv_rho = 1.0 / rho;
+    let vx_raw = mx * v_inv_rho;
+    let vy_raw = my * v_inv_rho;
+    let vz_raw = mz * v_inv_rho;
+    let v_mag = sqrt(vx_raw*vx_raw + vy_raw*vy_raw + vz_raw*vz_raw);
+    if (v_mag > V_MAX_SANE) {
+        let scale = V_MAX_SANE / v_mag;
+        mx = mx * scale;
+        my = my * scale;
+        mz = mz * scale;
+    }
+
+    // KE from sanitized momentum and density. Guaranteed finite, bounded.
     let ke = 0.5 * (mx*mx + my*my + mz*mz) / rho;
 
     // Energy: must be at least KE + p_floor/(γ−1). We can't add the

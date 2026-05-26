@@ -25,7 +25,7 @@ def main():
                     help='enable tight-loop mode (no per-step await — mirrors prod)')
     args = ap.parse_args()
 
-    url = (f'http://localhost:{args.port}/tests/harris-diagnostic.html'
+    url = (f'http://localhost:{args.port}/plasma/tests/harris-diagnostic.html'
            f'?auto=1&N={args.N}&maxSteps={args.maxSteps}'
            f'&sampleEvery={args.sampleEvery}&eta={args.eta}'
            f'{"&tight=1" if args.tight else ""}')

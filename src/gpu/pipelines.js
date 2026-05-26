@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 25;
+const SHADER_VERSION = 26;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);

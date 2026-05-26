@@ -1043,7 +1043,8 @@ export class Sim {
         b.pushStsCoeffs(coeffsArr);
 
         const N = this.n;
-        const gResis = Math.ceil((N + 3) / WG);
+        const gResis    = Math.ceil((N + 3) / WG);
+        const gTotalP1  = Math.ceil((this.n_total + 1) / WG);
 
         // dst buffers — stage 3 wrote into the side's `next` slot
         // (before the post-step swap).
@@ -1055,6 +1056,37 @@ export class Sim {
         const setA    = { Bx: b.Bx_res_pprev, By: b.By_res_pprev, U1: b.U1_res_pprev };
         const setB    = { Bx: b.Bx_res_prev,  By: b.By_res_prev,  U1: b.U1_res_prev  };
         const setC    = { Bx: b.Bx_res_tmp,   By: b.By_res_tmp,   U1: b.U1_res_tmp   };
+
+        // Refresh dst-side ghost cells before RKL2's substep loop reads
+        // them at boundary-face corners. Session 12 retrospective (fifth
+        // Harris bug, part 1 of 2): stage 3 writes fresh INTERIOR state
+        // to dst, but the dst-side ghosts haven't seen apply-bcs since
+        // this side was last a stage source — 1 step lagged. RKL2's
+        // curl(η J) stencil at boundary faces (ix == ghost or ix ==
+        // ghost+n_interior; iy mirror for By) reads cell-centered and
+        // face-B values one cell INSIDE the dispatch range, which lands
+        // in ghost storage. Stale ghosts break the periodic-wrap
+        // invariance for RKL2's update of boundary faces — observed as
+        // slow divB drift at i=255 in Harris (the last interior column
+        // under periodic E/W). Without this dispatch, divB at the
+        // periodic boundary grows ~5× faster and eventually destabilizes
+        // the hyperbolic step. Run apply-bcs in its OWN compute pass so
+        // the writes complete + synchronize before the seed-snapshot
+        // dispatches read them. The `applyBcsDst` bind group was built
+        // for each stage by `_buildBindGroupCache` (line ~822) but never
+        // dispatched after Session 8 retired the per-stage resistivity
+        // triad — this restores the dispatch in its only remaining
+        // legitimate slot. Used only on Harris (the sole MIXED-BC preset)
+        // — for all-periodic presets, the dispatch is essentially a no-op
+        // since the ghosts under stage-3 dst already match periodic wrap
+        // by CT preservation.
+        {
+            const bcPass = encoder.beginComputePass({ label: 'plasma.rkl2.applyBcsDst' });
+            bcPass.setPipeline(pipelines.pipelines.applyBcs);
+            bcPass.setBindGroup(0, this._bgCache.stage3[side].applyBcsDst);
+            bcPass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+            bcPass.end();
+        }
 
         const pass = encoder.beginComputePass({ label: 'plasma.rkl2' });
 
