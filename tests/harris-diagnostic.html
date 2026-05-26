@@ -226,8 +226,38 @@ function summarize(N, ghost, U0arr, U1arr, BxArr, ByArr, dx, gamma, pFloor) {
         }
     }
 
-    // J_z and div B from central differences over interior (avoid the
-    // outermost interior cells so the stencil stays in-bounds).
+    // J_z and div B from face values directly. Loop interior cells
+    // (i, j in [ghost, ghost+N)) but skip stencil-only cells for J_z.
+    // div B uses ONLY interior-stored face indices so it's valid on
+    // the full interior range.
+    let divbMaxCell = null;
+    // Per-j-row divB summary — separates boundary rows from interior.
+    // We collect per-row max and per-row mean.
+    const divbRowMax = new Float32Array(N);
+    const divbRowSum = new Float32Array(N);
+    const floorPCellsList = [];
+    for (let jj = 0; jj < N; jj++) { divbRowMax[jj] = 0; divbRowSum[jj] = 0; }
+
+    for (let j = ic0; j < ic1; j++) {
+        for (let i = ic0; i < ic1; i++) {
+            // div B from face values directly — valid on full interior.
+            const dBxdx = (BxArr[bxFaceIdx(i+1, j)] - BxArr[bxFaceIdx(i, j)]) / dx;
+            const dBydy = (ByArr[byFaceIdx(i, j+1)] - ByArr[byFaceIdx(i, j)]) / dx;
+            const db = Math.abs(dBxdx + dBydy);
+            if (isFinite(db)) {
+                divbAbsSum += db;
+                const jr = j - ic0;
+                divbRowSum[jr] += db;
+                if (db > divbRowMax[jr]) divbRowMax[jr] = db;
+                if (db > divbAbsMax) {
+                    divbAbsMax = db;
+                    divbMaxCell = { i: i - ghost, j: j - ghost, divB: dBxdx + dBydy };
+                }
+            }
+        }
+    }
+
+    // J_z central difference — needs ±1 in i and j, so loop one cell in.
     for (let j = ic0 + 1; j < ic1 - 1; j++) {
         for (let i = ic0 + 1; i < ic1 - 1; i++) {
             const bx_cp = 0.5 * (BxArr[bxFaceIdx(i,   j+1)] + BxArr[bxFaceIdx(i+1, j+1)]);
@@ -239,24 +269,58 @@ function summarize(N, ghost, U0arr, U1arr, BxArr, ByArr, dx, gamma, pFloor) {
             const jz = dBydx - dBxdy;
             const aj = Math.abs(jz);
             if (isFinite(aj) && aj > jMax) jMax = aj;
+        }
+    }
+    const divbAvg = divbAbsSum / Math.max(1, N * N);
 
-            // div B from face values directly.
-            const dBxdx = (BxArr[bxFaceIdx(i+1, j)] - BxArr[bxFaceIdx(i, j)]) / dx;
-            const dBydy = (ByArr[byFaceIdx(i, j+1)] - ByArr[byFaceIdx(i, j)]) / dx;
-            const db = Math.abs(dBxdx + dBydy);
-            if (isFinite(db)) {
-                divbAbsSum += db;
-                if (db > divbAbsMax) divbAbsMax = db;
+    // Sample per-row divB at 7 strategic rows: 3 nearest to south wall,
+    // domain center, 3 nearest to north wall.
+    const rowSamples = {
+        s0: divbRowMax[0],         s1: divbRowMax[1],
+        s2: divbRowMax[2],         mid: divbRowMax[Math.floor(N/2)],
+        n2: divbRowMax[N - 3],     n1: divbRowMax[N - 2],
+        n0: divbRowMax[N - 1],
+    };
+
+    // Sample per-row divB MEAN at boundary vs interior.
+    const meanBoundaryRows = (divbRowSum[0] + divbRowSum[1] + divbRowSum[N-1] + divbRowSum[N-2])
+                             / (4 * N);
+    let interiorSum = 0;
+    for (let jj = 3; jj < N - 3; jj++) interiorSum += divbRowSum[jj];
+    const meanInteriorRows = interiorSum / Math.max(1, (N - 6) * N);
+
+    // Cell list of floored-pressure cells (first up to 16). Walk
+    // interior again for this — cheaper than holding it in the main
+    // loop's variables.
+    for (let j = ic0; j < ic1 && floorPCellsList.length < 16; j++) {
+        for (let i = ic0; i < ic1 && floorPCellsList.length < 16; i++) {
+            const c = cellIdx(i, j);
+            const rho = U0arr[4*c + 0];
+            const mx  = U0arr[4*c + 1];
+            const my  = U0arr[4*c + 2];
+            const mz  = U0arr[4*c + 3];
+            const E   = U1arr[4*c + 0];
+            const bz  = U1arr[4*c + 1];
+            const bx_c = 0.5 * (BxArr[bxFaceIdx(i, j)] + BxArr[bxFaceIdx(i+1, j)]);
+            const by_c = 0.5 * (ByArr[byFaceIdx(i, j)] + ByArr[byFaceIdx(i, j+1)]);
+            if (!isFinite(rho) || !isFinite(E)) continue;
+            const prim = consToPrim(rho, mx, my, mz, E, bz, bx_c, by_c, gamma, pFloor);
+            if (prim.p <= 1.001 * pFloor) {
+                floorPCellsList.push({ i: i - ghost, j: j - ghost,
+                                       rho: prim.rho, p_raw: prim.p_raw });
             }
         }
     }
-    const divbAvg = divbAbsSum / Math.max(1, (N - 2) * (N - 2));
 
     return {
         rhoMin, rhoMax, pMin, pMax, pRawMin,
         vMax, bMax, jMax,
         rhoFloorCount, pFloorCount, nanCount, firstNaN,
         sumRho, sumE, sumBsq, divbAvg, divbAbsMax,
+        divbMaxCell, divbRowSamples: rowSamples,
+        divbMeanBoundary: meanBoundaryRows,
+        divbMeanInterior: meanInteriorRows,
+        floorPCells: floorPCellsList,
         cellCount,
     };
 }

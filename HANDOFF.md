@@ -1603,7 +1603,97 @@ shaders. Zero regression risk to the η=0 presets.
 * η=0 presets untouched by inspection (the gate at sim.js:1035 is
   intact).
 
-### The remaining fourth issue (next session)
+### The remaining fourth issue (next session) — divB leak at corner cells
+
+Extended `tests/harris-diagnostic.html` to localize the divB blow-up:
+per-j-row max, max-cell (i, j) coords, per-row mean at boundary vs
+interior, and a list of cells where `p_raw < pressure_floor`. Findings:
+
+1. **divB leak is η-driven.** At η=0 (ideal MHD Harris), divbAvg stays
+   at ~2e-5 (fp32 noise) through 30 steps. At η=1e-3, divbAvg grows to
+   1.17e-3 over the same window — 50× faster. The RKL2 resistivity
+   step is the source.
+2. **Leak concentrates at corner cells.** divbMaxCell is at (255, 1),
+   (1, 0), (0, 255), (255, 255) etc. — the four interior corners where
+   periodic-E/W meets outflow-N/S. By step 5 the corner cells have
+   divB ≈ 5e-2; by step 30, divB ≈ 8 at corners while the interior
+   mid-row has divB ≈ 2e-3.
+3. **Pressure floor cells are exactly the four corners.** From step
+   ~50 onward, `pFloorCount` plateaus at 4 with `floorPCells` reporting
+   precisely (0, 0), (255, 0), (0, 255), (255, 255). The corner-BC
+   priority + divB injection conspires to drive p_raw negative there.
+
+**Mechanism**. RKL2 currently restricts updates to faces strictly
+interior to the boundary face (Bx range `ix > ghost && ix <
+ghost+n_interior`, By range `iy > ghost && iy < ghost+n_interior`).
+The discrete identity ∇·(η∇²B) = η∇²(∇·B) requires the Laplacian
+operator to be applied to **every** face that appears in an interior
+cell's divB. Excluding the boundary face means the divB contribution
+from `(By[i, ghost+1] - By[i, ghost])/dx` evolves only on the upper
+half — η·dt·∇²By[i, ghost+1] modifies the first half but the boundary
+face contribution stays frozen. divB at the boundary cell leaks by
+exactly that amount per RKL2 substep.
+
+**Attempted fix that DIDN'T work** (kept in this writeup for future
+sessions). Extended RKL2's range to include boundary faces:
+
+```wgsl
+let in_bx_interior =
+    ix >= ghost && ix <= ghost + n_interior &&
+    iy >= ghost && iy < ghost + n_interior;
+let in_by_interior =
+    ix >= ghost && ix < ghost + n_interior &&
+    iy >= ghost && iy <= ghost + n_interior;
+```
+
+Result on tight-loop Harris N=256 eta=1e-3: **interior cleaner**
+(divbMeanInterior at step 25 was 8.5e-5 vs 2.5e-4 pre-fix — 3×
+improvement), but **corners much worse** (divbAbsMax 41 at step 25
+vs ~8 over the full pre-fix 400-step run). NaN onset moved from
+step 400 down to step 50. Reverted.
+
+The reason: at the periodic-x / outflow-y corners, apply-bcs's
+`on_s_wall` and `on_n_wall` priority paths handle the boundary
+face BC but **skip periodic-x correction** at the corner ghost. For
+example, By[258, 2] (E-ghost x-column, S-boundary y-row) is filled
+by `fill_by_face`'s on_s_wall path — self-copy of the CT-evolved
+value — instead of being kept periodically-equivalent to By[2, 2].
+Once RKL2 updates the boundary faces using these inconsistent ghost
+neighbors, the corner divB explodes. The on_s_wall priority needs
+to compose with periodic-x at corner cells before this fix is safe.
+
+**Canonical fix**: replace component-wise η∇²B with the
+`curl(η J)` form (Athena++ `src/diffusion/diffusion_b.cpp`, PLUTO
+`Src/MHD/Resistive/res_flux.c`). For 2.5D MHD with J_x = J_y = 0,
+∇·B-preserving evolution is:
+
+* `∂B_x/∂t |_res = -∂_y(η J_z)`   (CT-shape update at x-faces)
+* `∂B_y/∂t |_res =  ∂_x(η J_z)`   (CT-shape update at y-faces)
+* `∂B_z/∂t |_res = η ∇²B_z`       (cell-centered, unchanged)
+
+This evolves Bx and By as a curl of an edge-centered η J_z field,
+which is identically div-free at the discrete level on the Yee
+grid — same divergence-preservation argument as ideal-MHD CT.
+For UNIFORM η on a divergence-free B, this reduces to η∇²B exactly
+(I checked the algebra). For NON-uniform η (anomalous resistivity),
+this is the only formulation that maintains discrete ∇·B = 0.
+
+Estimated work: a new `compute-eta-jz.wgsl` pass writing
+`Ez_res = η · J_z` at corners (similar dispatch shape to
+compute-emf), then `apply-resistivity-init/prev` rewritten to do
+`Bx += -dt·(Ez_res[i, j+1] - Ez_res[i, j])/dy` and the symmetric
+form for By. Bz keeps its component-wise Laplacian. Estimated 1-2
+hours.
+
+**Quicker alternative** (worth trying first): fix apply-bcs's corner
+priority so that for cells where one edge is periodic and the other
+is outflow/reflecting, BOTH BCs compose. Specifically, when
+`on_s_wall || on_n_wall` fires at a corner column (ix in the h-ghost
+band), use the BC-of-the-on_*_wall AND ALSO apply the periodic
+correction along the h-axis. This is a localized fix to apply-bcs
+that doesn't touch the resistivity shaders.
+
+### Earlier post-fix trajectory (before divB localization)
 
 Tight-loop Harris still detonates at step ~400 post-fix. The
 trajectory shows:
