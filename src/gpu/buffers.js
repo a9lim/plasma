@@ -160,16 +160,47 @@ export class PlasmaBuffers {
         });
 
         // RKL2 per-substep meta — (substep_idx, s_total, dt_super, _pad).
-        // Rewritten per substep via queue.writeBuffer (16 B, cheap).
-        // Bound by both apply-resistivity-init and -prev as a uniform.
-        this.sts_meta = device.createBuffer({
-            label: 'plasma.sts_meta',
-            size:  16,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        this.stsMetaHost = new ArrayBuffer(16);
-        this.stsMetaU32  = new Uint32Array(this.stsMetaHost);
-        this.stsMetaF32  = new Float32Array(this.stsMetaHost);
+        //
+        // Bug history (Session 13): originally a SINGLE 16 B uniform
+        // rewritten via `queue.writeBuffer` inside the substep loop.
+        // That collided with WebGPU's `writeBuffer`-vs-`submit` ordering:
+        // all `writeBuffer` calls are ordered BEFORE the next `submit`,
+        // so when the substep loop encodes `s` init+prev dispatches into
+        // a single compute pass and then submits once, the queue applies
+        // every writeBuffer first (with only the LAST value surviving)
+        // and then runs the dispatches — meaning every substep ended up
+        // reading `substep_idx = s`. RKL2 with j=s coefficients applied
+        // s times is not RKL2; for s≥2 the effective Δt was ~1.25× too
+        // large with the wrong L² term, manifesting as the field "jumping
+        // suddenly" on Orszag-Tang once η crossed the s=1↔s=2 threshold
+        // (~5e-2 at N=256).
+        //
+        // Fix: pre-allocate STS_COEFFS_MAX_S separate 16 B uniform
+        // buffers (`sts_meta_per_j[j-1]`), each written ONCE at startup
+        // with the constant (j, 1, 0, 0). The substep loop now selects
+        // the appropriate buffer via the bind group rather than mutating
+        // a shared buffer. `s_total` is the constant 1 — the shader only
+        // uses it as an "is RKL2 active" gate, and CPU already guards
+        // dispatch on `s > 0`. `dt_super` was retired in Session 10 (the
+        // shader reads fresh from `dt_buf.dt_hyp` now), so we leave it
+        // 0 here for layout compatibility.
+        this.sts_meta_per_j = new Array(STS_COEFFS_MAX_S);
+        const stsMetaSeed = new ArrayBuffer(16);
+        const stsMetaSeedU32 = new Uint32Array(stsMetaSeed);
+        const stsMetaSeedF32 = new Float32Array(stsMetaSeed);
+        for (let j = 1; j <= STS_COEFFS_MAX_S; j++) {
+            const buf = device.createBuffer({
+                label: `plasma.sts_meta_j${j}`,
+                size:  16,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            stsMetaSeedU32[0] = j >>> 0;       // substep_idx
+            stsMetaSeedU32[1] = 1 >>> 0;       // s_total > 0 — gate the shader on
+            stsMetaSeedF32[2] = 0;             // dt_super — unused (Session 10)
+            stsMetaSeedF32[3] = 0;             // pad
+            device.queue.writeBuffer(buf, 0, stsMetaSeed);
+            this.sts_meta_per_j[j - 1] = buf;
+        }
 
         // ── PPM edge states — 4 buffers × 2 axes = 8 buffers ───────
         this.edge_l_x_0 = mkStorage('plasma.edge_l_x_0', u_v4_cell_bytes);
@@ -584,17 +615,6 @@ export class PlasmaBuffers {
     pushStsCoeffs(arr) {
         this.device.queue.writeBuffer(this.sts_coeffs, 0,
             arr.buffer, arr.byteOffset, arr.byteLength);
-    }
-
-    /**
-     * Update the per-substep meta uniform — (substep_idx, s_total, dt_super).
-     */
-    pushStsMeta(substepIdx, sTotal, dtSuper) {
-        this.stsMetaU32[0] = substepIdx >>> 0;
-        this.stsMetaU32[1] = sTotal >>> 0;
-        this.stsMetaF32[2] = dtSuper;
-        this.stsMetaF32[3] = 0;
-        this.device.queue.writeBuffer(this.sts_meta, 0, this.stsMetaHost);
     }
 
     /**

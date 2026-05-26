@@ -522,7 +522,7 @@ export class Sim {
         });
     }
 
-    _applyResInitBG(initBx, initBy, initU1, pprevBx, pprevBy, pprevU1,
+    _applyResInitBG(stsMetaBuf, initBx, initBy, initU1, pprevBx, pprevBy, pprevU1,
                     tmpBx, tmpBy, tmpU1) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -530,7 +530,7 @@ export class Sim {
             layout: this.pipelines.layouts.applyResInit,
             entries: [
                 { binding: 0,  resource: { buffer: b.uniform } },
-                { binding: 1,  resource: { buffer: b.sts_meta } },
+                { binding: 1,  resource: { buffer: stsMetaBuf } },
                 { binding: 2,  resource: { buffer: b.sts_coeffs } },
                 { binding: 3,  resource: { buffer: initBx } },
                 { binding: 4,  resource: { buffer: initBy } },
@@ -547,7 +547,7 @@ export class Sim {
         });
     }
 
-    _applyResPrevBG(initBx, initBy, prevBx, prevBy, prevU1,
+    _applyResPrevBG(stsMetaBuf, initBx, initBy, prevBx, prevBy, prevU1,
                     tmpBx, tmpBy, tmpU1) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -555,7 +555,7 @@ export class Sim {
             layout: this.pipelines.layouts.applyResPrev,
             entries: [
                 { binding: 0,  resource: { buffer: b.uniform } },
-                { binding: 1,  resource: { buffer: b.sts_meta } },
+                { binding: 1,  resource: { buffer: stsMetaBuf } },
                 { binding: 2,  resource: { buffer: b.sts_coeffs } },
                 { binding: 3,  resource: { buffer: initBx } },
                 { binding: 4,  resource: { buffer: initBy } },
@@ -962,19 +962,45 @@ export class Sim {
     //     γ̃_j         = -a_{j-1} · μ̃_j
     //
     // Substep count from Δt_super and dt_parabolic:
-    //   s = ceil(0.5 · (√(1 + 8 · Δt_super / dt_parabolic) − 1))
+    //   stability bound (MDK14 eq 18):
+    //     Δt_super ≤ ((s² + s − 2) / 2) · Δt_FE
+    //   with Δt_FE = dt_parabolic (the 2D 5-point FE bound: dx²/(4η);
+    //   see compute-dt.wgsl). Solving for the minimum integer s:
+    //     s² + s − 2 ≥ 2·r,   r ≡ Δt_super / dt_parabolic
+    //     s ≥ ½·(−1 + √(8r + 9))
+    //     s = ceil(½·(√(8r + 9) − 1))
     // capped at sts_coeffs_max_s (100; brief-specified safety cap).
+    //
+    // Session 13 retrospective — the prior formula was
+    //     s = ceil(½·(√(1 + 8r) − 1))
+    // which solves s² + s = 2r (MISSING the `-2` stability margin). It
+    // picks an s that's one short whenever the true sRaw straddles an
+    // integer:  at r ∈ (s_max_true, s_max_true + 0.5] it returns s,
+    // but s is only stable for r ≤ (s² + s − 2)/2 — so RKL2 ran with
+    // a substep count too small to damp the highest-k modes. Combined
+    // with the 2× error in dt_parabolic (Session 8 set it to the 1D FE
+    // bound rather than the 2D one — see compute-dt.wgsl header), the
+    // effective stability ratio was off by 2-3× for typical operating
+    // points. At Orszag-Tang N=1024 η ~5e-1 (true ratio ~13), the buggy
+    // code picked s=5 while true required s=7; the highest-k modes
+    // amplified each macro step until resistivity caught up, giving
+    // the "blobs fade in and out" visual.
     //
     // For s = 1 we want pure forward Euler (Y_1 = U^n + Δt · L(U^n)) —
     // achieved with the special-case μ̃_1 = 1 (the MDK formula divides
     // by (s² + s − 2) which is zero at s = 1, hence the special case).
+    // FE is stable for r ≤ 1/2 (i.e., Δt_super ≤ Δt_FE = dt_parabolic/2…
+    // wait, that's not right since dt_parabolic IS Δt_FE here. FE is
+    // stable for r ≤ 1.). The formula's lower limit handles this: at
+    // r = 1 sRaw = ½·(√17 − 1) ≈ 1.56, ceil → 2, so we over-substep
+    // at the FE/RKL2 boundary by one — negligible cost, zero risk.
     _computeRKL2Coeffs(dt_super, dt_parabolic, sMax) {
         let s;
         if (dt_parabolic >= 1e29 || dt_super <= 0) {
             s = 1;
         } else {
             const ratio = dt_super / dt_parabolic;
-            const sRaw = 0.5 * (Math.sqrt(1 + 8 * ratio) - 1);
+            const sRaw = 0.5 * (Math.sqrt(8 * ratio + 9) - 1);
             s = Math.max(1, Math.ceil(sRaw));
             if (s > sMax) s = sMax;
         }
@@ -1114,12 +1140,21 @@ export class Sim {
             pass.dispatchWorkgroups(gResis, gResis, 1);
         }
 
-        // s substeps with role rotation.
+        // s substeps with role rotation. The substep_idx that the init /
+        // prev shaders read lives in a per-j pre-baked uniform buffer
+        // (`b.sts_meta_per_j[j-1]`), NOT in a single shared buffer
+        // rewritten per iteration. Rewriting a shared buffer here would
+        // be a no-op race: WebGPU orders every `queue.writeBuffer` before
+        // the next `queue.submit`, so all s writes collapse to the last
+        // value before any of the dispatches in this compute pass
+        // actually run, and every substep would see substep_idx = s.
+        // See buffers.js `sts_meta_per_j` comment for the full history.
         let pprev = setA, prev = setB, tmp = setC;
         for (let j = 1; j <= s; j++) {
-            b.pushStsMeta(j, s, dt_super);
+            const stsMetaBuf = b.sts_meta_per_j[j - 1];
 
             const bgInit = this._applyResInitBG(
+                stsMetaBuf,
                 initSet.Bx, initSet.By, initSet.U1,
                 pprev.Bx,   pprev.By,   pprev.U1,
                 tmp.Bx,     tmp.By,     tmp.U1,
@@ -1129,6 +1164,7 @@ export class Sim {
             pass.dispatchWorkgroups(gResis, gResis, 1);
 
             const bgPrev = this._applyResPrevBG(
+                stsMetaBuf,
                 initSet.Bx, initSet.By,
                 prev.Bx,    prev.By,    prev.U1,
                 tmp.Bx,     tmp.By,     tmp.U1,

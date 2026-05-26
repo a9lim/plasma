@@ -136,15 +136,32 @@ fn finalize() {
     dt_buf[0] = dt_hyp;
 
     // Parabolic diagnostic — host reads this to pick RKL2 substep count.
-    // RKL2's per-substep forward-Euler bound is dt_sub ≤ 0.5 · dx²/η_max
-    // (factor 0.5, not 0.25; the previous code used the explicit-Euler
-    // half of that to be conservative). When η_max is effectively zero
-    // we report a huge value so the host's `s = ceil(...)` returns 1.
+    // This is the 2D forward-Euler stability bound for the 5-point
+    // Laplacian:  Δt_FE ≤ dx² / (4 · η_max)  =  0.25 · dx² / η_max.
+    // Derivation: the 5-point Laplacian has spectral radius 8/dx² in 2D
+    // (sum of two 1D operators with spectral radius 4/dx² each), so FE
+    // stability requires |1 − η·Δt·λ_max| ≤ 1 → Δt ≤ dx² / (4·η).
+    //
+    // Session 13 retrospective: this was 0.5·dx²/η for the prior several
+    // sessions. The comment justified it as "factor 0.5, not 0.25; the
+    // previous code used the explicit-Euler half of that to be
+    // conservative" — but that's wrong: 0.25·dx²/η isn't "conservative",
+    // it's the 2D bound; 0.5·dx²/η is the 1D bound applied incorrectly
+    // in 2D. The 2× error made the RKL2 substep count (computed CPU-side
+    // from dt_super/dt_parabolic) consistently too small. At high η on
+    // Orszag-Tang N=1024 (ratio ~13) RKL2 ran with s=5 when s=7 was
+    // required, leaving the highest-k modes unstable; they grew until
+    // resistivity caught up, then the cycle repeated — visible as blobs
+    // fading in and out in the J_z view. Fixed alongside the missing
+    // `-2` stability margin in `_computeRKL2Coeffs` (see sim.js).
+    //
+    // When η_max is effectively zero we report a huge value so the
+    // host's `s = ceil(...)` returns 1.
     let e_bits = atomicLoad(&eta_max_buf);
     let eta_max = max(bitcast<f32>(e_bits), 0.0);
     var dt_par: f32;
     if (eta_max > 1.0e-30) {
-        dt_par = 0.5 * dx * dx / eta_max;
+        dt_par = 0.25 * dx * dx / eta_max;
     } else {
         dt_par = 1.0e30;
     }
