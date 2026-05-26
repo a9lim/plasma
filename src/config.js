@@ -78,21 +78,39 @@ export const EDGE_S = 1;  // bottom
 export const EDGE_E = 2;  // right
 export const EDGE_W = 3;  // left
 
-// Uniform-buffer layout (Round 2): see `Uniforms` struct in shared-helpers.wgsl.
-//   f32 dx, gamma, view_min, view_max, eta, _pad_lic_0, _pad_lic_1, _pad_lic_2
-//   u32 grid_n, grid_n_total, ghost_w
-//   f32 pressure_floor                       (slot 11, live via UI slider)
-//   f32 cfl                                  (slot 12)
-//   u32 view_mode                            (slot 13)
-//   f32 _pad_lic_3                           (slot 14)
-//   u32 noise_n                              (slot 15)
-// 16 × 4B = 64B.
+// Uniform-buffer layout (Extended physics — slots 16-31 added for Hall,
+// cooling, conduction, gravity, EMF mode, physics flags). See `Uniforms`
+// struct in shared-helpers.wgsl for the canonical layout.
+//   Slots 0-15  (original 64 B): dx, gamma, view_min, view_max, eta,
+//                eta_anom_alpha, _pad×2, grid_n, grid_n_total, ghost_w,
+//                pressure_floor, cfl, view_mode, eta_anom_jcrit, noise_n.
+//   Slots 16-31 (new 64 B): hall_di, hall_substeps_max, cooling_lambda0,
+//                cooling_T_floor, cooling_T_ref, conduction_kappa,
+//                conduction_iso_frac, conduction_sat_frac, gravity_gx,
+//                gravity_gy, gravity_G, gravity_poisson_iters,
+//                physics_flags, emf_mode, _pad, _pad.
+// 32 × 4B = 128B.
 //
 // Sweep direction is in two static SweepDir uniform buffers (16 B each)
 // bound by reconstruct-ppm + riemann-hlld. LIC render-pace state
 // (phase, intensity, drift_x, drift_y) is in a separate 16 B
 // LicUniforms buffer rewritten per render frame.
-export const UNIFORM_BUFFER_SIZE = 64;
+export const UNIFORM_BUFFER_SIZE = 128;
+
+// ── Extended physics flags (slot 28: physics_flags bitfield) ───────────
+// Each feature is OFF by default — extended physics is opt-in so the
+// existing presets behave exactly as before unless the user enables them.
+export const FLAG_COOLING      = 1 << 0;
+export const FLAG_GRAVITY_EXT  = 1 << 1;  // constant external g vector
+export const FLAG_GRAVITY_SELF = 1 << 2;  // Poisson-solved self-gravity
+export const FLAG_CONDUCTION   = 1 << 3;  // anisotropic thermal conduction
+export const FLAG_HALL         = 1 << 4;  // Hall MHD correction to face B
+export const FLAG_POSITIVITY   = 1 << 5;  // stronger positivity guard
+export const FLAG_EMF_UPWIND   = 1 << 6;  // GS upwind EMF (vs BS arithmetic mean)
+
+// EMF mode enum (slot 29: emf_mode).
+export const EMF_MODE_BS_MEAN  = 0;  // Balsara-Spicer arithmetic mean (current default)
+export const EMF_MODE_GS_UPWIND = 1; // Gardiner-Stone 2005 upwind
 
 // bc_uniforms storage-buffer layout:
 //   u32 mode[4]  — N, S, E, W

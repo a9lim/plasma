@@ -109,6 +109,24 @@ export class Sim {
         this._dtReadbackPool   = null;  // lazy-init in init()
         this._pendingTimeSteps = 0;
 
+        // ── Extended physics state (breadth pass — Hall, cooling,
+        //    conduction, gravity, EMF mode toggle). All zero / off by
+        //    default; UI toggles enable individually.
+        this.physicsFlags        = 0;
+        this.emfMode             = 0;       // 0 = BS mean (current), 1 = GS upwind
+        this.hallDi              = 0.0;     // ion inertial length (code units)
+        this.hallSubstepsMax     = 8;
+        this.coolingLambda0      = 0.0;
+        this.coolingTFloor       = 1.0e-4;
+        this.coolingTRef         = 1.0;
+        this.conductionKappa     = 0.0;
+        this.conductionIsoFrac   = 0.0;
+        this.conductionSatFrac   = 0.0;
+        this.gravityGx           = 0.0;
+        this.gravityGy           = 0.0;
+        this.gravityG            = 0.0;
+        this.gravityPoissonIters = 30;
+
         // UI integration state — owned by Sim so save/load can capture it.
         this.running     = true;
         this.speedScale  = 1;
@@ -318,6 +336,25 @@ export class Sim {
     setGamma(g)         { this.gamma = g; this._pushUniforms(); }
     setPressureFloor(p) { this.pressureFloor = p; this._pushUniforms(); }
 
+    // ── Extended physics setters (breadth pass) ────────────────────
+    setPhysicsFlag(flag, on) {
+        if (on) this.physicsFlags |=  flag;
+        else    this.physicsFlags &= ~flag;
+        this._pushUniforms();
+    }
+    setEmfMode(mode)             { this.emfMode = mode | 0; this._pushUniforms(); }
+    setHallDi(d)                 { this.hallDi = +d || 0; this._pushUniforms(); }
+    setHallSubstepsMax(n)        { this.hallSubstepsMax = Math.max(1, n | 0); this._pushUniforms(); }
+    setCoolingLambda0(v)         { this.coolingLambda0 = Math.max(0, +v || 0); this._pushUniforms(); }
+    setCoolingTFloor(v)          { this.coolingTFloor = Math.max(0, +v || 0); this._pushUniforms(); }
+    setCoolingTRef(v)            { this.coolingTRef = Math.max(1e-30, +v || 1); this._pushUniforms(); }
+    setConductionKappa(v)        { this.conductionKappa = Math.max(0, +v || 0); this._pushUniforms(); }
+    setConductionIsoFrac(v)      { this.conductionIsoFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
+    setConductionSatFrac(v)      { this.conductionSatFrac = Math.max(0, +v || 0); this._pushUniforms(); }
+    setGravityG(v)               { this.gravityG = Math.max(0, +v || 0); this._pushUniforms(); }
+    setGravityVec(gx, gy)        { this.gravityGx = +gx || 0; this.gravityGy = +gy || 0; this._pushUniforms(); }
+    setGravityPoissonIters(n)    { this.gravityPoissonIters = Math.max(0, n | 0); this._pushUniforms(); }
+
     setRunning(r)       { this.running = !!r; }
     setSpeedScale(s)    { this.speedScale = s; }
 
@@ -431,6 +468,21 @@ export class Sim {
             pressureFloor: this.pressureFloor,
             etaAnomAlpha: this.etaAnomAlpha,
             etaAnomJcrit: this.etaAnomJcrit,
+            // Extended physics
+            hallDi:              this.hallDi,
+            hallSubstepsMax:     this.hallSubstepsMax,
+            coolingLambda0:      this.coolingLambda0,
+            coolingTFloor:       this.coolingTFloor,
+            coolingTRef:         this.coolingTRef,
+            conductionKappa:     this.conductionKappa,
+            conductionIsoFrac:   this.conductionIsoFrac,
+            conductionSatFrac:   this.conductionSatFrac,
+            gravityGx:           this.gravityGx,
+            gravityGy:           this.gravityGy,
+            gravityG:            this.gravityG,
+            gravityPoissonIters: this.gravityPoissonIters,
+            physicsFlags:        this.physicsFlags,
+            emfMode:             this.emfMode,
         });
         // Mirror the host-side cache so _encodeResistivitySuperStep
         // can skip-test alpha without re-reading the GPU uniform.
@@ -1220,6 +1272,151 @@ export class Sim {
         }
     }
 
+    // ── Extended physics bind-group factories (breadth pass) ──────
+    // Cheap to rebuild each step; no _bgCache entry yet.
+    _coolingBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyCooling.bg',
+            layout: this.pipelines.layouts.cooling,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.dt } },
+            ],
+        });
+    }
+
+    _poissonBG(U0, phi_in, phi_out) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.solvePoisson.bg',
+            layout: this.pipelines.layouts.poisson,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: phi_in } },
+                { binding: 3, resource: { buffer: phi_out } },
+                { binding: 4, resource: { buffer: b.rho_mean } },
+            ],
+        });
+    }
+
+    _gravityBG(U0, U1, phi) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyGravity.bg',
+            layout: this.pipelines.layouts.gravity,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: phi } },
+                { binding: 4, resource: { buffer: b.dt } },
+            ],
+        });
+    }
+
+    _conductionBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyConduction.bg',
+            layout: this.pipelines.layouts.conduction,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.dt } },
+            ],
+        });
+    }
+
+    _hallBG(U0, Bx, By, U1) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyHall.bg',
+            layout: this.pipelines.layouts.hall,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: Bx } },
+                { binding: 3, resource: { buffer: By } },
+                { binding: 4, resource: { buffer: U1 } },
+                { binding: 5, resource: { buffer: b.dt } },
+            ],
+        });
+    }
+
+    /**
+     * Encode the extended-physics passes after the RKL2 super-step.
+     * All operate on the side's stage-3 destination buffers (which
+     * alias U_next before the post-step swap). Each pass is gated by
+     * the corresponding bit in `physicsFlags` — when nothing is
+     * enabled this is effectively a no-op (skip flags fire inside the
+     * shaders so we keep dispatch encoding simple).
+     */
+    _encodeExtendedPhysics(encoder, side) {
+        if (this.physicsFlags === 0) return;
+        const b = this.buffers;
+        const { pipelines } = this;
+
+        const handles = (side === 'a')
+            ? { U0: b.U0_b, U1: b.U1_b, Bx: b.Bx_b, By: b.By_b }
+            : { U0: b.U0_a, U1: b.U1_a, Bx: b.Bx_a, By: b.By_a };
+
+        const N         = this.n;
+        const gInterior = Math.ceil(N / WG);
+        const gN1       = Math.ceil((N + 1) / WG);
+
+        // ── Self-gravity Poisson solve (Jacobi ping-pong) ──────────
+        // Runs FIRST so gravity acceleration uses the freshly-updated φ.
+        // Cooling / conduction / Hall don't depend on φ so their order
+        // among themselves doesn't matter for the breadth pass.
+        const selfGravOn = (this.physicsFlags & (1 << 2)) !== 0 && this.gravityG > 0;
+        if (selfGravOn) {
+            const poissonPass = encoder.beginComputePass({ label: 'plasma.poisson' });
+            // Seed ρ̄ once per macro step.
+            poissonPass.setPipeline(pipelines.pipelines.solvePoissonResetAvg);
+            poissonPass.setBindGroup(0, this._poissonBG(handles.U0, b.phi, b.phi_next));
+            poissonPass.dispatchWorkgroups(1, 1, 1);
+            // Iterate Jacobi. Ping-pong by alternating bind groups.
+            poissonPass.setPipeline(pipelines.pipelines.solvePoissonIterate);
+            const iters = Math.max(0, this.gravityPoissonIters | 0);
+            const bgAB  = this._poissonBG(handles.U0, b.phi,      b.phi_next);
+            const bgBA  = this._poissonBG(handles.U0, b.phi_next, b.phi);
+            for (let it = 0; it < iters; it++) {
+                poissonPass.setBindGroup(0, (it & 1) ? bgBA : bgAB);
+                poissonPass.dispatchWorkgroups(gInterior, gInterior, 1);
+            }
+            poissonPass.end();
+        }
+
+        // ── Source-term + correction passes ────────────────────────
+        const pass = encoder.beginComputePass({ label: 'plasma.extendedPhysics' });
+        // Gravity source — momentum + energy.
+        pass.setPipeline(pipelines.pipelines.applyGravity);
+        pass.setBindGroup(0, this._gravityBG(handles.U0, handles.U1, b.phi));
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        // Cooling — local energy sink.
+        pass.setPipeline(pipelines.pipelines.applyCooling);
+        pass.setBindGroup(0, this._coolingBG(handles.U0, handles.U1, handles.Bx, handles.By));
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        // Anisotropic conduction — energy diffusion.
+        pass.setPipeline(pipelines.pipelines.applyConduction);
+        pass.setBindGroup(0, this._conductionBG(handles.U0, handles.U1, handles.Bx, handles.By));
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        // Hall correction — face B + Bz update via corner Hall E.
+        pass.setPipeline(pipelines.pipelines.applyHall);
+        pass.setBindGroup(0, this._hallBG(handles.U0, handles.Bx, handles.By, handles.U1));
+        pass.dispatchWorkgroups(gN1, gN1, 1);
+        pass.end();
+    }
+
     _resistiveSizingBounds() {
         const alpha = this.buffers?._etaAnomAlpha ?? 0;
         if (this.eta <= 0 && alpha <= 0) {
@@ -1284,6 +1481,11 @@ export class Sim {
             rkl2Bounds.dtSuper,
             rkl2Bounds.dtParabolic,
         );
+
+        // Pass 3.5 (breadth pass): extended physics — cooling, gravity,
+        // anisotropic conduction, Hall. Each is gated by a bit in
+        // `physicsFlags`; full no-op when nothing is enabled.
+        this._encodeExtendedPhysics(encoder, side);
 
         // Pass 4: conservation diagnostics reduction over the just-
         // written destination state (stage 3 dst === U_next at this

@@ -89,14 +89,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let L0 = -(dFx_0 + dFy_0) / dx;
     let L1 = -mask * (dFx_1 + dFy_1) / dx;
 
-    let u0_raw =
+    var u0_raw =
         stage_params.a0 * U0_n[idx_c]
       + stage_params.a1 * U0_other[idx_c]
       + stage_params.dt_w * dt * L0;
-    let u1_raw =
+    var u1_raw =
         stage_params.a0 * U1_n[idx_c]
       + stage_params.a1 * U1_other[idx_c]
       + stage_params.dt_w * dt * L1;
+
+    // ── Positivity preservation (FLAG_POSITIVITY) ──────────────────
+    // If the unguarded post-update conserved state predicts a
+    // non-positive density or a non-positive thermal energy (E − KE
+    // already negative — magnetic energy adds back later but we
+    // can't see Bx/By here), DROP the L term entirely for this cell
+    // and fall back to the pure SSP blend of U_n and U_other. This is
+    // a cheap first-order positivity guard in the spirit of Hu, Adams
+    // & Shu 2013 §3 — it doesn't recompute the flux with HLL, but it
+    // guarantees the cell never advances through an unphysical state.
+    if (flag_set(U_uniforms.physics_flags, FLAG_POSITIVITY)) {
+        let rho_pred = u0_raw.x;
+        let mx_p     = u0_raw.y;
+        let my_p     = u0_raw.z;
+        let mz_p     = u0_raw.w;
+        let E_pred   = u1_raw.x;
+        let rho_safe = max(rho_pred, DENSITY_FLOOR);
+        let ke_pred  = 0.5 * (mx_p*mx_p + my_p*my_p + mz_p*mz_p) / rho_safe;
+        let bad = (rho_pred <= DENSITY_FLOOR)
+               || (E_pred - ke_pred <= U_uniforms.pressure_floor / (U_uniforms.gamma - 1.0))
+               || !(rho_pred == rho_pred)
+               || !(E_pred == E_pred);
+        if (bad) {
+            u0_raw = stage_params.a0 * U0_n[idx_c] + stage_params.a1 * U0_other[idx_c];
+            u1_raw = stage_params.a0 * U1_n[idx_c] + stage_params.a1 * U1_other[idx_c];
+        }
+    }
 
     // ── Defensive sanitization ──────────────────────────────────────
     // Catches NaN/Inf/sub-floor cells before they cascade through the

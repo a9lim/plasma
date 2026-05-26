@@ -187,28 +187,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                   select(0.5 * (ez_se + ez_ne), ez_ne, vy_ri < -TOL),
                   ez_se, vy_ri >  TOL);
 
-    // ── Balsara-Spicer 1999 arithmetic-mean corner EMF (temporary) ──
-    // The Gardiner-Stone 2005 upwind formulation above-the-line in
-    // the file header decomposes to:
-    //   Ez_corner = ½·(four face Ez) − ¼·(four upwind cell Ez)
-    // which is consistent in the smooth-flow limit but empirically
-    // produces a runaway CT B-update on Orszag-Tang at N=256, η=0.
-    // The OT cascade onsets at step ~250, exactly when the
-    // Riemann-solver face Ez at the four current sheets reaches
-    // ~2× the local cell Ez = vy·Bx − vx·By and the formula
-    // extrapolates outside the input range. The bisect that
-    // located this is documented in HANDOFF Session 9 — the upwind
-    // formula matches both the in-file derivation AND Stone+ 2008
-    // §3.5 eq 23, so the bug is subtle and pending re-investigation
-    // (likely flux-sign convention mismatch with HLLD's output, or
-    // a missing damping coefficient that Athena++ ships).
+    // ── Runtime EMF mode selection ──────────────────────────────────
+    // emf_mode = 0 (default): Balsara-Spicer 1999 arithmetic mean.
+    //   Conservative, ∇·B-preserving, but grid-aligned dissipative on
+    //   plane-parallel flows. Restored as default in Session 9 after
+    //   the GS-upwind below caused an OT cascade at step ~250.
+    // emf_mode = 1 (FLAG_EMF_UPWIND): Gardiner-Stone 2005 upwind.
+    //   Sharper on plane-parallel flows; needs damping for OT-stiff
+    //   reconnection. Exposed as a runtime toggle so users can A/B
+    //   the formulations on different presets.
     //
-    // Until the upwind formula is repaired, fall back to the
-    // Balsara-Spicer 1999 arithmetic mean. This costs us Session 4's
-    // claimed sharpness improvement on plane-parallel flows but
-    // restores OT stability. The cell-Ez upwind machinery above
-    // (lines 162-188) and the U0/Bx_face/By_face bindings (4-6)
-    // are left in place so re-introducing a corrected upwind term
-    // doesn't require pipeline-layout changes.
-    Ez_edge[ez_edge_idx(ix, iy, n_total)] = 0.25 * (ez_x_lo + ez_x_hi + ez_y_le + ez_y_ri);
+    // The G&S decomposition (Stone+ 2008 §3.5 eq 23):
+    //   Ez_corner = ½·(Σ four face Ez) − ¼·(Σ four upwind cell Ez)
+    let ez_bs   = 0.25 * (ez_x_lo + ez_x_hi + ez_y_le + ez_y_ri);
+    let ez_up   = 0.5  * (ez_x_lo + ez_x_hi + ez_y_le + ez_y_ri)
+                - 0.25 * (up_lo + up_hi + up_le + up_ri);
+
+    let upwind  = (U_uniforms.emf_mode == 1u)
+               || flag_set(U_uniforms.physics_flags, FLAG_EMF_UPWIND);
+    Ez_edge[ez_edge_idx(ix, iy, n_total)] = select(ez_bs, ez_up, upwind);
 }

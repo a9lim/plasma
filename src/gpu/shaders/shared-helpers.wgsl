@@ -111,6 +111,7 @@
 // eta_anom_alpha = 0 disables anomalous boost entirely (constant-η baseline).
 // |J| = |J_z| in 2.5D (only Jz is nonzero from in-plane fields).
 struct Uniforms {
+    // ── Original 64 B (slots 0-15) ────────────────────────────────────
     dx:              f32,
     gamma:           f32,
     view_min:        f32,
@@ -125,9 +126,39 @@ struct Uniforms {
     pressure_floor:  f32,  // minimum p in cons→prim recovery (UI slider)
     cfl:             f32,  // hyperbolic CFL number — consumed by compute-dt
     view_mode:       u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
-    eta_anom_jcrit:  f32,  // anomalous activation threshold |J_crit| (slot 14; was _pad_lic_3)
+    eta_anom_jcrit:  f32,  // anomalous activation threshold |J_crit| (slot 14)
     noise_n:         u32,  // noise-buffer side length (square, default 1024)
+    // ── Extended physics (slots 16-31, added for breadth pass) ───────
+    hall_di:               f32,  // Hall ion inertial length d_i (code units; 0 = no Hall)
+    hall_substeps_max:     u32,  // Max Hall sub-cycles per macro step
+    cooling_lambda0:       f32,  // Cooling rate scale Λ_0 (0 = no cooling)
+    cooling_T_floor:       f32,  // Below this T, Λ → 0
+    cooling_T_ref:         f32,  // Reference temperature for Λ(T) normalization
+    conduction_kappa:      f32,  // Parallel thermal conductivity κ_∥ (0 = no conduction)
+    conduction_iso_frac:   f32,  // κ_⊥ / κ_∥ (0 = fully anisotropic, 1 = isotropic)
+    conduction_sat_frac:   f32,  // Saturated heat-flux fraction (0 = unlimited)
+    gravity_gx:            f32,  // External gravity x (constant)
+    gravity_gy:            f32,  // External gravity y (constant; e.g., -1 for "down")
+    gravity_G:             f32,  // Newton's G for self-gravity (0 = no self-gravity)
+    gravity_poisson_iters: u32,  // Jacobi iterations per macro step
+    physics_flags:         u32,  // Bitfield: COOLING|GRAV_EXT|GRAV_SELF|COND|HALL|POSITIVITY|EMF_UPWIND
+    emf_mode:              u32,  // 0 = BS arithmetic mean, 1 = GS upwind
+    _pad_phys_0:           u32,
+    _pad_phys_1:           u32,
 };
+
+// Flag bits — keep in sync with FLAG_* constants in config.js.
+const FLAG_COOLING:      u32 = 1u << 0u;
+const FLAG_GRAVITY_EXT:  u32 = 1u << 1u;
+const FLAG_GRAVITY_SELF: u32 = 1u << 2u;
+const FLAG_CONDUCTION:   u32 = 1u << 3u;
+const FLAG_HALL:         u32 = 1u << 4u;
+const FLAG_POSITIVITY:   u32 = 1u << 5u;
+const FLAG_EMF_UPWIND:   u32 = 1u << 6u;
+
+fn flag_set(flags: u32, bit: u32) -> bool {
+    return (flags & bit) != 0u;
+}
 
 // Sweep-direction uniform — 16 B. Two of these (sweepDir_x = 0u,
 // sweepDir_y = 1u) are pre-written at construction; reconstruct-ppm and

@@ -415,6 +415,21 @@ export class PlasmaBuffers {
                  | GPUBufferUsage.COPY_SRC,
         });
 
+        // ── Self-gravity Poisson buffers (extended physics) ────────
+        // phi / phi_next form a Jacobi ping-pong for ∇²φ = 4πGρ.
+        // Same ghost-padded shape as cell-centered storage. Cleared at
+        // init and stays effectively zero until gravity_G > 0.
+        this.phi      = mkStorage('plasma.phi',      cellsT * F32_BYTES);
+        this.phi_next = mkStorage('plasma.phi_next', cellsT * F32_BYTES);
+        // rho_mean — single f32 holding ρ̄ for the periodic Poisson
+        // compatibility condition. (For the breadth pass we sample
+        // the center cell; a proper reduction is a follow-up.)
+        this.rho_mean = device.createBuffer({
+            label: 'plasma.rho_mean',
+            size:  16,  // 1 f32 padded to 16 B for alignment
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
         // ── Conservation diagnostics (Session 8) ───────────────────
         // Two-pass reduction: per-tile partials → final 7 scalars.
         // Sized for the per-axis tile count at the current resolution
@@ -581,29 +596,68 @@ export class PlasmaBuffers {
     pushUniforms({
         dx, gamma, viewMin, viewMax, gridN, viewMode, eta, cfl, pressureFloor,
         etaAnomAlpha, etaAnomJcrit,
+        // Extended physics (any subset; falls back to host cache):
+        hallDi, hallSubstepsMax,
+        coolingLambda0, coolingTFloor, coolingTRef,
+        conductionKappa, conductionIsoFrac, conductionSatFrac,
+        gravityGx, gravityGy, gravityG, gravityPoissonIters,
+        physicsFlags, emfMode,
     } = {}) {
         if (eta           !== undefined) this._eta           = eta;
         if (cfl           !== undefined) this._cfl           = cfl;
         if (pressureFloor !== undefined) this._pressureFloor = pressureFloor;
         if (etaAnomAlpha  !== undefined) this._etaAnomAlpha  = etaAnomAlpha;
         if (etaAnomJcrit  !== undefined) this._etaAnomJcrit  = etaAnomJcrit;
+        // Cache extended physics scalars (defaults: all OFF / 0).
+        if (hallDi              !== undefined) this._hallDi              = hallDi;
+        if (hallSubstepsMax     !== undefined) this._hallSubstepsMax     = hallSubstepsMax;
+        if (coolingLambda0      !== undefined) this._coolingLambda0      = coolingLambda0;
+        if (coolingTFloor       !== undefined) this._coolingTFloor       = coolingTFloor;
+        if (coolingTRef         !== undefined) this._coolingTRef         = coolingTRef;
+        if (conductionKappa     !== undefined) this._conductionKappa     = conductionKappa;
+        if (conductionIsoFrac   !== undefined) this._conductionIsoFrac   = conductionIsoFrac;
+        if (conductionSatFrac   !== undefined) this._conductionSatFrac   = conductionSatFrac;
+        if (gravityGx           !== undefined) this._gravityGx           = gravityGx;
+        if (gravityGy           !== undefined) this._gravityGy           = gravityGy;
+        if (gravityG            !== undefined) this._gravityG            = gravityG;
+        if (gravityPoissonIters !== undefined) this._gravityPoissonIters = gravityPoissonIters;
+        if (physicsFlags        !== undefined) this._physicsFlags        = physicsFlags;
+        if (emfMode             !== undefined) this._emfMode             = emfMode;
+        // ── Slots 0-15: original layout ────────────────────────────
         this.uniformF32[0] = dx;
         this.uniformF32[1] = gamma;
         this.uniformF32[2] = viewMin;
         this.uniformF32[3] = viewMax;
         this.uniformF32[4] = this._eta;
-        this.uniformF32[5] = (this._etaAnomAlpha ?? 0);  // anomalous-η α (slot 5)
+        this.uniformF32[5] = (this._etaAnomAlpha ?? 0);
         this.uniformF32[6] = 0; // _pad_lic_1
         this.uniformF32[7] = 0; // _pad_lic_2
         this.uniformU32[8]  = gridN >>> 0;
         this.uniformU32[9]  = (gridN + 2 * this.ghost) >>> 0;
         this.uniformU32[10] = this.ghost >>> 0;
-        this.uniformF32[11] = (this._pressureFloor ?? PRESSURE_FLOOR); // pressure_floor as f32
-        this.uniformF32[12] = (this._cfl ?? 0.4); // cfl as f32
+        this.uniformF32[11] = (this._pressureFloor ?? PRESSURE_FLOOR);
+        this.uniformF32[12] = (this._cfl ?? 0.4);
         this.uniformU32[13] = (viewMode ?? this._viewMode) >>> 0;
         if (viewMode !== undefined) this._viewMode = viewMode;
-        this.uniformF32[14] = (this._etaAnomJcrit ?? 10.0);  // anomalous-η J_crit (slot 14)
+        this.uniformF32[14] = (this._etaAnomJcrit ?? 10.0);
         this.uniformU32[15] = this.noise_n >>> 0;
+        // ── Slots 16-31: extended physics ──────────────────────────
+        this.uniformF32[16] = (this._hallDi              ?? 0);
+        this.uniformU32[17] = (this._hallSubstepsMax     ?? 8) >>> 0;
+        this.uniformF32[18] = (this._coolingLambda0      ?? 0);
+        this.uniformF32[19] = (this._coolingTFloor       ?? 1e-4);
+        this.uniformF32[20] = (this._coolingTRef         ?? 1.0);
+        this.uniformF32[21] = (this._conductionKappa     ?? 0);
+        this.uniformF32[22] = (this._conductionIsoFrac   ?? 0);
+        this.uniformF32[23] = (this._conductionSatFrac   ?? 0);
+        this.uniformF32[24] = (this._gravityGx           ?? 0);
+        this.uniformF32[25] = (this._gravityGy           ?? 0);
+        this.uniformF32[26] = (this._gravityG            ?? 0);
+        this.uniformU32[27] = (this._gravityPoissonIters ?? 30) >>> 0;
+        this.uniformU32[28] = (this._physicsFlags        ?? 0) >>> 0;
+        this.uniformU32[29] = (this._emfMode             ?? 0) >>> 0;
+        this.uniformU32[30] = 0;
+        this.uniformU32[31] = 0;
         this.device.queue.writeBuffer(this.uniform, 0, this.uniformHost);
     }
 
