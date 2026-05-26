@@ -24,7 +24,7 @@
  */
 
 import { readbackBatch, ReadbackPool } from './gpu/readback.js';
-import { GHOST_WIDTH } from './config.js';
+import { GHOST_WIDTH, DENSITY_FLOOR, DT_MIN } from './config.js';
 
 const SPARK_CAP = 240;
 
@@ -130,6 +130,22 @@ export class StatsDisplay {
         const maxV  = statRow('|v|_max');
         const maxJ  = statRow('|J_z|_max');
         this.root.append(maxB.row, maxV.row, maxJ.row);
+
+        // Health counters — the diagnostic page caught these first; keeping
+        // them in the main UI makes numerical death visible before the field
+        // view turns into a misleading color patch.
+        this.root.append(groupLabel('Health'));
+        const nanCells = statRow('Nonfinite cells');
+        const rhoFloor = statRow('ρ floor cells');
+        const pFloor   = statRow('p floor cells');
+        const dtMin    = statRow('dt min');
+        this.root.append(nanCells.row, rhoFloor.row, pFloor.row, dtMin.row);
+        this._healthRefs = {
+            nanCells: nanCells.value,
+            rhoFloor: rhoFloor.value,
+            pFloor: pFloor.value,
+            dtMin: dtMin.value,
+        };
 
         // ∇·B section
         this.root.append(groupLabel('Divergence'));
@@ -300,11 +316,14 @@ export class StatsDisplay {
         let bMagMax = 0, vMagMax = 0, jzMax = 0;
         let divBSq = 0;
         let nCells = 0;
+        let nanCount = 0, rhoFloorCount = 0, pFloorCount = 0;
+        const pFloor = this.sim.pressureFloor ?? 1e-6;
 
         for (let j = ghost; j < ghost + n; j++) {
             for (let i = ghost; i < ghost + n; i++) {
                 const idx = j * nT + i;
-                const rho = Math.max(U0[idx * 4 + 0], 1e-12);
+                const rhoRaw = U0[idx * 4 + 0];
+                const rho = Math.max(rhoRaw, DENSITY_FLOOR);
                 const mx  = U0[idx * 4 + 1];
                 const my  = U0[idx * 4 + 2];
                 const mz  = U0[idx * 4 + 3];
@@ -319,10 +338,19 @@ export class StatsDisplay {
                 const Bx = 0.5 * (bxL + bxR);
                 const By = 0.5 * (byD + byU);
 
+                if (![rhoRaw, mx, my, mz, E, Bz, Bx, By].every(Number.isFinite)) {
+                    nanCount += 1;
+                    continue;
+                }
+
+                if (rhoRaw <= 1.001 * DENSITY_FLOOR) rhoFloorCount += 1;
+
                 const vx = mx / rho, vy = my / rho, vz = mz / rho;
                 const ke = 0.5 * rho * (vx * vx + vy * vy + vz * vz);
                 const mb = 0.5 * (Bx * Bx + By * By + Bz * Bz);
-                const p  = Math.max(gammaM1 * (E - ke - mb), 1e-12);
+                const pRaw = gammaM1 * (E - ke - mb);
+                const p  = Math.max(pRaw, pFloor);
+                if (p <= 1.001 * pFloor) pFloorCount += 1;
 
                 Ekin += ke * cellArea;
                 Emag += mb * cellArea;
@@ -415,6 +443,14 @@ export class StatsDisplay {
 
         this._refs.divB.textContent = fmt(divBNorm);
         this._refs.rrate.textContent = (rrate >= 0 ? '+' : '') + rrate.toExponential(3);
+        this._healthRefs.nanCells.textContent = String(nanCount);
+        this._healthRefs.rhoFloor.textContent = String(rhoFloorCount);
+        this._healthRefs.pFloor.textContent = String(pFloorCount);
+        this._healthRefs.dtMin.textContent = dt <= 1.001 * DT_MIN ? 'yes' : 'no';
+        if (nanCount > 0 && this.sim.running) {
+            this.sim.setRunning(false);
+            console.warn(`[plasma.stats] paused after detecting ${nanCount} nonfinite cells`);
+        }
 
         this._refs.tStep.textContent = String(this.sim.stepCount);
         this._refs.tCfl.textContent  = dt.toExponential(3);

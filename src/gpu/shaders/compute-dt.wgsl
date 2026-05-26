@@ -5,7 +5,8 @@
 // to the uniform η_0) so the encoder can compute the RKL2 substep count
 // `s` from the parabolic CFL diagnostic:
 //
-//   dt_hyp        = CFL · dx / max(|v|+c_fast)    (CFL from U_uniforms.cfl)
+//   dt_hyp        = CFL · dx / ((|v_x|+c_fast,x) + (|v_y|+c_fast,y))
+//                                                   (CFL from U_uniforms.cfl)
 //   eta_max       = max over interior of η_local(|J|)
 //   dt_parabolic  = 0.5 · dx² / eta_max           (RKL2 forward-Euler bound)
 //   dt            = clamp(dt_hyp, [DT_MIN, DT_MAX])    ← hyperbolic only
@@ -95,7 +96,10 @@ fn reduce(
         let cfy = fast_mag_speed(P, U_uniforms.gamma, 1u, pf);
         let sx = abs(P.vx) + cfx;
         let sy = abs(P.vy) + cfy;
-        let s  = max(sx, sy);
+        // Unsplit 2D finite-volume CFL. The previous max(sx, sy) estimate
+        // is a 1D bound; diagonal waves and genuinely 2D MHD flows need the
+        // sum so the x and y flux updates cannot jointly overrun a cell.
+        let s  = sx + sy;
         let s_safe = select(0.0, s, s >= 0.0 && s == s);
         atomicMax(&tile_max_wave, bitcast<u32>(s_safe));
 

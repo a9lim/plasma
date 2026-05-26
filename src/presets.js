@@ -108,7 +108,7 @@ function fillCellGhostPeriodic(U0, U1, gamma, nT, ghost, nInterior,
 }
 
 /**
- * Sod shock tube. γ = 1.4, B ≡ 0, periodic BCs.
+ * Sod shock tube. γ = 1.4, B ≡ 0. Outflow in x, periodic transverse.
  */
 export function makeSodPreset(n = GRID_N) {
     const gamma = 1.4;
@@ -132,7 +132,7 @@ export function makeSodPreset(n = GRID_N) {
         eta: 0,
         bc: {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
-            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
         },
         data: { U0, U1, Bx_face, By_face },
         viewMin: 0.05, viewMax: 1.10, verifyTime: 0.2,
@@ -140,7 +140,7 @@ export function makeSodPreset(n = GRID_N) {
 }
 
 /**
- * Brio-Wu MHD shock tube. γ = 2, periodic BCs.
+ * Brio-Wu MHD shock tube. γ = 2. Outflow in x, periodic transverse.
  */
 export function makeBrioWuPreset(n = GRID_N) {
     const gamma = 2.0;
@@ -187,7 +187,7 @@ export function makeBrioWuPreset(n = GRID_N) {
         eta: 0,
         bc: {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
-            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
         },
         data: { U0, U1, Bx_face, By_face },
         viewMin: 0.05, viewMax: 1.10, verifyTime: 0.1,

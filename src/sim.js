@@ -54,7 +54,7 @@ import { VIRIDIS } from './colormaps.js';
 import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP,
     VIEW_JZ, ETA_DEFAULT, BC_PERIODIC, CFL, PRESSURE_FLOOR,
-    LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y,
+    LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, DT_MAX,
 } from './config.js';
 
 const WG = WORKGROUP;
@@ -107,6 +107,7 @@ export class Sim {
         this._lastSuperStepS   = 1;
         this._dtReadbackBusy   = false;
         this._dtReadbackPool   = null;  // lazy-init in init()
+        this._pendingTimeSteps = 0;
 
         // UI integration state — owned by Sim so save/load can capture it.
         this.running     = true;
@@ -203,6 +204,11 @@ export class Sim {
         this.buffers.uploadInitialState(preset.data);
         this.stepCount = 0;
         this.simTime   = 0;
+        this.lastDt    = 0;
+        this._lastDtHyp       = 1.0e-4;
+        this._lastDtParabolic = 1.0e30;
+        this._lastEtaMax      = 0;
+        this._pendingTimeSteps = 0;
         this._pushUniforms();
         this.buffers.pushBC(this.bcConfig);
     }
@@ -1070,13 +1076,14 @@ export class Sim {
 
         const N = this.n;
         const gResis    = Math.ceil((N + 3) / WG);
+        const gInterior = Math.ceil(N / WG);
         const gTotalP1  = Math.ceil((this.n_total + 1) / WG);
 
         // dst buffers — stage 3 wrote into the side's `next` slot
         // (before the post-step swap).
         const handles = (side === 'a')
-            ? { Bx: b.Bx_b, By: b.By_b, U1: b.U1_b }
-            : { Bx: b.Bx_a, By: b.By_a, U1: b.U1_a };
+            ? { U0: b.U0_b, Bx: b.Bx_b, By: b.By_b, U1: b.U1_b }
+            : { U0: b.U0_a, Bx: b.Bx_a, By: b.By_a, U1: b.U1_a };
 
         const initSet = { Bx: b.Bx_res_init,  By: b.By_res_init,  U1: b.U1_res_init  };
         const setA    = { Bx: b.Bx_res_pprev, By: b.By_res_pprev, U1: b.U1_res_pprev };
@@ -1102,10 +1109,9 @@ export class Sim {
         // for each stage by `_buildBindGroupCache` (line ~822) but never
         // dispatched after Session 8 retired the per-stage resistivity
         // triad — this restores the dispatch in its only remaining
-        // legitimate slot. Used only on Harris (the sole MIXED-BC preset)
-        // — for all-periodic presets, the dispatch is essentially a no-op
-        // since the ghosts under stage-3 dst already match periodic wrap
-        // by CT preservation.
+        // legitimate slot. It matters for mixed-BC presets (Harris plus
+        // the x-outflow shock tubes). For all-periodic presets, the dispatch
+        // is still cheap and keeps the post-step face convention explicit.
         {
             const bcPass = encoder.beginComputePass({ label: 'plasma.rkl2.applyBcsDst' });
             bcPass.setPipeline(pipelines.pipelines.applyBcs);
@@ -1191,7 +1197,45 @@ export class Sim {
         pass.setBindGroup(0, bgFinal);
         pass.dispatchWorkgroups(gResis, gResis, 1);
 
+        // RKL2 updates face B after the RK3-stage energy floor has already
+        // run. Clamp total energy once more against the post-diffusion B so
+        // the next primitive recovery cannot start with negative pressure in
+        // a cell where diffusion locally strengthened |B|.
+        pass.setPipeline(pipelines.pipelines.energyFloor);
+        pass.setBindGroup(0, this._energyFloorBG(handles.U0, handles.U1, handles.Bx, handles.By));
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
+
         pass.end();
+
+        // Canonicalize the destination ghosts/boundary faces after the
+        // resistive copy-back. This keeps post-step diagnostics, rendering,
+        // and the next step's source state on the same boundary convention
+        // instead of exposing RKL2's scratch-buffer ghost state for one frame.
+        {
+            const bcPass = encoder.beginComputePass({ label: 'plasma.rkl2.postApplyBcsDst' });
+            bcPass.setPipeline(pipelines.pipelines.applyBcs);
+            bcPass.setBindGroup(0, this._bgCache.stage3[side].applyBcsDst);
+            bcPass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+            bcPass.end();
+        }
+    }
+
+    _resistiveSizingBounds() {
+        const alpha = this.buffers?._etaAnomAlpha ?? 0;
+        if (this.eta <= 0 && alpha <= 0) {
+            return { dtSuper: 0, dtParabolic: 1.0e30 };
+        }
+        const etaMax = Math.max(this.eta || 0, this._lastEtaMax || 0);
+        const hostDtPar = etaMax > 1.0e-30
+            ? 0.25 * this.dx * this.dx / etaMax
+            : 1.0e30;
+        // RKL2's dispatch count is chosen on the CPU before the fresh GPU dt
+        // can be read back. Size for the shader-side upper bound instead of
+        // the previous-step dt so tight render loops cannot under-substep.
+        return {
+            dtSuper: DT_MAX,
+            dtParabolic: Math.min(this._lastDtParabolic, hostDtPar),
+        };
     }
 
     step() {
@@ -1230,14 +1274,15 @@ export class Sim {
 
         // Pass 3 (Session 8): RKL2 super-step for resistive diffusion.
         // Runs ON the side's stage-3 dst buffers (which alias U_next
-        // before the swap). Substep count `s` is sized from the
-        // PREVIOUS step's dt_hyp / dt_parabolic — readback is one-step
-        // lagged to avoid stalling the encode chain. Skipped entirely
-        // at η = 0 AND α = 0.
+        // before the swap). Substep count `s` is conservatively sized from
+        // the shader-side dt upper bound plus the best host eta bound, so
+        // fresh GPU dt feedback cannot under-substep a tight render loop.
+        // Skipped entirely at η = 0 AND α = 0.
+        const rkl2Bounds = this._resistiveSizingBounds();
         this._encodeResistivitySuperStep(
             encoder, side,
-            this._lastDtHyp,
-            this._lastDtParabolic,
+            rkl2Bounds.dtSuper,
+            rkl2Bounds.dtParabolic,
         );
 
         // Pass 4: conservation diagnostics reduction over the just-
@@ -1271,9 +1316,10 @@ export class Sim {
         device.queue.submit([encoder.finish()]);
 
         // Kick off async readback of dt_buf (dt_hyp, dt_parabolic,
-        // eta_max). Used by the next step's RKL2 substep-count sizing
-        // — one-step lag is acceptable since dt evolves slowly. Skip if
-        // a previous readback is still in-flight.
+        // eta_max). Used for diagnostics, approximate physical-time
+        // accounting, and anomalous-eta sizing hints. Skip if a previous
+        // readback is still in-flight.
+        this._pendingTimeSteps += 1;
         this._maybeReadbackDt();
 
         b.swap();
@@ -1300,7 +1346,16 @@ export class Sim {
                       this.buffers.dt, 0, 12)
             .then(ab => {
                 const arr = new Float32Array(ab);
-                if (Number.isFinite(arr[0]) && arr[0] > 0) this._lastDtHyp = arr[0];
+                const pending = this._pendingTimeSteps;
+                if (Number.isFinite(arr[0]) && arr[0] > 0) {
+                    this._lastDtHyp = arr[0];
+                    this.lastDt = arr[0];
+                    if (pending > 0) this.simTime += arr[0] * pending;
+                    this._pendingTimeSteps = 0;
+                } else if (pending > 0 && Number.isFinite(this._lastDtHyp) && this._lastDtHyp > 0) {
+                    this.simTime += this._lastDtHyp * pending;
+                    this._pendingTimeSteps = 0;
+                }
                 if (Number.isFinite(arr[1]) && arr[1] > 0) this._lastDtParabolic = arr[1];
                 if (Number.isFinite(arr[2])) this._lastEtaMax = arr[2];
             })

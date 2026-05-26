@@ -21,7 +21,7 @@ import { setupUI } from './src/ui.js';
 
 // ── Fixed-timestep config (mirrors geon's accumulator pattern) ──
 const PHYSICS_DT     = 1 / 128;   // seconds per physics substep
-const MAX_SUBSTEPS   = 32;        // hard cap per frame to avoid death spiral
+const MAX_SUBSTEPS   = 8;         // hard cap per frame to avoid stale-dt bursts
 const MAX_FRAME_DT   = 1 / 16;    // clamp huge frame deltas (tab refocus, etc.)
 const ACCUMULATOR_CAP = PHYSICS_DT * MAX_SUBSTEPS;
 

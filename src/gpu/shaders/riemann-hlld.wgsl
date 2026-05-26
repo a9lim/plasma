@@ -83,6 +83,18 @@
 const HLLD_BX_EPS2: f32 = 1.0e-10;
 const HLLD_WS_TOL:  f32 = 1.0e-8;
 
+fn finite_hlld(x: f32) -> bool {
+    return (x == x) && (abs(x) < 1.0e30);
+}
+
+fn star_state_ok(rho: f32, E: f32) -> bool {
+    return finite_hlld(rho) && finite_hlld(E) && rho > DENSITY_FLOOR && E > 0.0;
+}
+
+fn same_conserved_cell(a: u32, b: u32) -> bool {
+    return all(U0_in[a] == U0_in[b]) && all(U1_in[a] == U1_in[b]);
+}
+
 fn unpack_edge_prim(edge0: vec4<f32>, edge1: vec4<f32>, b_normal: f32, axis: u32, p_floor: f32) -> MhdPrim {
     var Q: MhdPrim;
     Q.rho = max(edge0.x, DENSITY_FLOOR);
@@ -303,8 +315,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let pf = U_uniforms.pressure_floor;
-    let QL = unpack_edge_prim(edge_r_0[idx_l], edge_r_1[idx_l], b_normal, axis, pf);
-    let QR = unpack_edge_prim(edge_l_0[idx_r], edge_l_1[idx_r], b_normal, axis, pf);
+    // Periodic boundary faces should pair the two wrapped INTERIOR
+    // parabolas, not the piecewise-constant reconstruction of the outer
+    // ghost cell. `apply-bcs` copies periodic ghosts bit-for-bit from the
+    // wrapped interior, so exact conserved-state equality is a cheap local
+    // detector that avoids adding another storage binding for BcUniforms.
+    var edge_l_src = idx_l;
+    var edge_r_src = idx_r;
+    if (axis == 0u) {
+        if (ix == ghost) {
+            let wrap_l = cell_idx_total(ghost + n_interior - 1u, iy, n_total);
+            if (same_conserved_cell(idx_l, wrap_l)) { edge_l_src = wrap_l; }
+        }
+        if (ix == ghost + n_interior) {
+            let wrap_r = cell_idx_total(ghost, iy, n_total);
+            if (same_conserved_cell(idx_r, wrap_r)) { edge_r_src = wrap_r; }
+        }
+    } else {
+        if (iy == ghost) {
+            let wrap_l = cell_idx_total(ix, ghost + n_interior - 1u, n_total);
+            if (same_conserved_cell(idx_l, wrap_l)) { edge_l_src = wrap_l; }
+        }
+        if (iy == ghost + n_interior) {
+            let wrap_r = cell_idx_total(ix, ghost, n_total);
+            if (same_conserved_cell(idx_r, wrap_r)) { edge_r_src = wrap_r; }
+        }
+    }
+
+    let QL = unpack_edge_prim(edge_r_0[edge_l_src], edge_r_1[edge_l_src], b_normal, axis, pf);
+    let QR = unpack_edge_prim(edge_l_0[edge_r_src], edge_l_1[edge_r_src], b_normal, axis, pf);
 
     let AL = prim_to_axis_state(QL, axis, g);
     let AR = prim_to_axis_state(QR, axis, g);
@@ -401,6 +440,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let E_Ls = ((SL - AL.un) * AL.E - AL.pT * AL.un + pT_star * SM) / (SL - SM);
         let E_Rs = ((SR - AR.un) * AR.E - AR.pT * AR.un + pT_star * SM) / (SR - SM);
+        if (!(star_state_ok(rhoLs, E_Ls) && star_state_ok(rhoRs, E_Rs))) {
+            var hin: HllInputs;
+            hin.QL = QL; hin.QR = QR;
+            hin.AL = AL; hin.AR = AR;
+            hin.FL = FL; hin.FR = FR;
+            hin.SL = SL; hin.SR = SR;
+            let h = hll_flux_mhd(hin, axis, g);
+            flux_0[dst] = h.f0;
+            flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, SM_face);
+            return;
+        }
         var Fout: AxisFlux;
         if (SM >= 0.0) {
             Fout.f_rho = FL.f_rho + SL * (rhoLs                - AL.rho);
@@ -459,6 +509,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let E_Rs = ((SR - AR.un) * AR.E - AR.pT * AR.un + pT_star * SM
                + b_normal * (vdotb_R - vdotbRs)) / (SR - SM);
 
+    if (!(finite_hlld(pT_star)
+       && abs(denomL_raw) > 1.0e-20
+       && abs(denomR_raw) > 1.0e-20
+       && star_state_ok(rhoLs, E_Ls)
+       && star_state_ok(rhoRs, E_Rs))) {
+        var hin: HllInputs;
+        hin.QL = QL; hin.QR = QR;
+        hin.AL = AL; hin.AR = AR;
+        hin.FL = FL; hin.FR = FR;
+        hin.SL = SL; hin.SR = SR;
+        let h = hll_flux_mhd(hin, axis, g);
+        flux_0[dst] = h.f0;
+        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, SM_face);
+        return;
+    }
+
     let absBn = abs(b_normal);
     let SLs = SM - absBn / sqrt(max(rhoLs, DENSITY_FLOOR));
     let SRs = SM + absBn / sqrt(max(rhoRs, DENSITY_FLOOR));
@@ -476,6 +542,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vdotb_ss = SM * b_normal + ut1_ss * bt1_ss + ut2_ss * bt2_ss;
     let E_Lss = E_Ls - srL * sgnBn * (vdotbLs - vdotb_ss);
     let E_Rss = E_Rs + srR * sgnBn * (vdotbRs - vdotb_ss);
+
+    if (!(star_state_ok(rhoLs, E_Lss) && star_state_ok(rhoRs, E_Rss))) {
+        var hin: HllInputs;
+        hin.QL = QL; hin.QR = QR;
+        hin.AL = AL; hin.AR = AR;
+        hin.FL = FL; hin.FR = FR;
+        hin.SL = SL; hin.SR = SR;
+        let h = hll_flux_mhd(hin, axis, g);
+        flux_0[dst] = h.f0;
+        flux_1[dst] = vec4<f32>(h.f1.x, h.f1.y, h.fBt1, SM_face);
+        return;
+    }
 
     var Fout: AxisFlux;
     if (SLs >= 0.0) {
