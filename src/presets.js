@@ -528,10 +528,101 @@ export function makeAlfvenCpawPreset(n = GRID_N) {
     };
 }
 
+/**
+ * Linear acoustic wave — pure hydro convergence test (B ≡ 0).
+ *
+ * Smooth periodic 1D acoustic wave on a 2D periodic domain. Used to
+ * isolate Euler-side convergence behavior from MHD-only paths (HLLD full
+ * 5-wave, BS-only EMF, CT face-B update). If CPAW (MHD) shows degraded
+ * order but this test recovers textbook order, the bug is MHD-specific.
+ *
+ *  ── Setup ─────────────────────────────────────────────────────────────
+ *  Domain          : [0, 1]² square, all periodic BCs.
+ *  Background      : ρ₀ = 1, p₀ = 1, v = 0, B = 0.  γ = 5/3.
+ *                    Sound speed c_s = √(γ p₀/ρ₀) = √(5/3) ≈ 1.2910.
+ *  Wave direction  : axis-aligned, +x. Wavelength λ = 1 (one wave fits
+ *                    in the box along x); axis-aligned is simpler than
+ *                    the tilted CPAW geometry — we already know tilt
+ *                    doesn't move the slope much, and axis-aligned makes
+ *                    the comparison to the CPAW slope cleaner.
+ *  Amplitude       : A = 1e-3. Smaller than CPAW's 0.1 to stay deeply
+ *                    linear — hydro acoustic waves steepen into N-waves
+ *                    much faster than Alfvén waves (Riemann invariant
+ *                    J+ = v + 2c/(γ-1) goes nonlinear at amplitude ~ε³
+ *                    for ε = A/p₀).
+ *  Perturbation    : right-going linear acoustic mode (Riemann invariant
+ *                    J+ constant; J- carries the perturbation):
+ *                       ρ' = A · sin(2π x / λ)
+ *                       v_x' = c_s · A / ρ₀ · sin(2π x / λ)
+ *                            = c_s · A · sin(2π x / λ)
+ *                       p' = c_s² · A · sin(2π x / λ)
+ *                       v_y' = v_z' = 0
+ *                       B = 0
+ *  Period          : T = λ / c_s = 1/√(5/3) = √(3/5) ≈ 0.7746.
+ *  Analytic at t=T : same as IC (returned to start by periodicity).
+ *
+ *  ── Why this isolates Euler ───────────────────────────────────────────
+ *  B = 0 everywhere → face B = 0 → cell B = 0. HLLD Branch A's
+ *  Bn²-comparison degenerates (Bn = 0 trivially), falling into HLLC.
+ *  Compute-EMF reads cell-centered vy·Bx - vx·By = 0 and face Bx/By = 0,
+ *  so Ez_corner = 0; the CT face-B update writes 0 - 0 = 0. The only
+ *  active path is: PPM → HLLC → update-conserved-weighted → energy floor.
+ */
+export function makeAcousticWaveHydroPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L     = 1.0;
+    const dx    = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0   = 1.0;
+    const p0     = 1.0;
+    const A      = 1e-3;
+    const lambda = 1.0;
+    const cs     = Math.sqrt(gamma * p0 / rho0);  // ≈ 1.2910
+    const TWO_PI = 2.0 * Math.PI;
+    const k      = TWO_PI / lambda;
+    const verifyTime = lambda / cs;               // T = √(3/5) ≈ 0.7746
+
+    const xCellOf = (i) => (i - ghost + 0.5) * dx;
+
+    // Cell-centered primitives. B ≡ 0 everywhere.
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            const x   = xCellOf(i);
+            const s   = Math.sin(k * x);
+            const rho = rho0 + A * s;
+            const vx  = cs * A * s;
+            const p   = p0 + cs * cs * A * s;
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho, vx, 0, 0, p, 0, 0, 0, gamma);
+        }
+    }
+
+    // Face B already zero from Float32Array init — explicit no-op.
+
+    return {
+        id: 'acoustic-wave-hydro', label: 'Linear acoustic wave (hydro)',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        // ρ ranges 1 ± A → bracket the background tightly.
+        viewMin: rho0 - 2 * A, viewMax: rho0 + 2 * A,
+        verifyTime,
+        // Convergence-test metadata for tests/acoustic-convergence.html.
+        acoustic: { A, lambda, cs, rho0, p0, gamma },
+    };
+}
+
 export const PRESETS = {
     sod: makeSodPreset,
     'brio-wu': makeBrioWuPreset,
     'orszag-tang': makeOrszagTangPreset,
     'harris': makeHarrisPreset,
     'alfven-cpaw': makeAlfvenCpawPreset,
+    'acoustic-wave-hydro': makeAcousticWaveHydroPreset,
 };
