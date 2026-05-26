@@ -14,7 +14,10 @@ Implementation plan (source of truth for design decisions):
 `~/.claude/plans/geon-currently-uses-cpu-abstract-cat.md`.
 
 **Status**: Phases 1–6 complete (engine + UI + LIC). Phases 7–8 (polish
-+ parent-repo wiring) outstanding — see `HANDOFF.md`.
++ parent-repo wiring) outstanding — see [`docs/HANDOFF.md`](docs/HANDOFF.md).
+Per-session retrospectives live in [`docs/sessions/`](docs/sessions/);
+comments in code and shaders that say "Session N" point at
+`docs/sessions/session-N.md`.
 
 ## Design
 
@@ -22,7 +25,7 @@ Implementation plan (source of truth for design decisions):
 - **Riemann solver**: HLLD (Miyoshi & Kusano 2005) with HLLC and HLL fallbacks for degenerate branches
 - **Reconstruction**: PPM (Colella & Woodward 1984) with characteristic-variable limiting (Stone+ 2008 §3.4.2 — Athena/Athena++ default for MHD)
 - **Time integration**: RK3 SSP, three stages, single-submit-per-step
-- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008), Balsara-Spicer 1999 arithmetic-mean corner EMF (the Gardiner-Stone 2005 upwind attempt was reverted Session 8 — see HANDOFF.md; upwind machinery in shader stays for re-implementation)
+- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008), Balsara-Spicer 1999 arithmetic-mean corner EMF (the Gardiner-Stone 2005 upwind attempt was reverted Session 8 — see [`docs/sessions/session-8.md`](docs/sessions/session-8.md); upwind machinery in shader stays for re-implementation)
 - **Resistivity**: curl(η J) form (Athena++/PLUTO canonical) — ∂Bx/∂t |_res = −∂_y(η J_z), ∂By/∂t |_res = +∂_x(η J_z), ∂Bz/∂t |_res = η ∇²Bz. J_z and η are sampled at corners (co-located with Ez_edge); curl form is identically ∇·B-preserving on the Yee grid by the same telescoping argument as ideal-MHD CT. RKL2 super-time-stepping applied after the RK3 hyperbolic step (Lie split, 1st order)
 - **Boundaries**: per-edge selectable — periodic / outflow / reflecting / driven
 - **Default view**: J_z (out-of-plane current density)
@@ -41,7 +44,7 @@ plasma/
 ├── colors.js               ← _PALETTE extensions, frozen at startup
 ├── about.md                ← educational content (stub — Phase 7)
 ├── AGENTS.md               ← this file
-├── HANDOFF.md              ← next-step doc for the next instance / agent
+├── docs/                   ← HANDOFF (forward-looking) + sessions/ (retros)
 ├── LICENSE                 ← AGPL-3.0
 ├── tests/                  ← convergence tests (Session 8): alfven-convergence.html (CPAW), acoustic-convergence.html (linear acoustic), README.md
 └── src/
@@ -336,7 +339,8 @@ Resolution-adaptive cadence: 12 Hz at 256², 6 Hz at 512², 3 Hz at
 
 `setPreset(name)`, `setBC(edge, mode)`, `setDrivenState(partial)`,
 `setEta(eta)`, `setViewMode(mode)`, `setCFL(cfl)` (uniform-only —
-see HANDOFF for the shader-wiring gap), `setGamma(g)`,
+see [`docs/HANDOFF.md`](docs/HANDOFF.md) for the shader-wiring gap),
+`setGamma(g)`,
 `setPressureFloor(p)` (uniform-only — same gap), `setRunning(r)`,
 `step()` (single step), `setSpeedScale(s)`, `setResolution(n)`,
 `saveState()` → `loadState(s)` (JSON, parameters only; no buffer
