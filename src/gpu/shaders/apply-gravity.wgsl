@@ -34,6 +34,12 @@ struct DtUniform {
 @group(0) @binding(3) var<storage, read>       phi:        array<f32>;
 @group(0) @binding(4) var<uniform>             dt_buf:     DtUniform;
 
+fn phi_at(gx: u32, gy: u32, n_interior: u32, n_total: u32, ghost: u32) -> f32 {
+    let ix = ghost + (gx % n_interior);
+    let iy = ghost + (gy % n_interior);
+    return phi[cell_idx_total(ix, iy, n_total)];
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let flags = U_uniforms.physics_flags;
@@ -63,20 +69,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         gy = gy + U_uniforms.gravity_gy;
     }
     if (do_self) {
-        // g = -∇φ. Periodic central differences on the cell-centered
-        // potential; the Poisson solve stores only interior φ values and
-        // does not rely on ghost cells.
+        // g = -∇φ. Fourth-order periodic central differences on the
+        // cell-centered potential. This is still cheap, but it substantially
+        // reduces the force-phase error in smooth Jeans-mode tests compared
+        // with the 2-point stencil, without changing the Jacobi buffer
+        // topology or relying on φ ghost cells.
         let dx = U_uniforms.dx;
-        let gx_l = (gid.x + n_interior - 1u) % n_interior;
-        let gx_r = (gid.x + 1u) % n_interior;
-        let gy_d = (gid.y + n_interior - 1u) % n_interior;
-        let gy_u = (gid.y + 1u) % n_interior;
-        let phi_l = phi[cell_idx_total(ghost + gx_l, iy,             n_total)];
-        let phi_r = phi[cell_idx_total(ghost + gx_r, iy,             n_total)];
-        let phi_d = phi[cell_idx_total(ix,             ghost + gy_d, n_total)];
-        let phi_u = phi[cell_idx_total(ix,             ghost + gy_u, n_total)];
-        gx = gx - (phi_r - phi_l) / (2.0 * dx);
-        gy = gy - (phi_u - phi_d) / (2.0 * dx);
+        let gx_m2 = (gid.x + n_interior - 2u) % n_interior;
+        let gx_m1 = (gid.x + n_interior - 1u) % n_interior;
+        let gx_p1 = (gid.x + 1u) % n_interior;
+        let gx_p2 = (gid.x + 2u) % n_interior;
+        let gy_m2 = (gid.y + n_interior - 2u) % n_interior;
+        let gy_m1 = (gid.y + n_interior - 1u) % n_interior;
+        let gy_p1 = (gid.y + 1u) % n_interior;
+        let gy_p2 = (gid.y + 2u) % n_interior;
+        let dphi_dx = (-phi_at(gx_p2, gid.y, n_interior, n_total, ghost)
+                       + 8.0 * phi_at(gx_p1, gid.y, n_interior, n_total, ghost)
+                       - 8.0 * phi_at(gx_m1, gid.y, n_interior, n_total, ghost)
+                       + phi_at(gx_m2, gid.y, n_interior, n_total, ghost)) / (12.0 * dx);
+        let dphi_dy = (-phi_at(gid.x, gy_p2, n_interior, n_total, ghost)
+                       + 8.0 * phi_at(gid.x, gy_p1, n_interior, n_total, ghost)
+                       - 8.0 * phi_at(gid.x, gy_m1, n_interior, n_total, ghost)
+                       + phi_at(gid.x, gy_m2, n_interior, n_total, ghost)) / (12.0 * dx);
+        gx = gx - dphi_dx;
+        gy = gy - dphi_dy;
     }
 
     let dt = dt_buf.dt;

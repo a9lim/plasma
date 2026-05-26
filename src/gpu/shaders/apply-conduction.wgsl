@@ -3,7 +3,7 @@
 // Spitzer-Härm 1953 — restricted to the parallel-only piece for the
 // breadth pass; cross-field κ_⊥ is exposed via conduction_iso_frac).
 //
-//   dE/dt |_cond  =  ∇ · q
+//   dE/dt |_cond  =  −∇ · q
 //
 // with the heat flux
 //
@@ -73,6 +73,17 @@ fn cell_by(ix: u32, iy: u32, n_total: u32) -> f32 {
                 + By_face[by_face_idx(ix, iy + 1u, n_total)]);
 }
 
+fn heat_flux_sat_factor(qx: f32, qy: f32, rho_face: f32, T_face: f32, gamma: f32) -> f32 {
+    let phi_sat = U_uniforms.conduction_sat_frac;
+    if (phi_sat <= 0.0) { return 1.0; }
+
+    // Cowie-McKee saturated flux in code units. Since T = p/ρ, c_s² = γT.
+    let cs = sqrt(max(gamma * T_face, 0.0));
+    let q_sat = max(phi_sat * max(rho_face, DENSITY_FLOOR) * cs * cs * cs, 1.0e-30);
+    let q_mag = sqrt(max(qx*qx + qy*qy, 0.0));
+    return 1.0 / sqrt(1.0 + (q_mag / q_sat) * (q_mag / q_sat));
+}
+
 // Compute the x-component of q at the LEFT face of cell (ix, iy) —
 // i.e., at the face shared with cell (ix-1, iy).
 fn q_x_face(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
@@ -105,8 +116,13 @@ fn q_x_face(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
     let byh = by_face / b_mag;
     let b_dot_gT = bxh * dTdx + byh * dTdy;
 
-    // q_x = κ_∥ ( (1-f) bx̂ (b̂·∇T)  +  f ∂T/∂x )
-    return -kappa * ((1.0 - f_iso) * bxh * b_dot_gT + f_iso * dTdx);
+    let qx_raw = -kappa * ((1.0 - f_iso) * bxh * b_dot_gT + f_iso * dTdx);
+    let qy_raw = -kappa * ((1.0 - f_iso) * byh * b_dot_gT + f_iso * dTdy);
+    let rho_l = max(U0[cell_idx_total(ix - 1u, iy, n_total)].x, DENSITY_FLOOR);
+    let rho_r = max(U0[cell_idx_total(ix,      iy, n_total)].x, DENSITY_FLOOR);
+    let rho_face = 0.5 * (rho_l + rho_r);
+    let T_face = max(0.5 * (T_l + T_r), 0.0);
+    return qx_raw * heat_flux_sat_factor(qx_raw, qy_raw, rho_face, T_face, gamma);
 }
 
 // Symmetric for the BOTTOM face — q_y.
@@ -137,7 +153,13 @@ fn q_y_face(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
     let byh = by_face / b_mag;
     let b_dot_gT = bxh * dTdx + byh * dTdy;
 
-    return -kappa * ((1.0 - f_iso) * byh * b_dot_gT + f_iso * dTdy);
+    let qx_raw = -kappa * ((1.0 - f_iso) * bxh * b_dot_gT + f_iso * dTdx);
+    let qy_raw = -kappa * ((1.0 - f_iso) * byh * b_dot_gT + f_iso * dTdy);
+    let rho_d = max(U0[cell_idx_total(ix, iy - 1u, n_total)].x, DENSITY_FLOOR);
+    let rho_u = max(U0[cell_idx_total(ix, iy,      n_total)].x, DENSITY_FLOOR);
+    let rho_face = 0.5 * (rho_d + rho_u);
+    let T_face = max(0.5 * (T_d + T_u), 0.0);
+    return qy_raw * heat_flux_sat_factor(qx_raw, qy_raw, rho_face, T_face, gamma);
 }
 
 @compute @workgroup_size(8, 8, 1)

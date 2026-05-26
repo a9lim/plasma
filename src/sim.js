@@ -57,7 +57,7 @@ import {
     LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, DT_MAX,
     FLAG_GRAVITY_SELF, FLAG_HALL, FLAG_CONDUCTION,
     BASE_PHYSICS_FLAGS, EXTENDED_SOURCE_FLAGS,
-    EMF_MODE_GS_UPWIND,
+    EMF_MODE_GS_UPWIND, COOLING_CURVE_TABLE,
 } from './config.js';
 
 const WG = WORKGROUP;
@@ -69,6 +69,7 @@ const DEFAULT_PHYSICS_STATE = Object.freeze({
     coolingLambda0: 0.01,
     coolingTFloor: 1.0e-4,
     coolingTRef: 1.0,
+    coolingCurveMode: COOLING_CURVE_TABLE,
     conductionKappa: 1.0e-3,
     conductionIsoFrac: 0.1,
     conductionSatFrac: 0.0,
@@ -76,6 +77,7 @@ const DEFAULT_PHYSICS_STATE = Object.freeze({
     gravityGy: 0.0,
     gravityG: 1.0e-3,
     gravityPoissonIters: 30,
+    hallElectronPressureFrac: 0.0,
 });
 
 export class Sim {
@@ -222,6 +224,7 @@ export class Sim {
         if (physics.coolingLambda0 !== undefined)      this.coolingLambda0 = Math.max(0, +physics.coolingLambda0 || 0);
         if (physics.coolingTFloor !== undefined)       this.coolingTFloor = Math.max(0, +physics.coolingTFloor || 0);
         if (physics.coolingTRef !== undefined)         this.coolingTRef = Math.max(1e-30, +physics.coolingTRef || 1);
+        if (physics.coolingCurveMode !== undefined)    this.coolingCurveMode = Math.max(0, physics.coolingCurveMode | 0);
         if (physics.conductionKappa !== undefined)     this.conductionKappa = Math.max(0, +physics.conductionKappa || 0);
         if (physics.conductionIsoFrac !== undefined)   this.conductionIsoFrac = Math.min(1, Math.max(0, +physics.conductionIsoFrac || 0));
         if (physics.conductionSatFrac !== undefined)   this.conductionSatFrac = Math.max(0, +physics.conductionSatFrac || 0);
@@ -229,6 +232,9 @@ export class Sim {
         if (physics.gravityGy !== undefined)           this.gravityGy = +physics.gravityGy || 0;
         if (physics.gravityG !== undefined)            this.gravityG = Math.max(0, +physics.gravityG || 0);
         if (physics.gravityPoissonIters !== undefined) this.gravityPoissonIters = Math.max(0, physics.gravityPoissonIters | 0);
+        if (physics.hallElectronPressureFrac !== undefined) {
+            this.hallElectronPressureFrac = Math.min(1, Math.max(0, +physics.hallElectronPressureFrac || 0));
+        }
     }
 
     loadPreset(preset) {
@@ -388,9 +394,11 @@ export class Sim {
     setCoolingLambda0(v)         { this.coolingLambda0 = Math.max(0, +v || 0); this._pushUniforms(); }
     setCoolingTFloor(v)          { this.coolingTFloor = Math.max(0, +v || 0); this._pushUniforms(); }
     setCoolingTRef(v)            { this.coolingTRef = Math.max(1e-30, +v || 1); this._pushUniforms(); }
+    setCoolingCurveMode(mode)    { this.coolingCurveMode = Math.max(0, mode | 0); this._pushUniforms(); }
     setConductionKappa(v)        { this.conductionKappa = Math.max(0, +v || 0); this._pushUniforms(); }
     setConductionIsoFrac(v)      { this.conductionIsoFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
     setConductionSatFrac(v)      { this.conductionSatFrac = Math.max(0, +v || 0); this._pushUniforms(); }
+    setHallElectronPressureFrac(v) { this.hallElectronPressureFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
     setGravityG(v)               { this.gravityG = Math.max(0, +v || 0); this._pushUniforms(); }
     setGravityVec(gx, gy)        { this.gravityGx = +gx || 0; this.gravityGy = +gy || 0; this._pushUniforms(); }
     setGravityPoissonIters(n)    { this.gravityPoissonIters = Math.max(0, n | 0); this._pushUniforms(); }
@@ -477,6 +485,7 @@ export class Sim {
                 coolingLambda0: this.coolingLambda0,
                 coolingTFloor: this.coolingTFloor,
                 coolingTRef: this.coolingTRef,
+                coolingCurveMode: this.coolingCurveMode,
                 conductionKappa: this.conductionKappa,
                 conductionIsoFrac: this.conductionIsoFrac,
                 conductionSatFrac: this.conductionSatFrac,
@@ -484,6 +493,7 @@ export class Sim {
                 gravityGy: this.gravityGy,
                 gravityG: this.gravityG,
                 gravityPoissonIters: this.gravityPoissonIters,
+                hallElectronPressureFrac: this.hallElectronPressureFrac,
             },
         });
     }
@@ -534,6 +544,7 @@ export class Sim {
             coolingLambda0:      this.coolingLambda0,
             coolingTFloor:       this.coolingTFloor,
             coolingTRef:         this.coolingTRef,
+            coolingCurveMode:    this.coolingCurveMode,
             conductionKappa:     this.conductionKappa,
             conductionIsoFrac:   this.conductionIsoFrac,
             conductionSatFrac:   this.conductionSatFrac,
@@ -541,6 +552,7 @@ export class Sim {
             gravityGy:           this.gravityGy,
             gravityG:            this.gravityG,
             gravityPoissonIters: this.gravityPoissonIters,
+            hallElectronPressureFrac: this.hallElectronPressureFrac,
             physicsFlags:        this.physicsFlags,
             emfMode:             this.emfMode,
         });

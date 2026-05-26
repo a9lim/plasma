@@ -96,7 +96,7 @@
 // ── γ & floors ──────────────────────────────────────────────────────
 // γ comes from the Uniforms; pressure & density floors match config.js.
 
-// Main physics-state Uniforms (64 B). Written when a physics parameter
+// Main physics-state Uniforms (128 B). Written when a physics parameter
 // changes (preset/eta/cfl/gamma/view_mode/resolution/pressure_floor). Slots
 // 6,7,14 are reserved (previously held LIC fields — now in a separate
 // LicUniforms buffer rewritten per render frame). Slot 5 was reclaimed
@@ -141,10 +141,10 @@ struct Uniforms {
     gravity_gy:            f32,  // External gravity y (constant; e.g., -1 for "down")
     gravity_G:             f32,  // Newton's G for self-gravity (0 = no self-gravity)
     gravity_poisson_iters: u32,  // Jacobi iterations per macro step
-    physics_flags:         u32,  // Bitfield: COOLING|GRAV_EXT|GRAV_SELF|COND|HALL|POSITIVITY|EMF_UPWIND
-    emf_mode:              u32,  // 0 = BS arithmetic mean, 1 = GS upwind
-    _pad_phys_0:           u32,
-    _pad_phys_1:           u32,
+    physics_flags:               u32,  // Bitfield: COOLING|GRAV_EXT|GRAV_SELF|COND|HALL|POSITIVITY|EMF_UPWIND
+    emf_mode:                    u32,  // 0 = BS arithmetic mean, 1 = GS upwind
+    cooling_curve_mode:          u32,  // 0 = √T brems, 1 = piecewise power-law table
+    hall_electron_pressure_frac: f32,  // p_e / p for generalized Ohm's law pressure term
 };
 
 // Flag bits — keep in sync with FLAG_* constants in config.js.

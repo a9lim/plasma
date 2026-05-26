@@ -65,6 +65,15 @@ fn cell_temp(ix: u32, iy: u32, n_total: u32) -> f32 {
     return p / rho;
 }
 
+fn heat_flux_sat_factor_view(qx: f32, qy: f32, rho: f32, T: f32) -> f32 {
+    let phi_sat = U_uniforms.conduction_sat_frac;
+    if (phi_sat <= 0.0) { return 1.0; }
+    let cs = sqrt(max(U_uniforms.gamma * T, 0.0));
+    let q_sat = max(phi_sat * max(rho, DENSITY_FLOOR) * cs * cs * cs, 1.0e-30);
+    let q_mag = sqrt(max(qx*qx + qy*qy, 0.0));
+    return 1.0 / sqrt(1.0 + (q_mag / q_sat) * (q_mag / q_sat));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_interior = U_uniforms.grid_n;
@@ -138,8 +147,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let qpar_y = kappa_par * bhat_y * b_dot_gradT;
         let qperp_x = kappa_per * (dTx - bhat_x * b_dot_gradT);
         let qperp_y = kappa_per * (dTy - bhat_y * b_dot_gradT);
-        let qx = -(qpar_x + qperp_x);  // q = -κ ∇T form
-        let qy = -(qpar_y + qperp_y);
+        var qx = -(qpar_x + qperp_x);  // q = -κ ∇T form
+        var qy = -(qpar_y + qperp_y);
+        let sat = heat_flux_sat_factor_view(qx, qy, rho, cell_temp(ix, iy, n_total));
+        qx = qx * sat;
+        qy = qy * sat;
         v = sqrt(qx*qx + qy*qy);
     } else {
         // φ — Poisson potential. Reads the canonical phi buffer; with

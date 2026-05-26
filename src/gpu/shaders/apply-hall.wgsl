@@ -1,7 +1,7 @@
 // ─── apply-hall.wgsl ──────────────────────────────────────────────────
 // Hall MHD correction to the induction equation:
 //
-//   E_H = (d_i / ρ) · (J × B)
+//   E_H = (d_i / ρ) · (J × B − ∇p_e)
 //   ∂B/∂t |_hall = -∇ × E_H
 //
 // The implementation is deliberately split into ordered dispatches:
@@ -41,6 +41,19 @@ fn cell_magnetic_energy(ix: u32, iy: u32, n_total: u32) -> f32 {
     let by_c = 0.5 * (By_face[by_face_idx(ix, iy,      n_total)]
                     + By_face[by_face_idx(ix, iy + 1u, n_total)]);
     return 0.5 * (bx_c * bx_c + by_c * by_c + u1.y * u1.y);
+}
+
+fn cell_pressure_hall(ix: u32, iy: u32, n_total: u32) -> f32 {
+    let u0 = U0[cell_idx_total(ix, iy, n_total)];
+    let u1 = U1[cell_idx_total(ix, iy, n_total)];
+    let rho = max(u0.x, DENSITY_FLOOR);
+    let ke = 0.5 * (u0.y*u0.y + u0.z*u0.z + u0.w*u0.w) / rho;
+    let bx_c = 0.5 * (Bx_face[bx_face_idx(ix,      iy, n_total)]
+                    + Bx_face[bx_face_idx(ix + 1u, iy, n_total)]);
+    let by_c = 0.5 * (By_face[by_face_idx(ix, iy,      n_total)]
+                    + By_face[by_face_idx(ix, iy + 1u, n_total)]);
+    let mb = 0.5 * (bx_c*bx_c + by_c*by_c + u1.y*u1.y);
+    return max((U_uniforms.gamma - 1.0) * (u1.x - ke - mb), U_uniforms.pressure_floor);
 }
 
 fn corner_jb(ix: u32, iy: u32, n_total: u32) -> CornerJB {
@@ -83,9 +96,16 @@ fn corner_jb(ix: u32, iy: u32, n_total: u32) -> CornerJB {
 fn hall_e_corner(ix: u32, iy: u32, n_total: u32) -> vec3<f32> {
     let s = corner_jb(ix, iy, n_total);
     let prefactor = U_uniforms.hall_di / s.rho;
+    let pe_frac = clamp(U_uniforms.hall_electron_pressure_frac, 0.0, 1.0);
+    let pe_sw = pe_frac * cell_pressure_hall(ix - 1u, iy - 1u, n_total);
+    let pe_se = pe_frac * cell_pressure_hall(ix,      iy - 1u, n_total);
+    let pe_nw = pe_frac * cell_pressure_hall(ix - 1u, iy,      n_total);
+    let pe_ne = pe_frac * cell_pressure_hall(ix,      iy,      n_total);
+    let grad_pe_x = 0.5 * ((pe_se + pe_ne) - (pe_sw + pe_nw)) / U_uniforms.dx;
+    let grad_pe_y = 0.5 * ((pe_nw + pe_ne) - (pe_sw + pe_se)) / U_uniforms.dx;
     return vec3<f32>(
-        prefactor * (s.Jy * s.Bz - s.Jz * s.By),
-        prefactor * (s.Jz * s.Bx - s.Jx * s.Bz),
+        prefactor * ((s.Jy * s.Bz - s.Jz * s.By) - grad_pe_x),
+        prefactor * ((s.Jz * s.Bx - s.Jx * s.Bz) - grad_pe_y),
         prefactor * (s.Jx * s.By - s.Jy * s.Bx),
     );
 }

@@ -201,7 +201,9 @@ export class StatsDisplay {
         const tStep = statRow('Step');
         const tCfl  = statRow('CFL');
         const tGpu  = statRow('GPU step');
-        this.root.append(tStep.row, tCfl.row, tGpu.row);
+        const tHall = statRow('Hall substeps');
+        const tCond = statRow('Cond substeps');
+        this.root.append(tStep.row, tCfl.row, tGpu.row, tHall.row, tCond.row);
 
         this._refs = {
             eTot: eTot.value, eKin: eKin.value, eMag: eMag.value,
@@ -210,6 +212,7 @@ export class StatsDisplay {
             maxB: maxB.value, maxV: maxV.value, maxJ: maxJ.value,
             divB: divB.value, rrate: rrate.value,
             tStep: tStep.value, tCfl: tCfl.value, tGpu: tGpu.value,
+            tHall: tHall.value, tCond: tCond.value,
         };
     }
 
@@ -454,6 +457,8 @@ export class StatsDisplay {
 
         this._refs.tStep.textContent = String(this.sim.stepCount);
         this._refs.tCfl.textContent  = dt.toExponential(3);
+        this._refs.tHall.textContent = String(this.sim._lastHallSubsteps ?? 1);
+        this._refs.tCond.textContent = String(this.sim._lastCondSubsteps ?? 1);
         // GPU step time. When timestamp-query isn't supported, we never
         // populate `gpuMs`; fall back to em-dash via the cached refs.
         if (gpuMs != null && Number.isFinite(gpuMs)) {

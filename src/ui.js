@@ -21,6 +21,7 @@ import {
     VIEW_T, VIEW_QMAG, VIEW_PHI,
     FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
     FLAG_POSITIVITY, EMF_MODE_BS_MEAN, EMF_MODE_GS_UPWIND,
+    COOLING_CURVE_BREMS, COOLING_CURVE_TABLE,
 } from './config.js';
 import { StatsDisplay } from './stats-display.js';
 import { Probe } from './probe.js';
@@ -148,15 +149,27 @@ export function setupUI(simShell) {
             epSlider('Hall d_i (log10)',
                 () => sim.hallDi, v => sim.setHallDi(v),
                 FLAG_HALL, { lo: -4 }),
+            { type: 'slider', label: 'Hall p_e / p', min: 0, max: 1, step: 0.05,
+              value: sim.hallElectronPressureFrac, format: v => v.toFixed(2),
+              onChange: v => sim.setHallElectronPressureFrac(v) },
             epSlider('Cooling Λ₀ (log10)',
                 () => sim.coolingLambda0, v => sim.setCoolingLambda0(v),
                 FLAG_COOLING, { lo: -4 }),
+            { type: 'mode', label: 'Cooling curve', dataAttr: 'cooling-curve',
+              buttons: [
+                  { value: String(COOLING_CURVE_TABLE), label: 'table', active: sim.coolingCurveMode === COOLING_CURVE_TABLE },
+                  { value: String(COOLING_CURVE_BREMS), label: 'brems', active: sim.coolingCurveMode === COOLING_CURVE_BREMS },
+              ],
+              onChange: v => sim.setCoolingCurveMode(parseInt(v, 10)) },
             epSlider('Conduction κ∥ (log10)',
                 () => sim.conductionKappa, v => sim.setConductionKappa(v),
                 FLAG_CONDUCTION, { lo: -6 }),
             { type: 'slider', label: 'κ⊥ / κ∥', min: 0, max: 1, step: 0.05,
               value: sim.conductionIsoFrac, format: v => v.toFixed(2),
               onChange: v => sim.setConductionIsoFrac(v) },
+            { type: 'slider', label: 'q_sat φ', min: 0, max: 1, step: 0.05,
+              value: sim.conductionSatFrac, format: v => (v <= 0 ? 'off' : v.toFixed(2)),
+              onChange: v => sim.setConductionSatFrac(v) },
             epSlider('Self-gravity G (log10)',
                 () => sim.gravityG, v => sim.setGravityG(v),
                 FLAG_GRAVITY_SELF, { lo: -4, hi: 2 }),
@@ -183,7 +196,7 @@ export function setupUI(simShell) {
     if (typeof initAboutPanel === 'function') {
         const aboutHandle = initAboutPanel({
             title: 'Plasma',
-            lastUpdated: '2026-05-24',
+            lastUpdated: '2026-05-26',
             description: 'WebGPU-native 2D resistive MHD plasma simulator. Click to place the probe; use Settings to switch preset, view mode, resistivity, and boundary conditions.',
             controls: [
                 { label: 'Probe cell',  value: 'Click canvas' },

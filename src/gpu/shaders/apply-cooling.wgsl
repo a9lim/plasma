@@ -16,8 +16,14 @@
 // Bremsstrahlung has Λ ∝ √T at high T — the dominant cooling channel
 // for fully-ionized H/He at T ≳ 10⁷ K.
 //
-// Integration (Session 15 — Townsend-style exact integration for the
-// single-power-law cooling shape):
+// Integration modes:
+//   cooling_curve_mode = 0: Session-15 Townsend-style exact integration for
+//                          the single √T bremsstrahlung shape.
+//   cooling_curve_mode = 1: Session-16 piecewise power-law table. This keeps
+//                          the exact-per-segment Townsend update while adding
+//                          a line-cooling peak and high-T brems tail.
+//
+// Single-shape derivation:
 //
 //   dT/dt = -(γ-1) ρ Λ_0 · √((T − T_floor) / T_ref)
 //
@@ -52,12 +58,107 @@ struct DtUniform {
     dt: f32, _pad0: f32, _pad1: f32, _pad2: f32,
 };
 
+struct CoolingSeg {
+    theta_lo:  f32,
+    lambda_lo: f32,
+    alpha:     f32,
+};
+
 @group(0) @binding(0) var<uniform>             U_uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read>       U0:         array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> U1:         array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read>       Bx_face:    array<f32>;
 @group(0) @binding(4) var<storage, read>       By_face:    array<f32>;
 @group(0) @binding(5) var<uniform>             dt_buf:     DtUniform;
+
+fn cooling_table_segment(theta: f32) -> CoolingSeg {
+    // Dimensionless table in θ = T/T_ref. λ values are relative to Λ_0.
+    // The shape is intentionally compact: a steep low-T rise, a line-cooling
+    // peak near θ≈0.03, a trough around θ≈3, and a √θ brems tail.
+    var s: CoolingSeg;
+    if (theta <= 3.0e-4) {
+        s = CoolingSeg(1.0e-4, 0.02, 1.261860);
+    } else if (theta <= 1.0e-3) {
+        s = CoolingSeg(3.0e-4, 0.08, 1.336773);
+    } else if (theta <= 3.0e-3) {
+        s = CoolingSeg(1.0e-3, 0.40, 1.000000);
+    } else if (theta <= 1.0e-2) {
+        s = CoolingSeg(3.0e-3, 1.20, 0.642199);
+    } else if (theta <= 3.0e-2) {
+        s = CoolingSeg(1.0e-2, 2.60, 0.392116);
+    } else if (theta <= 1.0e-1) {
+        s = CoolingSeg(3.0e-2, 4.00, -0.238944);
+    } else if (theta <= 3.0e-1) {
+        s = CoolingSeg(1.0e-1, 3.00, -0.572184);
+    } else if (theta <= 1.0) {
+        s = CoolingSeg(3.0e-1, 1.60, -0.390377);
+    } else if (theta <= 3.0) {
+        s = CoolingSeg(1.0, 1.00, -0.261860);
+    } else if (theta <= 10.0) {
+        s = CoolingSeg(3.0, 0.75, 0.238944);
+    } else if (theta <= 30.0) {
+        s = CoolingSeg(10.0, 1.00, 0.535026);
+    } else if (theta <= 100.0) {
+        s = CoolingSeg(30.0, 1.80, 0.503446);
+    } else {
+        s = CoolingSeg(100.0, 3.30, 0.5);
+    }
+    return s;
+}
+
+fn segment_A(rate: f32, seg: CoolingSeg) -> f32 {
+    return rate * seg.lambda_lo / pow(max(seg.theta_lo, 1.0e-12), seg.alpha);
+}
+
+fn theta_after_powerlaw(theta0: f32, dt: f32, rate: f32, seg: CoolingSeg) -> f32 {
+    let A = segment_A(rate, seg);
+    if (A <= 0.0 || dt <= 0.0) { return theta0; }
+    let a = seg.alpha;
+    if (abs(a - 1.0) < 1.0e-4) {
+        return theta0 * exp(-A * dt);
+    }
+    let p = 1.0 - a;
+    let y = pow(theta0, p) - p * A * dt;
+    if (y <= 0.0 && p > 0.0) { return 0.0; }
+    return pow(max(y, 1.0e-30), 1.0 / p);
+}
+
+fn time_to_theta(theta0: f32, theta1: f32, rate: f32, seg: CoolingSeg) -> f32 {
+    if (theta1 >= theta0) { return 0.0; }
+    let A = segment_A(rate, seg);
+    if (A <= 0.0) { return 1.0e30; }
+    let a = seg.alpha;
+    if (abs(a - 1.0) < 1.0e-4) {
+        return max(log(theta0 / max(theta1, 1.0e-30)) / A, 0.0);
+    }
+    let p = 1.0 - a;
+    return max((pow(theta0, p) - pow(theta1, p)) / (A * p), 0.0);
+}
+
+fn cool_table_theta(theta0: f32, theta_floor: f32, dt: f32, rate: f32) -> f32 {
+    var theta = max(theta0, theta_floor);
+    var rem = dt;
+    for (var iter: u32 = 0u; iter < 16u; iter = iter + 1u) {
+        if (rem <= 0.0 || theta <= theta_floor) { break; }
+        let seg = cooling_table_segment(theta);
+        var lower = max(theta_floor, seg.theta_lo);
+        if (seg.theta_lo <= 1.0e-4) {
+            // Extend the first tabulated slope down to the configured floor.
+            lower = theta_floor;
+        }
+        let dt_lower = time_to_theta(theta, lower, rate, seg);
+        if (dt_lower <= 1.0e-12 || dt_lower != dt_lower) {
+            theta = lower;
+        } else if (rem < dt_lower) {
+            theta = max(theta_after_powerlaw(theta, rem, rate, seg), lower);
+            rem = 0.0;
+        } else {
+            theta = lower;
+            rem = rem - dt_lower;
+        }
+    }
+    return max(theta, theta_floor);
+}
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -101,11 +202,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dT_excess <= 0.0) { return; }
 
     let T_ref = max(U_uniforms.cooling_T_ref, 1.0e-30);
-    let s0 = sqrt(dT_excess / T_ref);
-    let C  = (U_uniforms.gamma - 1.0) * rho
-           * U_uniforms.cooling_lambda0 / (2.0 * T_ref);
-    let s1 = max(s0 - C * dt_buf.dt, 0.0);
-    let T_new = U_uniforms.cooling_T_floor + T_ref * s1 * s1;
+    var T_new: f32;
+    if (U_uniforms.cooling_curve_mode == 0u) {
+        let s0 = sqrt(dT_excess / T_ref);
+        let C  = (U_uniforms.gamma - 1.0) * rho
+               * U_uniforms.cooling_lambda0 / (2.0 * T_ref);
+        let s1 = max(s0 - C * dt_buf.dt, 0.0);
+        T_new = U_uniforms.cooling_T_floor + T_ref * s1 * s1;
+    } else {
+        let theta0 = max(T / T_ref, 1.0e-8);
+        let theta_floor = max(U_uniforms.cooling_T_floor / T_ref, 1.0e-8);
+        let rate = (U_uniforms.gamma - 1.0) * rho * U_uniforms.cooling_lambda0 / T_ref;
+        T_new = T_ref * cool_table_theta(theta0, theta_floor, dt_buf.dt, rate);
+    }
     let p_new = max(rho * T_new, p_floor);
     let E_new = ke + mb + p_new / (U_uniforms.gamma - 1.0);
 

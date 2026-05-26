@@ -15,9 +15,11 @@ Implementation plan (source of truth for design decisions):
 
 **Status**: Phases 1–6 complete (engine + UI + LIC). Session 14 added a
 breadth-pass extended-physics layer (Hall, anisotropic conduction,
-radiative cooling, self-gravity, GS-upwind EMF toggle, positivity guard)
-— all ON by default; stability/integration/UI deferred. Phases 7–8
-(polish + parent-repo wiring) outstanding — see
+radiative cooling, self-gravity, GS-upwind EMF toggle, positivity guard);
+Session 15 made source physics per-preset opt-in and added sub-cycling /
+exact integration hardening; Session 16 added a realism pass for transport,
+cooling, generalized Ohm, and self-gravity force recovery. Phases 7–8
+(polish + parent-repo wiring) still have loose ends — see
 [`docs/HANDOFF.md`](docs/HANDOFF.md). Per-session retrospectives live
 in [`docs/sessions/`](docs/sessions/); comments in code and shaders
 that say "Session N" point at `docs/sessions/session-N.md`.
@@ -81,11 +83,11 @@ plasma/
             ├── lic-reduce.wgsl                  ← per-tile min/max reduce of lic_out (workgroup-shared atomics)
             ├── lic-normalize.wgsl               ← in-place contrast stretch using lic_minmax
             ├── composite.wgsl                   ← canvas blit, colormap × LIC luminance
-            ├── apply-cooling.wgsl               ← (Session 14) Λ(T)=Λ_0·√T bremsstrahlung-shape source on E
+            ├── apply-cooling.wgsl               ← (Sessions 14/15/16) exact cooling: √T brems mode or piecewise power-law table mode
             ├── solve-poisson.wgsl               ← (Sessions 14/15) Periodic Jacobi for ∇²φ = 4πG(ρ−ρ̄) + real ρ̄ reduction
-            ├── apply-gravity.wgsl               ← (Session 14) external + self-gravity source on momentum + E (time-centered v)
-            ├── apply-conduction.wgsl            ← (Sessions 14/15) anisotropic Spitzer ∇·q on E, compute_delta/apply_delta split
-            ├── apply-hall.wgsl                  ← (Sessions 14/15) corner Hall E = (d_i/ρ)·(J×B); compute_emf/apply_update/repair_energy split
+            ├── apply-gravity.wgsl               ← (Sessions 14/15/16) external + self-gravity source on momentum + E (time-centered v, 4th-order φ force)
+            ├── apply-conduction.wgsl            ← (Sessions 14/15/16) anisotropic Spitzer ∇·q on E, saturated flux limiter, compute_delta/apply_delta split
+            ├── apply-hall.wgsl                  ← (Sessions 14/15/16) corner generalized Ohm E = (d_i/ρ)·(J×B − ∇p_e); compute_emf/apply_update/repair_energy split
             └── energy-floor.wgsl                ← (Session 15) post-extended-physics E clamp against final B
 ```
 
@@ -471,20 +473,21 @@ Slot 16-31 (extended physics, Session 14):
 | Slot | Type | Field                   | Notes                                                          |
 |------|------|-------------------------|----------------------------------------------------------------|
 | 16   | f32  | `hall_di`               | Hall ion inertial length d_i (code units; 0 = no Hall)         |
-| 17   | u32  | `hall_substeps_max`     | Max Hall sub-cycles per macro step (currently unused; explicit FE) |
+| 17   | u32  | `hall_substeps_max`     | Max Hall / conduction sub-cycles per macro step                    |
 | 18   | f32  | `cooling_lambda0`       | Cooling rate scale Λ_0 (0 = no cooling)                        |
 | 19   | f32  | `cooling_T_floor`       | Below this T, Λ → 0                                            |
 | 20   | f32  | `cooling_T_ref`         | Reference temperature for Λ(T) normalization                   |
 | 21   | f32  | `conduction_kappa`      | Parallel thermal conductivity κ_∥ (0 = no conduction)          |
 | 22   | f32  | `conduction_iso_frac`   | κ_⊥ / κ_∥ (0 = fully anisotropic, 1 = isotropic)               |
-| 23   | f32  | `conduction_sat_frac`   | Saturated heat-flux fraction (0 = unlimited; currently unused) |
+| 23   | f32  | `conduction_sat_frac`   | Cowie-McKee saturated heat-flux fraction (0 = unlimited)       |
 | 24   | f32  | `gravity_gx`            | External gravity x (constant)                                  |
 | 25   | f32  | `gravity_gy`            | External gravity y                                             |
 | 26   | f32  | `gravity_G`             | Newton's G for self-gravity (0 = no self-gravity)              |
 | 27   | u32  | `gravity_poisson_iters` | Jacobi iterations per macro step                               |
 | 28   | u32  | `physics_flags`         | Bitfield: COOLING\|GRAV_EXT\|GRAV_SELF\|COND\|HALL\|POSITIVITY\|EMF_UPWIND |
 | 29   | u32  | `emf_mode`              | 0 = Balsara-Spicer mean, 1 = Gardiner-Stone upwind             |
-| 30-31| u32  | `_pad_phys_*`           | Reserved                                                       |
+| 30   | u32  | `cooling_curve_mode`    | 0 = √T brems exact mode, 1 = piecewise power-law table         |
+| 31   | f32  | `hall_electron_pressure_frac` | p_e / p closure for the Hall pressure-gradient term      |
 
 `Uniforms` is held in a single 128 B buffer. Sweep direction lives in two
 static 16 B uniforms (`sweepDir_x` = 0u, `sweepDir_y` = 1u) bound only by
@@ -496,7 +499,7 @@ frame. Stage weights live in 3 separate uniform buffers (`stage_1` /
 ## Extended physics
 
 Six features bolted onto the base MHD engine in Session 14, then hardened
-in Session 15 (Codex pass + follow-up). Each shader early-returns when its
+in Sessions 15-16 (Codex passes + follow-up). Each shader early-returns when its
 flag bit is clear OR the corresponding scalar is 0, so individual features
 can be toggled per-cell via the uniform without code changes.
 
@@ -516,11 +519,11 @@ block is part of the save/load schema.
 
 | Feature              | Shader(s)                                                                | Equation / discretization                                                              |
 |----------------------|--------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| Radiative cooling    | `apply-cooling.wgsl`                                                     | `dE/dt = -ρ²·Λ_0·√(max(T-T_floor,0)/T_ref)` (bremsstrahlung shape); explicit FE with single-step E-floor clamp + compute-dt timestep bound |
-| Self-gravity         | `solve-poisson.wgsl` (reduce_mean + finalize_mean + iterate) + `apply-gravity.wgsl` | Workgroup-shared ρ̄ reduction, periodic Jacobi `∇²φ = 4πG(ρ−ρ̄)`, then `d(ρv)/dt = ρg`, `dE/dt = ρv_mid·g` (time-centered v) with `g = -∇φ` |
+| Radiative cooling    | `apply-cooling.wgsl`                                                     | Exact integration of either the legacy `√T` bremsstrahlung shape or a compact piecewise power-law cooling table with a line-cooling peak and high-T brems tail |
+| Self-gravity         | `solve-poisson.wgsl` (reduce_mean + finalize_mean + iterate) + `apply-gravity.wgsl` | Workgroup-shared ρ̄ reduction, periodic Jacobi `∇²φ = 4πG(ρ−ρ̄)`, then `d(ρv)/dt = ρg`, `dE/dt = ρv_mid·g` (time-centered v) with 4th-order periodic force recovery `g = -∇φ` |
 | External gravity     | `apply-gravity.wgsl` (alt branch)                                        | Same source-term form with constant `g = (gx, gy, 0)`                                  |
-| Anisotropic conduction | `apply-conduction.wgsl` (compute_delta + apply_delta)                   | `q = κ_∥ b̂(b̂·∇T) + κ_⊥(∇T−b̂(b̂·∇T))`, `dE/dt = -∇·q`; frozen-state delta into `conduction_dE`, then applied to U1 |
-| Hall MHD             | `apply-hall.wgsl` (compute_emf + apply_update + repair_energy)           | Corner `E_H = (d_i/ρ)·(J×B)` → `hall_E` scratch, CT update of face B + cell Bz from frozen E, then `Δ(½|B|²)` added to total E so the Hall B update doesn't masquerade as heat |
+| Anisotropic conduction | `apply-conduction.wgsl` (compute_delta + apply_delta)                   | `q = κ_∥ b̂(b̂·∇T) + κ_⊥(∇T−b̂(b̂·∇T))`, smooth Cowie-McKee saturation, `dE/dt = -∇·q`; frozen-state delta into `conduction_dE`, then applied to U1 |
+| Hall MHD             | `apply-hall.wgsl` (compute_emf + apply_update + repair_energy)           | Corner `E_H = (d_i/ρ)·(J×B − ∇p_e)` → `hall_E` scratch, CT update of face B + cell Bz from frozen E, then `Δ(½|B|²)` added to total E so the Hall B update doesn't masquerade as heat |
 | Positivity guard     | `update-conserved-weighted.wgsl` (inline)                                | When post-update `ρ ≤ 0` or `E−KE ≤ p_floor/(γ−1)`, drop the L term and fall back to the pure SSP blend (Hu/Adams/Shu 2013 §3 spirit) |
 | EMF mode toggle      | `compute-emf.wgsl`                                                       | Runtime switch between Balsara-Spicer arithmetic mean and Gardiner-Stone 2005 upwind (latter is default) |
 | Energy-floor cleanup | `energy-floor.wgsl`                                                      | Final pass after extended physics: clamps E against the final B so source-term combinations leave the cell physically consistent |
@@ -576,9 +579,12 @@ sources; `orszag-tang-extended` keeps them all active.
 | `physicsFlags`        | `POSITIVITY \| EMF_UPWIND` (BASE) | Source flags are opt-in per preset      |
 | `emfMode`             | 1 (GS upwind) | The numerical default for CT                |
 | `hallDi`              | 0.02    | ~5 cells at N=256 — Hall scale resolved            |
+| `hallElectronPressureFrac` | 0.0 | Presets can opt into `p_e / p`; whistler test keeps it off |
 | `coolingLambda0`      | 0.01    | Visible but not catastrophic on 1×1-domain presets |
+| `coolingCurveMode`    | 1       | Piecewise power-law table by default               |
 | `conductionKappa`     | 1e-3    | Below parabolic CFL for OT scale at base resolution |
 | `conductionIsoFrac`   | 0.1     | 90% parallel, 10% perp                             |
+| `conductionSatFrac`   | 0.0     | Unlimited by default; extended/validation presets opt into saturation |
 | `gravityG`            | 1e-3    | Mostly visible where ρ-contrasts are large         |
 | `gravityPoissonIters` | 30      | Sufficient for steady-state on N=256 with 1×1 box  |
 
@@ -616,7 +622,7 @@ Both sub-cycles share the user-facing `hallSubstepsMax` cap (default
 for d_i = 0.02 and κ = 1e-3 — the infrastructure is in place for
 when the user dials them up or shrinks dx.
 
-### Cooling exact integrator (Session 15)
+### Cooling exact integrator (Sessions 15-16)
 
 `apply-cooling.wgsl` no longer uses forward Euler. For our specific
 single-power-law cooling shape (Λ ∝ √((T − T_floor)/T_ref)), the
@@ -628,10 +634,13 @@ update is
     T(t)  = T_floor + T_ref · s(t)²
 
 — unconditionally stable for any Δt, exact for the chosen Λ shape.
-This is Townsend 2009 in spirit (general piecewise-power-law table);
-for our single-segment case the closed form lives inline. The
-cooling timestep bound that briefly lived in `compute-dt.wgsl` is
-gone — cooling no longer constrains macro Δt.
+Session 16 keeps that as `cooling_curve_mode = 0` and adds
+`cooling_curve_mode = 1`: a compact piecewise power-law table in
+`θ = T/T_ref`, advanced exactly per segment with the same Townsend
+idea. The default table has a low-temperature rise, line-cooling peak,
+trough, and high-temperature bremsstrahlung tail. The cooling timestep
+bound that briefly lived in `compute-dt.wgsl` is gone — cooling no
+longer constrains macro Δt.
 
 ### Remaining sharp edges (Phase 9 follow-up)
 
@@ -650,10 +659,10 @@ open:
    RKL2 would be O(√N_cond). Currently blocked by the 10-binding
    cap on `apply-resistivity-init.wgsl` — needs a multi-shader BGL
    reshuffle. Worth it if a future workload pushes N_cond above ~30.
-3. **Townsend table integration.** The current exact integrator is
-   specific to the single √T cooling shape. A piecewise-power-law
-   Λ(T) table with precomputed Y values would let the same
-   infrastructure handle realistic astrophysical cooling curves.
+3. **Cooling data fidelity.** Session 16's table is intentionally compact
+   and dimensionless. A production astrophysical mode should upload a
+   vetted metallicity-dependent table (for example CHIANTI/Sutherland-
+   Dopita style data) instead of baking one curve into WGSL.
 
 ## Transpiler contract
 

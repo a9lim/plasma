@@ -29,7 +29,7 @@ point at the corresponding `sessions/session-N.md`.
 | 6     | Animated LIC visualization                 | done     |
 | 7     | Polish (content, perturbation, JSON-LD, OG)| **partial** |
 | 8     | Parent-repo wiring                         | **todo** |
-| 9     | Extended physics (Hall, cooling, conduction, self-gravity, EMF toggle, positivity guard) | **partial** — see [Session 14](sessions/session-14.md) + [Session 15](sessions/session-15.md) + the "Phase 9" section below |
+| 9     | Extended physics (Hall, cooling, conduction, self-gravity, EMF toggle, positivity guard) | **partial** — see [Session 14](sessions/session-14.md), [Session 15](sessions/session-15.md), [Session 16](sessions/session-16.md), and the "Phase 9" section below |
 
 **Verification status**: OT live-verified at N=256 and N=1024 across
 the full η range up to 1.0 (Session 13 — the RKL2 substep-count fixes
@@ -348,9 +348,12 @@ anisotropic conduction, self-gravity, positivity guard, and the
 GS-upwind EMF toggle — all ON by default. Session 15 (Codex pass +
 follow-up) addressed the structural sharp edges: race-elimination
 splits, real Poisson reduction, BC consistency, per-preset opt-in.
-The remaining work is the items that need real physics decisions
-(sub-cycling vs HDS for Hall, RKL2 extension for conduction,
-Townsend table layout, UI design, validation presets).
+Session 16 made a targeted realism pass: saturated heat flux,
+piecewise exact cooling, an optional electron-pressure Hall term,
+sub-step diagnostics, and higher-order self-gravity force recovery.
+The remaining work is now the heavier physics architecture:
+HDS vs sub-cycling for Hall, RKL2 for large conduction workloads,
+vetted cooling data, and stronger geometry/gravity solvers.
 
 ### 1. Validation presets and view modes ✅ (Session 15)
 
@@ -426,15 +429,21 @@ sub-cycle cost is competitive with RKL2's O(√N_cond) without the
 binding-cap complexity. If a future workload pushes N_cond above
 ~30, RKL2 folding becomes worth the implementation cost.
 
-### 5. Townsend cooling integration
+### 5. Townsend cooling integration ✅ (Session 16)
 
 Explicit FE biases the cooling timestep. Townsend 2009 exact
-integration with a piecewise-power-law Λ(T) is the canonical fix
-— shader needs a small precomputed CDF table (one upload at init).
+integration with a piecewise-power-law Λ(T) is the canonical fix.
+Session 15 removed the FE bias for the single `√T` bremsstrahlung
+shape. Session 16 keeps that mode (`cooling_curve_mode = 0`) and adds
+`cooling_curve_mode = 1`: a compact dimensionless piecewise power-law
+cooling curve with exact per-segment integration. The table includes a
+low-temperature rise, line-cooling peak, trough, and high-temperature
+bremsstrahlung tail.
 
-_Partial interim (Session 15 — Codex pass): cooling Δt is now
-bounded in `compute-dt.wgsl` by the explicit `0.25 · eth /
-cooling_rate` limit. Cures the worst overshoots but still biased._
+This is the right numerical shape, but the baked-in table is still a
+toy curve. The next realism step is a vetted metallicity-dependent
+cooling table uploaded once at init rather than hard-coded WGSL
+constants.
 
 ### 6. Real ρ̄ reduction for Poisson ✅ (Session 15 — Codex pass)
 
@@ -461,17 +470,22 @@ two new scratch buffers `hall_E`, `hall_mb0`):
   total E so the Hall B update doesn't masquerade as spurious
   heating/cooling.
 
-The race-prone in-place EMF evaluation is gone. Conduction got the
-same treatment (`compute_delta` + `apply_delta` with the
-`conduction_dE` scratch buffer).
+The race-prone in-place EMF evaluation is gone. Session 16 also adds
+an optional electron-pressure term, so the corner EMF is now
+`E_H = (d_i/ρ)·(J×B − ∇p_e)`, with `p_e/p` exposed as a scalar closure.
+Conduction got the same frozen-state treatment (`compute_delta` +
+`apply_delta` with the `conduction_dE` scratch buffer).
 
 ### 8. UI surface
 
 Sliders + toggles in the advanced settings dropdown:
 * "Hall d_i" log slider, with snap-to-0
+* "Hall p_e / p" linear slider
 * "Cooling Λ_0" log slider, snap-to-0
+* Cooling-curve mode group (piecewise table / brems)
 * "Conduction κ_∥" log slider, snap-to-0
 * "Conduction κ_⊥/κ_∥" linear 0–1
+* "q_sat φ" linear slider for the Cowie-McKee saturation limiter
 * "Self-gravity G" log slider, snap-to-0
 * Mode group for EMF mode (BS / GS upwind)
 * Toggle row for positivity guard
@@ -502,6 +516,27 @@ the spurious heating that pure forward Euler introduces. And
 `buffers.clearExtendedScratch()` runs on preset/resolution load
 so the Poisson solve doesn't warm-start against a previous
 preset's φ.
+
+### 11. Session 16 realism pass
+
+What landed:
+
+* **Transport:** `conduction_sat_frac` is live. `apply-conduction.wgsl`
+  applies a smooth Cowie-McKee saturated heat-flux limiter, and the
+  `|q|` view uses the same limiter so the diagnostic matches the source.
+* **Cooling:** `apply-cooling.wgsl` supports both the legacy exact
+  `√T` brems mode and the new exact piecewise power-law table mode.
+  The cooling-instability and extended presets use table mode.
+* **Hall / generalized Ohm:** `apply-hall.wgsl` can include
+  `−∇p_e`; the extended preset sets `p_e/p = 0.5`, while the whistler
+  validation preset keeps it at 0 to preserve the analytic Hall-only
+  dispersion comparison.
+* **Gravity:** `apply-gravity.wgsl` now recovers `−∇φ` with a fourth-
+  order periodic central difference. The Poisson solve is still Jacobi
+  on a periodic Cartesian box; FFT/multigrid and non-periodic gravity
+  remain future work.
+* **Diagnostics:** Stats show the last Hall and conduction sub-cycle
+  counts, so stiff regimes are visible instead of hidden in the step.
 
 ## References
 

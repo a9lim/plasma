@@ -300,7 +300,7 @@ export class PlasmaBuffers {
         this.cond_speed_buf = device.createBuffer({
             label: 'plasma.cond_speed_max',
             size: 16,
-            usage: GPUBufferUsage.STORAGE,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
 
         // ── Uniforms: single physics-state buffer ──────────────────
@@ -665,8 +665,10 @@ export class PlasmaBuffers {
      *   slot 11     f32: pressure_floor (UI slider, was _pad_sweep)
      *   slot 12     f32: cfl
      *   slot 13     u32: view_mode
-     *   slot 14     f32: _pad_lic_3
+     *   slot 14     f32: eta_anom_jcrit
      *   slot 15     u32: noise_n
+     *   slot 30     u32: cooling_curve_mode
+     *   slot 31     f32: hall_electron_pressure_frac
      *
      * Any field not passed in the args object falls back to the host-side
      * cache (so callers that only know about a subset don't clobber
@@ -680,6 +682,7 @@ export class PlasmaBuffers {
         coolingLambda0, coolingTFloor, coolingTRef,
         conductionKappa, conductionIsoFrac, conductionSatFrac,
         gravityGx, gravityGy, gravityG, gravityPoissonIters,
+        coolingCurveMode, hallElectronPressureFrac,
         physicsFlags, emfMode,
     } = {}) {
         if (eta           !== undefined) this._eta           = eta;
@@ -700,6 +703,8 @@ export class PlasmaBuffers {
         if (gravityGy           !== undefined) this._gravityGy           = gravityGy;
         if (gravityG            !== undefined) this._gravityG            = gravityG;
         if (gravityPoissonIters !== undefined) this._gravityPoissonIters = gravityPoissonIters;
+        if (coolingCurveMode    !== undefined) this._coolingCurveMode    = coolingCurveMode;
+        if (hallElectronPressureFrac !== undefined) this._hallElectronPressureFrac = hallElectronPressureFrac;
         if (physicsFlags        !== undefined) this._physicsFlags        = physicsFlags;
         if (emfMode             !== undefined) this._emfMode             = emfMode;
         // ── Slots 0-15: original layout ────────────────────────────
@@ -735,8 +740,8 @@ export class PlasmaBuffers {
         this.uniformU32[27] = (this._gravityPoissonIters ?? 30) >>> 0;
         this.uniformU32[28] = (this._physicsFlags        ?? 0) >>> 0;
         this.uniformU32[29] = (this._emfMode             ?? 0) >>> 0;
-        this.uniformU32[30] = 0;
-        this.uniformU32[31] = 0;
+        this.uniformU32[30] = (this._coolingCurveMode    ?? 1) >>> 0;
+        this.uniformF32[31] = (this._hallElectronPressureFrac ?? 0);
         this.device.queue.writeBuffer(this.uniform, 0, this.uniformHost);
     }
 

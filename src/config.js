@@ -93,7 +93,8 @@ export const EDGE_W = 3;  // left
 //                cooling_T_floor, cooling_T_ref, conduction_kappa,
 //                conduction_iso_frac, conduction_sat_frac, gravity_gx,
 //                gravity_gy, gravity_G, gravity_poisson_iters,
-//                physics_flags, emf_mode, _pad, _pad.
+//                physics_flags, emf_mode, cooling_curve_mode,
+//                hall_electron_pressure_frac.
 // 32 × 4B = 128B.
 //
 // Sweep direction is in two static SweepDir uniform buffers (16 B each)
@@ -127,6 +128,12 @@ export const EXTENDED_PHYSICS_FLAGS = BASE_PHYSICS_FLAGS | EXTENDED_SOURCE_FLAGS
 // EMF mode enum (slot 29: emf_mode).
 export const EMF_MODE_BS_MEAN  = 0;  // Balsara-Spicer arithmetic mean (legacy fallback)
 export const EMF_MODE_GS_UPWIND = 1; // Gardiner-Stone 2005 upwind default
+
+// Optically-thin cooling curve selector (slot 30). BREMS preserves the old
+// single √T exact integrator; TABLE uses the Session-16 piecewise power-law
+// curve for a line-cooling peak plus high-T bremsstrahlung tail.
+export const COOLING_CURVE_BREMS = 0;
+export const COOLING_CURVE_TABLE = 1;
 
 // bc_uniforms storage-buffer layout:
 //   u32 mode[4]  — N, S, E, W

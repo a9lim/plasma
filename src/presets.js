@@ -36,6 +36,7 @@ import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, PRESSURE_FLOOR, ETA_DEFAULT,
     BC_PERIODIC, BC_OUTFLOW, BASE_PHYSICS_FLAGS, EXTENDED_PHYSICS_FLAGS,
     FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
+    COOLING_CURVE_TABLE,
 } from './config.js';
 
 /** Cell-centered flat index in ghost-padded storage. */
@@ -291,13 +292,15 @@ export function makeOrszagTangExtendedPreset(n = GRID_N) {
             coolingLambda0: 0.01,
             coolingTFloor: 1.0e-4,
             coolingTRef: 1.0,
+            coolingCurveMode: COOLING_CURVE_TABLE,
             conductionKappa: 1.0e-3,
             conductionIsoFrac: 0.1,
-            conductionSatFrac: 0.0,
+            conductionSatFrac: 0.3,
             gravityGx: 0.0,
             gravityGy: 0.0,
             gravityG: 1.0e-3,
             gravityPoissonIters: 30,
+            hallElectronPressureFrac: 0.5,
         },
     };
 }
@@ -738,6 +741,7 @@ export function makeHallWhistlerPreset(n = GRID_N) {
             physicsFlags: BASE_PHYSICS_FLAGS | FLAG_HALL,
             hallDi: d_i,
             hallSubstepsMax: 8,
+            hallElectronPressureFrac: 0.0,
             // Defaults for the rest stay quiet.
         },
         data: { U0, U1, Bx_face, By_face },
@@ -813,6 +817,7 @@ export function makeConductionFrontPreset(n = GRID_N) {
             physicsFlags: BASE_PHYSICS_FLAGS | FLAG_CONDUCTION,
             conductionKappa:   1.0e-2,
             conductionIsoFrac: 0.1,
+            conductionSatFrac: 0.3,
         },
         data: { U0, U1, Bx_face, By_face },
         viewMode: 5,  // VIEW_T — temperature spread is the test signal
@@ -885,6 +890,7 @@ export function makeCoolingInstabilityPreset(n = GRID_N) {
             coolingLambda0: 0.1,
             coolingTFloor:  1.0e-3,
             coolingTRef:    1.0,
+            coolingCurveMode: COOLING_CURVE_TABLE,
         },
         data: { U0, U1, Bx_face, By_face },
         viewMode: 0,  // VIEW_DENSITY — fragmentation shows up as ρ clumps
