@@ -640,14 +640,6 @@ export class Sim {
         });
     }
 
-    // riemann-hlld now writes two outputs per face: the existing flux
-    // pair and the new face_wavespeeds_{x,y} (S_L, S_L*, S_R*, S_R)
-    // that compute-emf consumes for the UCT-HLLD corner EMF. The
-    // U0/U1 bindings dropped in the BGL upgrade (they were declared
-    // but never read — riemann reads only from PPM edges) so this BG
-    // no longer threads U0/U1 either. The (axis, U0, U1, Bx, By)
-    // signature is preserved so the cache-builder call sites need no
-    // change; U0/U1 are accepted-but-unused here.
     _riemannBG(axis, U0, U1, Bx, By) {
         const b = this.buffers;
         const sweepBuf = (axis === 0) ? b.sweepDir_x : b.sweepDir_y;
@@ -662,29 +654,27 @@ export class Sim {
             layout: this.pipelines.layouts.riemann,
             entries: [
                 { binding: 0,  resource: { buffer: b.uniform } },
-                { binding: 1,  resource: { buffer: Bx } },
-                { binding: 2,  resource: { buffer: By } },
-                { binding: 3,  resource: { buffer: eL0 } },
-                { binding: 4,  resource: { buffer: eL1 } },
-                { binding: 5,  resource: { buffer: eR0 } },
-                { binding: 6,  resource: { buffer: eR1 } },
-                { binding: 7,  resource: { buffer: f0 } },
-                { binding: 8,  resource: { buffer: f1 } },
-                { binding: 9,  resource: { buffer: b.face_wavespeeds_x } },
-                { binding: 10, resource: { buffer: b.face_wavespeeds_y } },
+                { binding: 1,  resource: { buffer: U0 } },
+                { binding: 2,  resource: { buffer: U1 } },
+                { binding: 3,  resource: { buffer: Bx } },
+                { binding: 4,  resource: { buffer: By } },
+                { binding: 5,  resource: { buffer: eL0 } },
+                { binding: 6,  resource: { buffer: eL1 } },
+                { binding: 7,  resource: { buffer: eR0 } },
+                { binding: 8,  resource: { buffer: eR1 } },
+                { binding: 9,  resource: { buffer: f0 } },
+                { binding: 10, resource: { buffer: f1 } },
                 { binding: 11, resource: { buffer: sweepBuf } },
             ],
         });
     }
 
-    // EMF bind group is side- and stage-dependent — the UCT-HLLD
-    // corner EMF (Mignone+ 2010/2021) reads cell-centered Ez at the
-    // four cells around each corner from the SRC U0 + SRC face B
+    // EMF bind group is now side- and stage-dependent — Gardiner-Stone
+    // 2005 upwind CT needs the cell-centered Ez at the four cells
+    // around each corner, computed from the SRC U0 and SRC face B
     // (whichever buffer the current stage's PPM read from). Caller
     // passes the stage's (U0_src, Bx_src, By_src) so the cache builds
-    // A/B variants per stage. face_wavespeeds_{x,y} are global (one
-    // pair per face, rewritten each stage by riemann-hlld) — side-
-    // independent.
+    // A/B variants per stage.
     _emfBG(U0_src, Bx_src, By_src) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -698,8 +688,6 @@ export class Sim {
                 { binding: 4, resource: { buffer: U0_src } },
                 { binding: 5, resource: { buffer: Bx_src } },
                 { binding: 6, resource: { buffer: By_src } },
-                { binding: 7, resource: { buffer: b.face_wavespeeds_x } },
-                { binding: 8, resource: { buffer: b.face_wavespeeds_y } },
             ],
         });
     }

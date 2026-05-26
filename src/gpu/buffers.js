@@ -189,17 +189,6 @@ export class PlasmaBuffers {
         this.flux_y_0 = mkStorage('plasma.flux_y_0', u_v4_cell_bytes);
         this.flux_y_1 = mkStorage('plasma.flux_y_1', u_v4_cell_bytes);
 
-        // ── Per-face HLLD wave speeds (UCT-HLLD upgrade) ───────────
-        // (S_L, S_L*, S_R*, S_R) packed as vec4<f32> per face. Written
-        // by riemann-hlld.wgsl in every branch (supersonic / HLL /
-        // HLLC / full 5-wave), consumed by compute-emf.wgsl as the
-        // ingredients of the per-face LHLLD EMF reconstruction
-        // (Mignone, Tzeferacos & Bodo 2010 §4.2; Mignone+ 2021 §3).
-        // Same (N+4)² cell-centered indexing as flux buffers — we only
-        // write the relevant face cells per sweep, like flux_x_*.
-        this.face_wavespeeds_x = mkStorage('plasma.face_wavespeeds_x', u_v4_cell_bytes);
-        this.face_wavespeeds_y = mkStorage('plasma.face_wavespeeds_y', u_v4_cell_bytes);
-
         // ── dt reduction ───────────────────────────────────────────
         this.wavespeed = device.createBuffer({
             label: 'plasma.wavespeed',
