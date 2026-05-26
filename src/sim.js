@@ -55,6 +55,8 @@ import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP,
     VIEW_JZ, ETA_DEFAULT, BC_PERIODIC, CFL, PRESSURE_FLOOR,
     LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, DT_MAX,
+    FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
+    FLAG_POSITIVITY, FLAG_EMF_UPWIND, EMF_MODE_GS_UPWIND,
 } from './config.js';
 
 const WG = WORKGROUP;
@@ -110,21 +112,33 @@ export class Sim {
         this._pendingTimeSteps = 0;
 
         // ── Extended physics state (breadth pass — Hall, cooling,
-        //    conduction, gravity, EMF mode toggle). All zero / off by
-        //    default; UI toggles enable individually.
-        this.physicsFlags        = 0;
-        this.emfMode             = 0;       // 0 = BS mean (current), 1 = GS upwind
-        this.hallDi              = 0.0;     // ion inertial length (code units)
+        //    conduction, gravity, EMF mode toggle).
+        //
+        // All ON by default per locked decision. Scales picked small
+        // enough to be visible but not catastrophic on the existing
+        // 1×1-domain presets (Sod, Brio-Wu, Orszag-Tang, Harris).
+        // Stability is NOT promised — Hall ignores whistler CFL,
+        // conduction ignores parabolic CFL, cooling is explicit. If
+        // anything detonates, dial individual scalars to 0 via the
+        // setters or strip a flag from `physicsFlags`.
+        this.physicsFlags = FLAG_COOLING
+                          | FLAG_GRAVITY_SELF
+                          | FLAG_CONDUCTION
+                          | FLAG_HALL
+                          | FLAG_POSITIVITY
+                          | FLAG_EMF_UPWIND;
+        this.emfMode             = EMF_MODE_GS_UPWIND;
+        this.hallDi              = 0.02;    // ~5 cells at N=256 (resolved Hall scale)
         this.hallSubstepsMax     = 8;
-        this.coolingLambda0      = 0.0;
+        this.coolingLambda0      = 0.01;
         this.coolingTFloor       = 1.0e-4;
         this.coolingTRef         = 1.0;
-        this.conductionKappa     = 0.0;
-        this.conductionIsoFrac   = 0.0;
+        this.conductionKappa     = 1.0e-3;
+        this.conductionIsoFrac   = 0.1;     // mostly along B, 10% perp
         this.conductionSatFrac   = 0.0;
         this.gravityGx           = 0.0;
         this.gravityGy           = 0.0;
-        this.gravityG            = 0.0;
+        this.gravityG            = 1.0e-3;
         this.gravityPoissonIters = 30;
 
         // UI integration state — owned by Sim so save/load can capture it.
