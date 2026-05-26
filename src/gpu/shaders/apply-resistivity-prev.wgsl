@@ -5,9 +5,10 @@
 // Y_j in the tmp slot. L(Y_{j-1}) uses the SAME frozen-init η_local as
 // pass 1 (sampled from U^n via face B in init slots).
 //
-// Bindings (10 storage + 2 uniforms):
+// Bindings (10 storage + 2 uniforms — at per-pipeline cap after the
+// Session 10 dt-feedback fix added dt_buf):
 //   0  uniforms
-//   1  sts_meta        (uniform)
+//   1  sts_meta        (uniform — dt_super field is unused; see init shader)
 //   2  sts_coeffs      (ro storage)
 //   3  Bx_init  (ro)             — only for η_local (frozen)
 //   4  By_init  (ro)             — only for η_local (frozen)
@@ -17,14 +18,24 @@
 //   8  Bx_tmp   (rw)             — read accumulator + write Y_j
 //   9  By_tmp   (rw)
 //   10 U1_tmp   (rw)
-//
-// Storage bindings: 9. Under the 10 cap.
+//   11 dt_buf   (uniform)        — Session 10: fresh per-step dt_hyp.
+//                                  See apply-resistivity-init.wgsl
+//                                  header for the full rationale.
+//                                  Bound as UNIFORM to keep this
+//                                  shader's storage-binding count at 8.
 
 struct StsMeta {
     substep_idx: u32,
     s_total:     u32,
-    dt_super:    f32,
+    dt_super:    f32,    // unused by shader; kept for CPU diagnostic + layout
     _pad:        f32,
+};
+
+struct DtUniform {
+    dt_hyp:       f32,
+    dt_parabolic: f32,
+    eta_max:      f32,
+    _pad:         f32,
 };
 
 @group(0) @binding(0)  var<uniform> U_uniforms: Uniforms;
@@ -38,6 +49,7 @@ struct StsMeta {
 @group(0) @binding(8)  var<storage, read_write> Bx_tmp:     array<f32>;
 @group(0) @binding(9)  var<storage, read_write> By_tmp:     array<f32>;
 @group(0) @binding(10) var<storage, read_write> U1_tmp:     array<vec4<f32>>;
+@group(0) @binding(11) var<uniform>             dt_buf:     DtUniform;
 
 fn jz_mag_init(ix: u32, iy: u32, n_total: u32, dx_inv: f32) -> f32 {
     let by_R = 0.5 * (By_init[by_face_down_idx(ix + 1u, iy, n_total)]
@@ -67,7 +79,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ghost      = U_uniforms.ghost_w;
     let dx_inv     = 1.0 / U_uniforms.dx;
     let dx2_inv    = dx_inv * dx_inv;
-    let dt_super   = sts_meta.dt_super;
+    // Session 10 RKL2 dt-feedback fix — read fresh dt_super from the GPU
+    // dt buffer rather than from the (lagged) sts_meta. See header for
+    // the full rationale.
+    let dt_super   = dt_buf.dt_hyp;
     if (sts_meta.s_total == 0u) { return; }
 
     let j_idx       = sts_meta.substep_idx;

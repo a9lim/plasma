@@ -13,9 +13,14 @@
 // For j = 1: ν_j = 0, μ_j = 0, γ̃_j = 0  → Y_tmp = U^n. The follow-on
 // `apply-resistivity-prev` then adds the μ̃_1 · Δt · L(Y_0) term.
 //
-// Bindings (one group, 9 storage + 1 ro storage + 2 uniforms):
+// Bindings (one group, 10 storage + 2 uniforms — at the per-pipeline
+// storage-binding cap):
 //   0  uniforms
-//   1  sts_meta        (uniform — substep_idx, s_total, dt_super, _pad)
+//   1  sts_meta        (uniform — substep_idx, s_total, _pad, _pad)
+//                       (dt_super field is RETAINED for layout compatibility
+//                        and as a CPU-side diagnostic of the lagged value,
+//                        but the shader reads the FRESH dt_super from
+//                        dt_buf[0] instead — see binding 12 comment.)
 //   2  sts_coeffs      (ro storage — packed (μ, ν, μ̃, γ̃) per substep)
 //   3  Bx_init  (ro)
 //   4  By_init  (ro)
@@ -26,12 +31,49 @@
 //   9  Bx_tmp   (rw)
 //   10 By_tmp   (rw)
 //   11 U1_tmp   (rw)
+//   12 dt_buf   (uniform) — Session 10 RKL2 dt-feedback fix. compute-dt
+//                       writes the fresh per-step dt_hyp into dt_buf[0]
+//                       at the start of EACH macro step (before any
+//                       RKL2 substep runs). Reading from here instead of
+//                       sts_meta.dt_super eliminates the CPU-side
+//                       _lastDtHyp staleness path that detonates Harris
+//                       in tight render loops: when consecutive step()
+//                       calls have no microtask break, the async
+//                       readback of dt_buf into _lastDtHyp never
+//                       completes, so sts_meta.dt_super stays at its
+//                       1e-4 initial value while the actual dt_hyp has
+//                       grown to ~1e-3. RKL2's recurrence then applies
+//                       only ~1/10 of the needed resistive diffusion
+//                       per macro step → current sheet thins
+//                       unphysically → NaN cascade within ~50 steps.
+//                       Per-substep diffusion contract: Δt_super in
+//                       the recurrence equals dt_hyp (the hyperbolic
+//                       step). The substep count s is still CPU-sized
+//                       from the lagged _lastDtParabolic ratio — when
+//                       the parabolic CFL has actually tightened, the
+//                       CPU s is OVER-sized relative to the strict
+//                       requirement, which is the safe-fail direction
+//                       (RKL2 is unconditionally stable for s ≥
+//                       s_critical). See Session 10 / 9 retrospective.
 
 struct StsMeta {
     substep_idx: u32,
     s_total:     u32,
-    dt_super:    f32,
+    dt_super:    f32,    // unused by shader; kept for CPU diagnostic + layout
     _pad:        f32,
+};
+
+// dt_buf is bound as a UNIFORM struct here (rather than storage<read>)
+// for two reasons: (1) keeps this shader's storage-binding count at 9
+// (under the 10-per-stage cap), (2) matches the established pattern in
+// update-conserved-weighted.wgsl which faces the same cap constraint.
+// The buffer is created with both STORAGE and UNIFORM usage flags in
+// buffers.js so the same buffer can be bound either way.
+struct DtUniform {
+    dt_hyp:       f32,
+    dt_parabolic: f32,
+    eta_max:      f32,
+    _pad:         f32,
 };
 
 @group(0) @binding(0)  var<uniform> U_uniforms: Uniforms;
@@ -46,6 +88,7 @@ struct StsMeta {
 @group(0) @binding(9)  var<storage, read_write> Bx_tmp:     array<f32>;
 @group(0) @binding(10) var<storage, read_write> By_tmp:     array<f32>;
 @group(0) @binding(11) var<storage, read_write> U1_tmp:     array<vec4<f32>>;
+@group(0) @binding(12) var<uniform>             dt_buf:     DtUniform;
 
 // |J_z(ix, iy)| from frozen init face B — central differences on
 // face-averaged cell-centered B. Reads (ix±1, iy±1) face cells.
@@ -77,7 +120,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ghost      = U_uniforms.ghost_w;
     let dx_inv     = 1.0 / U_uniforms.dx;
     let dx2_inv    = dx_inv * dx_inv;
-    let dt_super   = sts_meta.dt_super;
+    // Read fresh Δt_super straight from the GPU dt buffer (Session 10
+    // RKL2 dt-feedback fix). compute-dt populates dt_buf[0] at the start
+    // of every macro step before this kernel runs. sts_meta.dt_super
+    // would be the lagged value from the host's last successful readback
+    // of dt_buf — under tight render loops without microtask breaks that
+    // readback never completes and dt_super stays stuck at its initial
+    // value, dramatically under-applying η ∇²B over the macro step and
+    // detonating Harris.
+    let dt_super   = dt_buf.dt_hyp;
     if (sts_meta.s_total == 0u) { return; }
 
     let j_idx       = sts_meta.substep_idx;        // 1..s

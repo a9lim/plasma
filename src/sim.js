@@ -541,6 +541,8 @@ export class Sim {
                 { binding: 9,  resource: { buffer: tmpBx } },
                 { binding: 10, resource: { buffer: tmpBy } },
                 { binding: 11, resource: { buffer: tmpU1 } },
+                // Session 10: shader reads fresh dt_super from dt_buf[0].
+                { binding: 12, resource: { buffer: b.dt } },
             ],
         });
     }
@@ -563,6 +565,8 @@ export class Sim {
                 { binding: 8,  resource: { buffer: tmpBx } },
                 { binding: 9,  resource: { buffer: tmpBy } },
                 { binding: 10, resource: { buffer: tmpU1 } },
+                // Session 10: shader reads fresh dt_super from dt_buf[0].
+                { binding: 11, resource: { buffer: b.dt } },
             ],
         });
     }

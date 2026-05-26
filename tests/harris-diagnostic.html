@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plasma — Harris diagnostic | a9l.im</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="/favicon.ico">
+
+<link rel="stylesheet" href="/fonts/fonts.css">
+<script src="/shared-tokens.js"></script>
+<link rel="stylesheet" href="/shared-base.css">
+<link rel="stylesheet" href="../styles.css">
+
+<style>
+  body.sim-body { overflow: auto; padding: 24px; }
+  #wrap { max-width: 1200px; margin: 0 auto; font-family: var(--font-sans); }
+  h1 { font-family: var(--font-display); margin: 0 0 8px; }
+  .hint { color: var(--text-muted); margin: 4px 0 16px; font-size: var(--font-sm); }
+  .actions { display: flex; gap: 12px; align-items: center; margin: 16px 0; }
+  button.tool-btn { padding: 8px 16px; font-size: var(--font-base); }
+  input[type=number] { font-family: var(--font-mono); padding: 6px 10px;
+                       background: var(--bg-elevated); color: var(--text);
+                       border: none; outline: 0; border-radius: var(--radius);
+                       width: 80px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px;
+          font-family: var(--font-mono); font-size: var(--font-sm);
+          font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 8px; text-align: right; white-space: nowrap; }
+  th { background: var(--bg-elevated); color: var(--text); font-weight: 600;
+       border-bottom: 1px solid var(--accent); position: sticky; top: 0; }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:nth-child(even) { background: var(--bg-elevated); }
+  tr.bad td { color: #c02520; }
+  tr.warn td { color: #aa6600; }
+  #log { font-family: var(--font-mono); font-size: var(--font-sm);
+         background: var(--bg-elevated); padding: 12px; border-radius: var(--radius);
+         margin-top: 16px; white-space: pre-wrap; min-height: 60px;
+         max-height: 220px; overflow: auto; }
+  canvas#dummy { display: none; }
+  .err { color: #c02520; }
+  details { margin-top: 16px; background: var(--bg-elevated);
+            padding: 8px 12px; border-radius: var(--radius); }
+  details summary { cursor: pointer; padding: 4px 0; font-weight: 600; }
+</style>
+</head>
+<body class="sim-body">
+<div id="wrap">
+  <h1>Harris current sheet — diagnostic harness</h1>
+  <p class="hint">
+    Runs the production Sim under the Harris preset (N=256 by default,
+    γ=5/3, η=1e-3, outflow N/S, periodic E/W). Every <code>sampleEvery</code>
+    steps it reads back U0/U1/Bx/By to the CPU and computes a row of
+    diagnostics. Stops on the first non-finite cell or at the step cap.
+    Logs everything to <code>console.log</code> as JSON for Playwright.
+  </p>
+
+  <div class="actions">
+    <label>N <input id="optN" type="number" value="256" min="32" max="1024" step="32"></label>
+    <label>maxSteps <input id="optSteps" type="number" value="400" min="1" max="20000" step="50"></label>
+    <label>sampleEvery <input id="optSample" type="number" value="5" min="1" max="100" step="1"></label>
+    <label>eta <input id="optEta" type="number" value="1e-3" min="0" max="1" step="1e-4"></label>
+    <label title="If on, step in batches of `sampleEvery` with no per-step await — mirrors production hot loop.">
+      tightLoop <input id="optTight" type="checkbox">
+    </label>
+    <button id="runBtn" class="tool-btn">Run</button>
+    <span id="status" class="hint">Idle.</span>
+  </div>
+
+  <table id="results">
+    <thead>
+      <tr>
+        <th>step</th>
+        <th>t</th>
+        <th>dt_hyp</th>
+        <th>dt_par</th>
+        <th>ρ_min</th>
+        <th>ρ_max</th>
+        <th>p_min</th>
+        <th>p_max</th>
+        <th>|v|_max</th>
+        <th>|B|_max</th>
+        <th>|J|_max</th>
+        <th>ρ_floor#</th>
+        <th>p_floor#</th>
+        <th>NaN#</th>
+        <th>∫ρ_drift</th>
+        <th>∫E_drift</th>
+        <th>⟨|∇·B|⟩</th>
+      </tr>
+    </thead>
+    <tbody id="resBody"></tbody>
+  </table>
+
+  <div id="log"></div>
+
+  <details>
+    <summary>What this measures</summary>
+    <p style="font-size: var(--font-sm); line-height: 1.5;">
+      Every <code>sampleEvery</code> steps the harness reads U0/U1/Bx/By
+      to CPU. Per-cell it recovers primitive (ρ, v, p, B) using the same
+      <code>cons_to_prim_mhd</code> recipe the engine uses (DENSITY_FLOOR
+      = 1e-6, PRESSURE_FLOOR default 1e-6). It counts cells where the
+      floors triggered (ρ ≤ 1.001 × floor, p ≤ 1.001 × floor) — those
+      indicate the engine is masking real over-relaxation. It also counts
+      non-finite cells and reports the first (i, j) where a NaN appears.
+      Conservation drift is reported relative to the IC totals (∫ρ over
+      the interior cells changes by less than 1e-7 per step on a healthy
+      run).
+    </p>
+  </details>
+</div>
+
+<canvas id="dummy"></canvas>
+
+<script type="module">
+import { initDevice } from '../src/gpu/device.js';
+import { Sim } from '../src/sim.js';
+import { makeHarrisPreset } from '../src/presets.js';
+import { ReadbackPool, readbackBatch } from '../src/gpu/readback.js';
+import { GHOST_WIDTH, DENSITY_FLOOR, PRESSURE_FLOOR } from '../src/config.js';
+
+const log = document.getElementById('log');
+const status = document.getElementById('status');
+const runBtn = document.getElementById('runBtn');
+const resBody = document.getElementById('resBody');
+
+function logln(msg, cls) {
+    const span = document.createElement('div');
+    if (cls) span.className = cls;
+    span.textContent = msg;
+    log.appendChild(span);
+    log.scrollTop = log.scrollHeight;
+}
+
+function fmt(v, d=3) {
+    if (!isFinite(v)) return String(v);
+    if (v === 0) return '0';
+    const ax = Math.abs(v);
+    if (ax >= 0.01 && ax < 1000) return v.toFixed(d);
+    return v.toExponential(d);
+}
+
+// Recover primitive state at one interior cell, matching cons_to_prim_mhd
+// in shared-helpers.wgsl.
+function consToPrim(rho, mx, my, mz, E, bz, bx_c, by_c, gamma, pFloor) {
+    const r = Math.max(rho, DENSITY_FLOOR);
+    const vx = mx / r;
+    const vy = my / r;
+    const vz = mz / r;
+    const ke = 0.5 * r * (vx*vx + vy*vy + vz*vz);
+    const mb = 0.5 * (bx_c*bx_c + by_c*by_c + bz*bz);
+    const p_raw = (gamma - 1) * (E - ke - mb);
+    const p = Math.max(p_raw, pFloor);
+    return { rho: r, vx, vy, vz, p, p_raw, ke, mb };
+}
+
+// Sample interior state, returning summary statistics + first non-finite
+// cell coords (or null if all finite). Operates on the host-side typed
+// arrays returned from the readback.
+function summarize(N, ghost, U0arr, U1arr, BxArr, ByArr, dx, gamma, pFloor) {
+    const nT = N + 2 * ghost;
+    const ic0 = ghost;
+    const ic1 = ghost + N;
+
+    let rhoMin = +Infinity, rhoMax = -Infinity;
+    let pMin = +Infinity, pMax = -Infinity, pRawMin = +Infinity;
+    let vMax = 0, bMax = 0, jMax = 0;
+    let rhoFloorCount = 0, pFloorCount = 0;
+    let nanCount = 0;
+    let firstNaN = null;
+    let sumRho = 0, sumE = 0, sumBsq = 0;
+    let divbAbsSum = 0, divbAbsMax = 0;
+    let cellCount = 0;
+
+    // Face B → cell-centered B averages.
+    const bxFaceIdx = (i, j) => j * (nT + 1) + i;
+    const byFaceIdx = (i, j) => j * nT + i;
+    const cellIdx = (i, j) => j * nT + i;
+
+    for (let j = ic0; j < ic1; j++) {
+        for (let i = ic0; i < ic1; i++) {
+            const c = cellIdx(i, j);
+            const rho = U0arr[4*c + 0];
+            const mx  = U0arr[4*c + 1];
+            const my  = U0arr[4*c + 2];
+            const mz  = U0arr[4*c + 3];
+            const E   = U1arr[4*c + 0];
+            const bz  = U1arr[4*c + 1];
+
+            // Cell-center B from face averages.
+            const bx_c = 0.5 * (BxArr[bxFaceIdx(i, j)] + BxArr[bxFaceIdx(i+1, j)]);
+            const by_c = 0.5 * (ByArr[byFaceIdx(i, j)] + ByArr[byFaceIdx(i, j+1)]);
+
+            // NaN check.
+            if (!isFinite(rho) || !isFinite(mx) || !isFinite(my) || !isFinite(mz)
+                || !isFinite(E) || !isFinite(bz)
+                || !isFinite(bx_c) || !isFinite(by_c)) {
+                nanCount++;
+                if (firstNaN === null) {
+                    firstNaN = { i: i - ghost, j: j - ghost,
+                                 rho, mx, my, mz, E, bz, bx_c, by_c };
+                }
+                continue;  // don't include in stats
+            }
+
+            const prim = consToPrim(rho, mx, my, mz, E, bz, bx_c, by_c, gamma, pFloor);
+            const v = Math.hypot(prim.vx, prim.vy, prim.vz);
+            const b = Math.hypot(bx_c, by_c, bz);
+
+            if (prim.rho < rhoMin) rhoMin = prim.rho;
+            if (prim.rho > rhoMax) rhoMax = prim.rho;
+            if (prim.p < pMin) pMin = prim.p;
+            if (prim.p > pMax) pMax = prim.p;
+            if (prim.p_raw < pRawMin) pRawMin = prim.p_raw;
+            if (v > vMax) vMax = v;
+            if (b > bMax) bMax = b;
+
+            if (prim.rho <= 1.001 * DENSITY_FLOOR) rhoFloorCount++;
+            if (prim.p   <= 1.001 * pFloor)        pFloorCount++;
+
+            sumRho += rho;
+            sumE   += E;
+            sumBsq += bx_c*bx_c + by_c*by_c + bz*bz;
+            cellCount++;
+        }
+    }
+
+    // J_z and div B from central differences over interior (avoid the
+    // outermost interior cells so the stencil stays in-bounds).
+    for (let j = ic0 + 1; j < ic1 - 1; j++) {
+        for (let i = ic0 + 1; i < ic1 - 1; i++) {
+            const bx_cp = 0.5 * (BxArr[bxFaceIdx(i,   j+1)] + BxArr[bxFaceIdx(i+1, j+1)]);
+            const bx_cm = 0.5 * (BxArr[bxFaceIdx(i,   j-1)] + BxArr[bxFaceIdx(i+1, j-1)]);
+            const by_cp = 0.5 * (ByArr[byFaceIdx(i+1, j  )] + ByArr[byFaceIdx(i+1, j+1)]);
+            const by_cm = 0.5 * (ByArr[byFaceIdx(i-1, j  )] + ByArr[byFaceIdx(i-1, j+1)]);
+            const dBydx = (by_cp - by_cm) / (2 * dx);
+            const dBxdy = (bx_cp - bx_cm) / (2 * dx);
+            const jz = dBydx - dBxdy;
+            const aj = Math.abs(jz);
+            if (isFinite(aj) && aj > jMax) jMax = aj;
+
+            // div B from face values directly.
+            const dBxdx = (BxArr[bxFaceIdx(i+1, j)] - BxArr[bxFaceIdx(i, j)]) / dx;
+            const dBydy = (ByArr[byFaceIdx(i, j+1)] - ByArr[byFaceIdx(i, j)]) / dx;
+            const db = Math.abs(dBxdx + dBydy);
+            if (isFinite(db)) {
+                divbAbsSum += db;
+                if (db > divbAbsMax) divbAbsMax = db;
+            }
+        }
+    }
+    const divbAvg = divbAbsSum / Math.max(1, (N - 2) * (N - 2));
+
+    return {
+        rhoMin, rhoMax, pMin, pMax, pRawMin,
+        vMax, bMax, jMax,
+        rhoFloorCount, pFloorCount, nanCount, firstNaN,
+        sumRho, sumE, sumBsq, divbAvg, divbAbsMax,
+        cellCount,
+    };
+}
+
+async function readbackState(device, pool, sim) {
+    const N = sim.n;
+    const nT = N + 2 * sim.ghost;
+    const cellsT = nT * nT;
+    const xfaces = (nT + 1) * nT;
+    const yfaces = nT * (nT + 1);
+    const bytesV4 = cellsT * 16;
+    const bytesX  = xfaces * 4;
+    const bytesY  = yfaces * 4;
+    // Current state — after step() and swap() — sits in U_n.
+    const reads = await readbackBatch(device, pool, [
+        { buf: sim.buffers.U0_n, byteOffset: 0, byteSize: bytesV4 },
+        { buf: sim.buffers.U1_n, byteOffset: 0, byteSize: bytesV4 },
+        { buf: sim.buffers.Bx_n, byteOffset: 0, byteSize: bytesX  },
+        { buf: sim.buffers.By_n, byteOffset: 0, byteSize: bytesY  },
+        { buf: sim.buffers.dt,   byteOffset: 0, byteSize: 12      },
+    ]);
+    return {
+        U0: new Float32Array(reads[0]),
+        U1: new Float32Array(reads[1]),
+        Bx: new Float32Array(reads[2]),
+        By: new Float32Array(reads[3]),
+        dt: new Float32Array(reads[4]),
+    };
+}
+
+function appendRow(row, baseRow) {
+    const tr = document.createElement('tr');
+    if (row.nanCount > 0) tr.classList.add('bad');
+    else if (row.rhoFloorCount > 0 || row.pFloorCount > 0) tr.classList.add('warn');
+    const drhoPct = baseRow ? 100 * (row.sumRho - baseRow.sumRho) / baseRow.sumRho : 0;
+    const dEPct   = baseRow ? 100 * (row.sumE   - baseRow.sumE  ) / baseRow.sumE   : 0;
+    const cells = [
+        row.step,
+        fmt(row.tEst, 4),
+        fmt(row.dtHyp),
+        fmt(row.dtPar),
+        fmt(row.rhoMin),
+        fmt(row.rhoMax),
+        fmt(row.pMin),
+        fmt(row.pMax),
+        fmt(row.vMax),
+        fmt(row.bMax),
+        fmt(row.jMax),
+        String(row.rhoFloorCount),
+        String(row.pFloorCount),
+        String(row.nanCount),
+        baseRow ? `${drhoPct >= 0 ? '+' : ''}${drhoPct.toFixed(4)}%` : '—',
+        baseRow ? `${dEPct   >= 0 ? '+' : ''}${dEPct.toFixed(4)}%`   : '—',
+        fmt(row.divbAvg),
+    ];
+    for (const c of cells) {
+        const td = document.createElement('td');
+        td.textContent = c;
+        tr.appendChild(td);
+    }
+    resBody.appendChild(tr);
+}
+
+async function runHarris(opts) {
+    const { N, maxSteps, sampleEvery, eta, tightLoop } = opts;
+
+    const canvas = document.getElementById('dummy');
+    const context = canvas.getContext('webgpu');
+
+    const { adapter, device, format } = await initDevice();
+    context.configure({ device, format, alphaMode: 'premultiplied' });
+    logln(`WebGPU ready: ${adapter.info?.description || '(unknown adapter)'}`);
+
+    const sim = new Sim(device, context, format, { hasTimestamp: false });
+    await sim.init();
+    sim.setRunning(false);
+
+    // Patch in a non-standard N (mirrors the convergence-test pattern).
+    if (N !== 256) {
+        sim.n = N;
+        sim.n_total = N + 2 * sim.ghost;
+        const { PlasmaBuffers } = await import('../src/gpu/buffers.js');
+        const { PlasmaRenderer } = await import('../src/gpu/render.js');
+        const { VIRIDIS } = await import('../src/colormaps.js');
+        sim.buffers = new PlasmaBuffers(device, N);
+        sim.renderer = new PlasmaRenderer(device, context, sim.pipelines, sim.buffers);
+        sim.buffers.uploadLUT(VIRIDIS);
+        device.queue.writeBuffer(sim.buffers.dt, 0, new Float32Array([1e-4]).buffer);
+    }
+
+    const preset = makeHarrisPreset(N);
+    // Use harness-supplied dx (Harris is on [-1,1]² → L = 2).
+    sim.loadPreset(preset);
+    if (typeof eta === 'number' && isFinite(eta)) {
+        sim.setEta(eta);
+    }
+    sim._buildBindGroupCache();
+
+    const pool = new ReadbackPool(device);
+    const gamma = sim.gamma;
+    const dx    = sim.dx;
+    const pFloor = sim.pressureFloor;
+
+    const series = [];
+    let baseRow = null;
+    let simTime = 0;
+
+    // Sample step 0 (IC).
+    {
+        const state = await readbackState(device, pool, sim);
+        const s = summarize(N, sim.ghost, state.U0, state.U1, state.Bx, state.By,
+                            dx, gamma, pFloor);
+        const row = {
+            step: 0, tEst: 0, dtHyp: NaN, dtPar: NaN, ...s,
+        };
+        appendRow(row, null);
+        baseRow = row;
+        series.push(row);
+    }
+
+    let nanStep = null;
+    let lastDt = 1e-4;
+    let step = 0;
+    while (step < maxSteps) {
+        // In tight-loop mode, run a batch of `sampleEvery` step()s with
+        // ZERO awaits between them — mirrors the production hot loop's
+        // pattern (no microtask break, so `_maybeReadbackDt`'s .then()
+        // never fires and `_lastDtHyp` stays stale).
+        const batch = Math.min(sampleEvery, maxSteps - step);
+        if (tightLoop) {
+            for (let k = 0; k < batch; k++) sim.step();
+            step += batch;
+            simTime += lastDt * batch;
+        } else {
+            for (let k = 0; k < batch; k++) {
+                sim.step();
+                simTime += lastDt;
+            }
+            step += batch;
+        }
+
+        {
+            // Flush GPU work before reading back.
+            await device.queue.onSubmittedWorkDone();
+            const state = await readbackState(device, pool, sim);
+            const dtHyp = state.dt[0];
+            const dtPar = state.dt[1];
+            if (isFinite(dtHyp) && dtHyp > 0) lastDt = dtHyp;
+            const s = summarize(N, sim.ghost, state.U0, state.U1, state.Bx, state.By,
+                                dx, gamma, pFloor);
+            const row = { step, tEst: simTime, dtHyp, dtPar, ...s };
+            appendRow(row, baseRow);
+            series.push(row);
+            if (s.nanCount > 0) {
+                nanStep = step;
+                logln(`NaN detected at step ${step}.`, 'err');
+                logln(`first cell: (${s.firstNaN.i}, ${s.firstNaN.j})  rho=${s.firstNaN.rho} E=${s.firstNaN.E}`);
+                break;
+            }
+        }
+    }
+
+    return {
+        meta: { N, maxSteps, sampleEvery, eta, dx, gamma, pFloor, nanStep },
+        series,
+    };
+}
+
+async function runOnce() {
+    runBtn.disabled = true;
+    log.textContent = '';
+    resBody.replaceChildren();
+    status.textContent = 'Running...';
+
+    const opts = {
+        N: parseInt(document.getElementById('optN').value, 10) || 256,
+        maxSteps: parseInt(document.getElementById('optSteps').value, 10) || 400,
+        sampleEvery: parseInt(document.getElementById('optSample').value, 10) || 5,
+        eta: parseFloat(document.getElementById('optEta').value),
+        tightLoop: document.getElementById('optTight').checked,
+    };
+
+    try {
+        const result = await runHarris(opts);
+        // Emit the full result for Playwright via window.__harrisResult and
+        // also a single console.log line so puppeteer/playwright can scrape it.
+        window.__harrisResult = result;
+        console.log('HARRIS_DIAGNOSTIC_JSON_BEGIN');
+        console.log(JSON.stringify(result));
+        console.log('HARRIS_DIAGNOSTIC_JSON_END');
+        status.textContent = result.meta.nanStep != null
+            ? `Done. NaN at step ${result.meta.nanStep}.`
+            : `Done. ${result.meta.maxSteps} steps clean.`;
+        logln(`Result keys: ${result.series.length} rows.`);
+    } catch (e) {
+        status.textContent = 'Failed.';
+        logln('ERROR: ' + e.message, 'err');
+        console.error(e);
+        window.__harrisError = String(e.stack || e.message);
+        console.log('HARRIS_DIAGNOSTIC_ERROR ' + (e.message || e));
+    }
+    runBtn.disabled = false;
+}
+
+runBtn.addEventListener('click', runOnce);
+
+// Auto-run if ?auto=1 in URL.
+const url = new URL(window.location.href);
+if (url.searchParams.get('auto') === '1') {
+    if (url.searchParams.get('N'))           document.getElementById('optN').value = url.searchParams.get('N');
+    if (url.searchParams.get('maxSteps'))    document.getElementById('optSteps').value = url.searchParams.get('maxSteps');
+    if (url.searchParams.get('sampleEvery')) document.getElementById('optSample').value = url.searchParams.get('sampleEvery');
+    if (url.searchParams.get('eta'))         document.getElementById('optEta').value = url.searchParams.get('eta');
+    if (url.searchParams.get('tight') === '1') document.getElementById('optTight').checked = true;
+    setTimeout(runOnce, 100);
+}
+</script>
+</body>
+</html>

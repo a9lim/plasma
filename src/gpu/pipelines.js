@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 23;
+const SHADER_VERSION = 24;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -208,6 +208,12 @@ function applyResInitBGL(device) {
         { binding: 9,  visibility: COMPUTE, buffer: RW_STO },   // Bx_tmp
         { binding: 10, visibility: COMPUTE, buffer: RW_STO },   // By_tmp
         { binding: 11, visibility: COMPUTE, buffer: RW_STO },   // U1_tmp
+        // Session 10 dt-feedback fix — fresh dt_super read inside the
+        // shader from dt_buf.dt_hyp rather than the lagged
+        // sts_meta.dt_super. Bound as UNIFORM (DtUniform struct, 16 B,
+        // same buffer as update-conserved-weighted's dt_buf) to keep
+        // the storage-binding count at 9 (under the 10-per-stage cap).
+        { binding: 12, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
     ]);
 }
 
@@ -224,6 +230,9 @@ function applyResPrevBGL(device) {
         { binding: 8,  visibility: COMPUTE, buffer: RW_STO },   // Bx_tmp
         { binding: 9,  visibility: COMPUTE, buffer: RW_STO },   // By_tmp
         { binding: 10, visibility: COMPUTE, buffer: RW_STO },   // U1_tmp
+        // Session 10 dt-feedback fix — see applyResInitBGL.
+        // Bound as UNIFORM to keep storage-binding count at 8.
+        { binding: 11, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
     ]);
 }
 
