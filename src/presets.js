@@ -568,7 +568,7 @@ export function makeAlfvenCpawPreset(n = GRID_N) {
  *  so Ez_corner = 0; the CT face-B update writes 0 - 0 = 0. The only
  *  active path is: PPM → HLLC → update-conserved-weighted → energy floor.
  */
-export function makeAcousticWaveHydroPreset(n = GRID_N) {
+export function makeAcousticWaveHydroPreset(n = GRID_N, amplitudeOverride) {
     const gamma = 5.0 / 3.0;
     const L     = 1.0;
     const dx    = L / n;
@@ -576,7 +576,8 @@ export function makeAcousticWaveHydroPreset(n = GRID_N) {
 
     const rho0   = 1.0;
     const p0     = 1.0;
-    const A      = 1e-3;
+    const A      = (typeof amplitudeOverride === 'number' && isFinite(amplitudeOverride))
+                       ? amplitudeOverride : 1e-3;
     const lambda = 1.0;
     const cs     = Math.sqrt(gamma * p0 / rho0);  // ≈ 1.2910
     const TWO_PI = 2.0 * Math.PI;

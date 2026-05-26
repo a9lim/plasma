@@ -48,11 +48,13 @@
   <h1>Linear acoustic wave (hydro) — convergence test</h1>
   <p class="hint">
     Pure Euler: B ≡ 0 everywhere, smooth periodic 1D acoustic wave on
-    [0,1]², γ = 5/3, η = 0, amplitude A = 1e-3 (deeply linear). After one
-    period T = λ/c_s = √(3/5) ≈ 0.7746 the analytic solution equals the
-    IC. L1 error averaged per cell per conserved component over all 8
-    conserved variables; B components stay machine-zero. Companion to
-    the CPAW (MHD) sweep — same harness, B = 0.
+    [0,1]², γ = 5/3, η = 0. Sweep amplitudes A ∈ {1e-2, 1e-3, 1e-4} × resolutions
+    N ∈ {32, 64, 128, 256} (12 runs). After one period T = λ/c_s = √(3/5) ≈ 0.7746
+    the analytic solution equals the IC. L1 error averaged per cell per
+    conserved component over all 8 conserved variables; B components stay
+    machine-zero. The amplitude sweep tests whether the L1 floor at A=1e-3
+    is fp32 noise (floor scales with A) or a constant-coefficient bug
+    (floor independent of A).
   </p>
   <div class="actions">
     <button id="runBtn" class="tool-btn">Run sweep</button>
@@ -62,6 +64,7 @@
   <table id="results">
     <thead>
       <tr>
+        <th>A</th>
         <th>N</th>
         <th>dx</th>
         <th>steps</th>
@@ -125,8 +128,8 @@ function fmt(v, digits=4) {
  * t=0 by periodicity) on the interior cells of an (N+4) ghost-padded
  * grid. Returns the same four typed arrays the preset returns.
  */
-function analyticAcoustic(n) {
-    return makeAcousticWaveHydroPreset(n);
+function analyticAcoustic(n, A) {
+    return makeAcousticWaveHydroPreset(n, A);
 }
 
 /**
@@ -179,7 +182,7 @@ function l1Error(n, ghost, num, ref) {
     return { L1: sum / count, bMaxAbs };
 }
 
-async function runOne(adapter, device, format, N, T) {
+async function runOne(adapter, device, format, N, T, amplitude) {
     const canvas = document.getElementById('dummy');
     const context = canvas.getContext('webgpu');
     context.configure({ device, format, alphaMode: 'premultiplied' });
@@ -201,7 +204,7 @@ async function runOne(adapter, device, format, N, T) {
     sim._pushUniforms();
     sim._pushLicUniforms();
 
-    sim.loadPreset(makeAcousticWaveHydroPreset(N));
+    sim.loadPreset(makeAcousticWaveHydroPreset(N, amplitude));
     sim._buildBindGroupCache();
 
     const pool = new ReadbackPool(device);
@@ -269,7 +272,7 @@ async function runOne(adapter, device, format, N, T) {
         Bx_face: reads[2],
         By_face: reads[3],
     };
-    const ref = analyticAcoustic(N);
+    const ref = analyticAcoustic(N, amplitude);
     const { L1, bMaxAbs } = l1Error(N, ghost, num, ref);
 
     const wallMs = performance.now() - t0;
@@ -307,49 +310,68 @@ async function runSweep() {
     logln(`Target time T = λ/c_s = √(3/5) = ${T.toFixed(7)}`);
 
     const sizes = [32, 64, 128, 256];
-    const results = [];
+    const amplitudes = [1e-2, 1e-3, 1e-4];
+    const allResults = {};  // amplitude -> array of run results
 
-    for (const N of sizes) {
-        setStatus(`Running N=${N}...`);
-        logln(`Starting N=${N}`);
-        try {
-            const r = await runOne(adapter, device, format, N, T);
-            results.push(r);
-            logln(
-              `N=${N}: L1 = ${fmt(r.L1)},  dt_avg = ${fmt(r.dtAvg, 3)},  ` +
-              `${r.steps} steps,  ${r.wallSec.toFixed(2)}s,  ` +
-              `simTime=${r.simTime.toFixed(5)},  |B|max=${fmt(r.bMaxAbs, 2)}`
-            );
-            appendRow(r, results);
-        } catch (e) {
-            logln(`N=${N} FAILED: ${e.message}`, 'err');
-            console.error(e);
-            break;
+    for (const A of amplitudes) {
+        logln(`──── Amplitude A = ${A} ────`);
+        const results = [];
+        allResults[A] = results;
+        for (const N of sizes) {
+            setStatus(`A=${A}, N=${N}...`);
+            logln(`Starting A=${A}, N=${N}`);
+            try {
+                const r = await runOne(adapter, device, format, N, T, A);
+                r.amplitude = A;
+                results.push(r);
+                logln(
+                  `A=${A}, N=${N}: L1 = ${fmt(r.L1)},  dt_avg = ${fmt(r.dtAvg, 3)},  ` +
+                  `${r.steps} steps,  ${r.wallSec.toFixed(2)}s,  ` +
+                  `simTime=${r.simTime.toFixed(5)},  |B|max=${fmt(r.bMaxAbs, 2)}`
+                );
+                appendRow(r, results);
+            } catch (e) {
+                logln(`A=${A}, N=${N} FAILED: ${e.message}`, 'err');
+                console.error(e);
+                break;
+            }
+            await new Promise(r => setTimeout(r, 50));
         }
-        await new Promise(r => setTimeout(r, 50));
+
+        if (results.length >= 2) {
+            const fit = leastSquaresLogLog(results.map(r => r.dx),
+                                           results.map(r => r.L1));
+            const row = document.createElement('tr');
+            const labelCell = document.createElement('td');
+            labelCell.colSpan = 6;
+            labelCell.textContent = `A=${A} slope (log L1 vs log dx, over ${results.length} resolutions):`;
+            const slopeCell = document.createElement('td');
+            const pill = document.createElement('span');
+            pill.className = 'pill';
+            pill.textContent = fit.slope.toFixed(3);
+            slopeCell.appendChild(pill);
+            const noteCell = document.createElement('td');
+            noteCell.textContent = interpret(fit.slope);
+            row.appendChild(labelCell);
+            row.appendChild(slopeCell);
+            row.appendChild(noteCell);
+            resFoot.appendChild(row);
+            logln(`A=${A} best-fit slope (log L1 vs log dx): ${fit.slope.toFixed(4)}`);
+            logln(`Interpretation: ${interpret(fit.slope)}`);
+        }
     }
 
-    if (results.length >= 2) {
-        const fit = leastSquaresLogLog(results.map(r => r.dx),
-                                       results.map(r => r.L1));
-        const row = document.createElement('tr');
-        const labelCell = document.createElement('td');
-        labelCell.colSpan = 5;
-        labelCell.textContent = `Least-squares slope over ${results.length} resolutions (log L1 vs log dx):`;
-        const slopeCell = document.createElement('td');
-        const pill = document.createElement('span');
-        pill.className = 'pill';
-        pill.textContent = fit.slope.toFixed(3);
-        slopeCell.appendChild(pill);
-        const noteCell = document.createElement('td');
-        noteCell.textContent = interpret(fit.slope);
-        row.appendChild(labelCell);
-        row.appendChild(slopeCell);
-        row.appendChild(noteCell);
-        resFoot.appendChild(row);
-        logln(`Best-fit slope (log L1 vs log dx): ${fit.slope.toFixed(4)}`);
-        logln(`Interpretation: ${interpret(fit.slope)}`);
+    // Cross-amplitude floor analysis: how does L1 scale with A at each N?
+    logln(`──── Cross-amplitude L1/A scaling (a floor would imply L1/A ≈ const at high A only, or no scaling at saturation) ────`);
+    for (const N of sizes) {
+        const parts = [];
+        for (const A of amplitudes) {
+            const r = (allResults[A] || []).find(x => x.N === N);
+            if (r) parts.push(`A=${A}: L1=${fmt(r.L1, 3)}, L1/A=${fmt(r.L1 / A, 3)}`);
+        }
+        logln(`N=${N}: ${parts.join('  |  ')}`);
     }
+
     setStatus('Done.');
     runBtn.disabled = false;
 }
@@ -366,6 +388,7 @@ function appendRow(r, all) {
     }
     const tr = document.createElement('tr');
     const cells = [
+        r.amplitude != null ? fmt(r.amplitude, 1) : '—',
         String(r.N),
         fmt(r.dx),
         String(r.steps),
