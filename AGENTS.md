@@ -13,19 +13,22 @@ contract section below.
 Implementation plan (source of truth for design decisions):
 `~/.claude/plans/geon-currently-uses-cpu-abstract-cat.md`.
 
-**Status**: Phases 1–6 complete (engine + UI + LIC). Phases 7–8 (polish
-+ parent-repo wiring) outstanding — see [`docs/HANDOFF.md`](docs/HANDOFF.md).
-Per-session retrospectives live in [`docs/sessions/`](docs/sessions/);
-comments in code and shaders that say "Session N" point at
-`docs/sessions/session-N.md`.
+**Status**: Phases 1–6 complete (engine + UI + LIC). Session 14 added a
+breadth-pass extended-physics layer (Hall, anisotropic conduction,
+radiative cooling, self-gravity, GS-upwind EMF toggle, positivity guard)
+— all ON by default; stability/integration/UI deferred. Phases 7–8
+(polish + parent-repo wiring) outstanding — see
+[`docs/HANDOFF.md`](docs/HANDOFF.md). Per-session retrospectives live
+in [`docs/sessions/`](docs/sessions/); comments in code and shaders
+that say "Session N" point at `docs/sessions/session-N.md`.
 
 ## Design
 
-- **Physics**: resistive 2.5D ideal MHD — state `(ρ, v_x, v_y, v_z, B_x, B_y, B_z, p)`
-- **Riemann solver**: HLLD (Miyoshi & Kusano 2005) with HLLC and HLL fallbacks for degenerate branches
+- **Physics**: resistive 2.5D ideal MHD — state `(ρ, v_x, v_y, v_z, B_x, B_y, B_z, p)` — plus a Session 14 breadth-pass extended-physics layer (Hall, cooling, anisotropic conduction, self-gravity); see "Extended physics" section
+- **Riemann solver**: HLLD (Miyoshi & Kusano 2005) with HLLC and HLL fallbacks for degenerate branches, plus star-state positivity fallback (Session-WIP)
 - **Reconstruction**: PPM (Colella & Woodward 1984) with characteristic-variable limiting (Stone+ 2008 §3.4.2 — Athena/Athena++ default for MHD)
 - **Time integration**: RK3 SSP, three stages, single-submit-per-step
-- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008), Balsara-Spicer 1999 arithmetic-mean corner EMF (the Gardiner-Stone 2005 upwind attempt was reverted Session 8 — see [`docs/sessions/session-8.md`](docs/sessions/session-8.md); upwind machinery in shader stays for re-implementation)
+- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008). EMF mode is runtime-toggleable via `emf_mode` uniform: Balsara-Spicer 1999 arithmetic mean (mode 0) or Gardiner-Stone 2005 upwind (mode 1). Mode 1 default since Session 14
 - **Resistivity**: curl(η J) form (Athena++/PLUTO canonical) — ∂Bx/∂t |_res = −∂_y(η J_z), ∂By/∂t |_res = +∂_x(η J_z), ∂Bz/∂t |_res = η ∇²Bz. J_z and η are sampled at corners (co-located with Ez_edge); curl form is identically ∇·B-preserving on the Yee grid by the same telescoping argument as ideal-MHD CT. RKL2 super-time-stepping applied after the RK3 hyperbolic step (Lie split, 1st order)
 - **Boundaries**: per-edge selectable — periodic / outflow / reflecting / driven
 - **Default view**: J_z (out-of-plane current density)
@@ -57,27 +60,32 @@ plasma/
     ├── probe.js            ← Probe tab: cell sampling + mini time-series
     └── gpu/
         ├── device.js       ← adapter + device init
-        ├── buffers.js      ← ghost-padded slots, BC uniforms, stage params, noise + lic_out
+        ├── buffers.js      ← ghost-padded slots, BC uniforms, stage params, noise + lic_out, Poisson φ
         ├── pipelines.js    ← compute + render pipeline factory
         ├── render.js       ← view-field → colormap → LIC advect → composite
         ├── lic.js          ← LicRenderer (per-frame bind group construction)
         ├── readback.js     ← ReadbackPool for stats + probe GPU→CPU
         └── shaders/
-            ├── shared-helpers.wgsl              ← Uniforms, BcUniforms, MHD prim/cons, indexing
+            ├── shared-helpers.wgsl              ← Uniforms (128 B), BcUniforms, MHD prim/cons, indexing, FLAG_* enums
             ├── apply-bcs.wgsl                   ← ghost-cell fill (4 modes × 4 edges)
             ├── reconstruct-ppm.wgsl             ← per-direction PPM (CW 1984)
-            ├── riemann-hlld.wgsl                ← HLLD (M&K 2005) + HLLC + HLL fallbacks
-            ├── compute-emf.wgsl                 ← Balsara-Spicer 1999 arithmetic-mean corner Ez (upwind machinery present but disabled — Session 8)
-            ├── update-conserved-weighted.wgsl   ← RK3 SSP weighted U update
+            ├── riemann-hlld.wgsl                ← HLLD (M&K 2005) + HLLC + HLL fallbacks + star-state positivity guards
+            ├── compute-emf.wgsl                 ← Corner Ez — runtime toggle between Balsara-Spicer mean (emf_mode=0) and Gardiner-Stone 2005 upwind (emf_mode=1, default since Session 14)
+            ├── update-conserved-weighted.wgsl   ← RK3 SSP weighted U update + FLAG_POSITIVITY guard
             ├── update-b-weighted.wgsl           ← RK3 SSP weighted face-B update (CT)
             ├── apply-resistivity.wgsl           ← η ∇²B per stage (post-CT)
-            ├── compute-dt.wgsl                  ← MHD CFL + parabolic resistive CFL
+            ├── compute-dt.wgsl                  ← MHD CFL (2D unsplit sum) + parabolic resistive CFL
             ├── view-field.wgsl                  ← scalar extract (ρ, p, |v|, |B|, J_z)
             ├── colormap.wgsl                    ← viridis LUT lookup (interior only)
             ├── lic-advect.wgsl                  ← backward-trace LIC along B (transpilable)
             ├── lic-reduce.wgsl                  ← per-tile min/max reduce of lic_out (workgroup-shared atomics)
             ├── lic-normalize.wgsl               ← in-place contrast stretch using lic_minmax
-            └── composite.wgsl                   ← canvas blit, colormap × LIC luminance
+            ├── composite.wgsl                   ← canvas blit, colormap × LIC luminance
+            ├── apply-cooling.wgsl               ← (Session 14) Λ(T)=Λ_0·√T bremsstrahlung-shape source on E
+            ├── solve-poisson.wgsl               ← (Session 14) Jacobi iterator for ∇²φ = 4πG(ρ−ρ̄)
+            ├── apply-gravity.wgsl               ← (Session 14) external + self-gravity source on momentum + E
+            ├── apply-conduction.wgsl            ← (Session 14) anisotropic Spitzer heat-flux divergence on E
+            └── apply-hall.wgsl                  ← (Session 14) corner Hall E = (d_i/ρ)·(J×B), CT update of face B + Bz
 ```
 
 ## Numerical method
@@ -434,33 +442,99 @@ direction (`tile_min`, `tile_max`) with a single top-level
 `lic-normalize` are purely per-invocation (no shared memory, no
 atomics, no barriers).
 
-## Uniforms (64 bytes)
+## Uniforms (128 bytes)
 
-| Slot | Type | Field            | Notes                                                          |
-|------|------|------------------|----------------------------------------------------------------|
-| 0    | f32  | `dx`             | Cell size in domain units                                      |
-| 1    | f32  | `gamma`          | Adiabatic index                                                |
-| 2    | f32  | `view_min`       | Per-preset visualization clamp                                 |
-| 3    | f32  | `view_max`       | Per-preset visualization clamp                                 |
-| 4    | f32  | `eta`            | Resistivity                                                    |
-| 5    | f32  | `_pad_lic_0`     | Reserved (was lic_phase — moved to LicUniforms)                |
-| 6    | f32  | `_pad_lic_1`     | Reserved (was lic_intensity — moved to LicUniforms)            |
-| 7    | f32  | `_pad_lic_2`     | Reserved (was lic_drift_x — moved to LicUniforms)              |
-| 8    | u32  | `grid_n`         | Interior grid extent                                           |
-| 9    | u32  | `grid_n_total`   | Ghost-padded grid extent                                       |
-| 10   | u32  | `ghost_w`        | Ghost width (= 2)                                              |
-| 11   | f32  | `pressure_floor` | Live UI slider; minimum p in cons→prim recovery                |
-| 12   | f32  | `cfl`            | Hyperbolic CFL number — consumed by compute-dt                 |
-| 13   | u32  | `view_mode`      | View enum from config.js VIEW_*                                |
-| 14   | f32  | `_pad_lic_3`     | Reserved (was lic_drift_y — moved to LicUniforms)              |
-| 15   | u32  | `noise_n`        | Side length of noise buffer (= 1024)                           |
+Slot 0-15 (original 64 B) — base MHD physics + render state:
 
-`Uniforms` is held in a single 64 B buffer. Sweep direction lives in two
+| Slot | Type | Field             | Notes                                                          |
+|------|------|-------------------|----------------------------------------------------------------|
+| 0    | f32  | `dx`              | Cell size in domain units                                      |
+| 1    | f32  | `gamma`           | Adiabatic index                                                |
+| 2    | f32  | `view_min`        | Per-preset visualization clamp                                 |
+| 3    | f32  | `view_max`        | Per-preset visualization clamp                                 |
+| 4    | f32  | `eta`             | Resistivity                                                    |
+| 5    | f32  | `eta_anom_alpha`  | Birn 2001 anomalous-η α (0 = constant-η)                       |
+| 6    | f32  | `_pad_lic_1`      | Reserved (was lic_intensity — now in LicUniforms)              |
+| 7    | f32  | `_pad_lic_2`      | Reserved (was lic_drift_x — now in LicUniforms)                |
+| 8    | u32  | `grid_n`          | Interior grid extent                                           |
+| 9    | u32  | `grid_n_total`    | Ghost-padded grid extent                                       |
+| 10   | u32  | `ghost_w`         | Ghost width (= 2)                                              |
+| 11   | f32  | `pressure_floor`  | Live UI slider; minimum p in cons→prim recovery                |
+| 12   | f32  | `cfl`             | Hyperbolic CFL number — consumed by compute-dt                 |
+| 13   | u32  | `view_mode`       | View enum from config.js VIEW_*                                |
+| 14   | f32  | `eta_anom_jcrit`  | Anomalous-η activation threshold J_crit                        |
+| 15   | u32  | `noise_n`         | Side length of noise buffer (= 1024)                           |
+
+Slot 16-31 (extended physics, Session 14):
+
+| Slot | Type | Field                   | Notes                                                          |
+|------|------|-------------------------|----------------------------------------------------------------|
+| 16   | f32  | `hall_di`               | Hall ion inertial length d_i (code units; 0 = no Hall)         |
+| 17   | u32  | `hall_substeps_max`     | Max Hall sub-cycles per macro step (currently unused; explicit FE) |
+| 18   | f32  | `cooling_lambda0`       | Cooling rate scale Λ_0 (0 = no cooling)                        |
+| 19   | f32  | `cooling_T_floor`       | Below this T, Λ → 0                                            |
+| 20   | f32  | `cooling_T_ref`         | Reference temperature for Λ(T) normalization                   |
+| 21   | f32  | `conduction_kappa`      | Parallel thermal conductivity κ_∥ (0 = no conduction)          |
+| 22   | f32  | `conduction_iso_frac`   | κ_⊥ / κ_∥ (0 = fully anisotropic, 1 = isotropic)               |
+| 23   | f32  | `conduction_sat_frac`   | Saturated heat-flux fraction (0 = unlimited; currently unused) |
+| 24   | f32  | `gravity_gx`            | External gravity x (constant)                                  |
+| 25   | f32  | `gravity_gy`            | External gravity y                                             |
+| 26   | f32  | `gravity_G`             | Newton's G for self-gravity (0 = no self-gravity)              |
+| 27   | u32  | `gravity_poisson_iters` | Jacobi iterations per macro step                               |
+| 28   | u32  | `physics_flags`         | Bitfield: COOLING\|GRAV_EXT\|GRAV_SELF\|COND\|HALL\|POSITIVITY\|EMF_UPWIND |
+| 29   | u32  | `emf_mode`              | 0 = Balsara-Spicer mean, 1 = Gardiner-Stone upwind             |
+| 30-31| u32  | `_pad_phys_*`           | Reserved                                                       |
+
+`Uniforms` is held in a single 128 B buffer. Sweep direction lives in two
 static 16 B uniforms (`sweepDir_x` = 0u, `sweepDir_y` = 1u) bound only by
 reconstruct-ppm and riemann-hlld. LIC render-pace state (phase, intensity,
 drift) lives in a separate 16 B `LicUniforms` buffer rewritten per render
 frame. Stage weights live in 3 separate uniform buffers (`stage_1` /
 `stage_2` / `stage_3`).
+
+## Extended physics (Session 14 breadth pass)
+
+Six features bolted onto the base MHD engine in one sprint. All ON by
+default — no UI knobs in the current pass. Each shader early-returns
+when its corresponding scalar is 0 or its flag bit is clear, so a
+feature can be disabled cell-locally by zeroing the relevant uniform
+via the `sim.set*` setters. Physics correctness was the priority;
+stability, performance, and integration with the existing RK3 + RKL2
+pipeline are deferred to a follow-up iteration pass.
+
+| Feature              | Shader                             | Equation / discretization                                                              |
+|----------------------|------------------------------------|----------------------------------------------------------------------------------------|
+| Radiative cooling    | `apply-cooling.wgsl`               | `dE/dt = -ρ²·Λ_0·√(max(T-T_floor,0)/T_ref)` (bremsstrahlung shape); explicit FE with single-step E-floor clamp |
+| Self-gravity         | `solve-poisson.wgsl` + `apply-gravity.wgsl` | Jacobi iterator for `∇²φ = 4πG(ρ−ρ̄)`, then `d(ρv)/dt = ρg`, `dE/dt = ρv·g` with `g = -∇φ` |
+| External gravity     | `apply-gravity.wgsl` (alt branch)  | Same source-term form with constant `g = (gx, gy, 0)`                                  |
+| Anisotropic conduction | `apply-conduction.wgsl`          | `q = κ_∥ b̂(b̂·∇T) + κ_⊥(∇T−b̂(b̂·∇T))`, `dE/dt = -∇·q`; face-centered ∇T via central diffs |
+| Hall MHD             | `apply-hall.wgsl`                  | Corner `E_H = (d_i/ρ)·(J×B)` from corner-sampled J=∇×B, then CT update of face B + cell-centered Bz |
+| Positivity guard     | `update-conserved-weighted.wgsl` (inline) | When post-update `ρ ≤ 0` or `E−KE ≤ p_floor/(γ−1)`, drop the L term and fall back to the pure SSP blend (Hu/Adams/Shu 2013 §3 spirit) |
+| EMF mode toggle      | `compute-emf.wgsl`                 | Runtime switch between Balsara-Spicer arithmetic mean and Gardiner-Stone 2005 upwind (latter is default since S14) |
+
+### Default scalars (Session 14)
+
+| Knob                  | Default | Notes                                              |
+|-----------------------|---------|----------------------------------------------------|
+| `physics_flags`       | `COOLING\|GRAVITY_SELF\|CONDUCTION\|HALL\|POSITIVITY\|EMF_UPWIND` | All asked-for features on |
+| `emf_mode`            | 1 (GS upwind) | Reverted-from default flipped back |
+| `hall_di`             | 0.02    | ~5 cells at N=256 — Hall scale resolved            |
+| `cooling_lambda0`     | 0.01    | Visible but not catastrophic on 1×1-domain presets |
+| `conduction_kappa`    | 1e-3    | Below parabolic CFL for OT scale; still expects instability at boundaries |
+| `conduction_iso_frac` | 0.1     | 90% parallel, 10% perp                             |
+| `gravity_G`           | 1e-3    | Tiny perturbation, mostly visible on Sod/Brio-Wu where ρ-contrasts are large |
+| `gravity_poisson_iters` | 30    | Stub — proper relaxation needs more iters         |
+
+### Sharp edges (the iteration pass should address these)
+
+1. **Hall ignores whistler CFL.** Dispersive scheme; formal stability bound is `dt ≤ dx² / (v_A·d_i)` which is ~100× more restrictive than hyperbolic CFL at the default `d_i = 0.02` on N=256. Expect instability under tight coupling. Fix: sub-cycle (Tóth 2008) or Hall Diffusion Scheme (O'Sullivan & Downes 2006).
+2. **Conduction ignores parabolic CFL.** Same story — needs RKL2 integration alongside the existing resistivity super-step.
+3. **Cooling is explicit FE.** Stable only when `n²Λ·Δt ≪ (γ−1)·p`. The single-step floor clamp keeps it from going negative, but the iteration step is biased. Fix: Townsend 2009 exact integration with piecewise-power-law Λ.
+4. **Poisson `ρ̄` is sampled from the center cell**, not reduced. Periodic compatibility breaks for asymmetric mass distributions. Fix: actual mean reduction (mirror compute-dt's tile pattern).
+5. **No apply-bcs after the extended-physics passes.** Ghost cells go stale once Hall/gravity/conduction/cooling modify face B + E. Expect boundary artifacts on Sod/Brio-Wu (outflow) and Harris (mixed).
+6. **Hall reads and writes face B in the same pass.** Race-prone — different invocations read each other's mid-update writes. Cleaner structure is "compute E_H corner buffer" → "CT-update face B from buffer" as two passes.
+7. **No new view modes** for T, |q| (heat flux), φ (gravitational potential). Each feature is active but not directly visualizable. The reconnection-rate / |B|_max / current diagnostics in stats-display will pick up secondary signatures.
+8. **No UI.** Setters exist (`sim.setPhysicsFlag`, `sim.setHallDi`, `sim.setCoolingLambda0`, etc.) for save/load capture and dev use, but the advanced settings dropdown doesn't expose them. UI wiring is the obvious next session.
 
 ## Transpiler contract
 

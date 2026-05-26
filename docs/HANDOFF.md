@@ -29,6 +29,7 @@ point at the corresponding `sessions/session-N.md`.
 | 6     | Animated LIC visualization                 | done     |
 | 7     | Polish (content, perturbation, JSON-LD, OG)| **partial** |
 | 8     | Parent-repo wiring                         | **todo** |
+| 9     | Extended physics (Hall, cooling, conduction, self-gravity, EMF toggle, positivity guard) — **breadth pass only** | **partial** — see [Session 14](sessions/session-14.md) and the "Phase 9" section below |
 
 **Verification status**: OT live-verified at N=256 and N=1024 across
 the full η range up to 1.0 (Session 13 — the RKL2 substep-count fixes
@@ -37,6 +38,16 @@ clean through 400+ steps as of Session 12. Sod / Brio-Wu not yet
 retested after Sessions 2-13 — should be safe (Sod is pure hydro, no
 RKL2 path; Brio-Wu is η=0, no RKL2 path) but worth a smoke test.
 N=512 also not directly verified.
+
+**Post-Session 14 caveat**: all the verification above is from BEFORE
+the extended-physics breadth pass. Session 14 turned six new features
+(Hall, cooling, conduction, self-gravity, GS-upwind EMF, positivity
+guard) ON BY DEFAULT for every preset, with no stability promises.
+The OT / Harris / Sod / Brio-Wu live-verification numbers above no
+longer hold — they refer to a code path that is no longer the default
+path. To re-verify base MHD without the breadth-pass layer, call
+`sim.physicsFlags = 0; sim.emfMode = 0; sim._pushUniforms()` after
+sim init.
 
 ## Phase 7 — Polish
 
@@ -331,6 +342,106 @@ context) can plug in:
   corner. This is the right call (matches Stone+ 2008) but worth
   knowing if reading the plan and code together.
 
+## Phase 9 — Extended physics iteration
+
+Session 14 landed first-pass implementations of Hall, cooling,
+anisotropic conduction, self-gravity, positivity guard, and the
+GS-upwind EMF toggle — all ON by default. Physics correctness was
+the priority; everything else was deferred. The follow-up work is
+to fix each sharp edge documented in `apply-*.wgsl` headers. In
+recommended order (small + foundational first, marquee last):
+
+### 1. Validation presets and view modes
+
+Without dedicated tests / views, none of the new features are
+*visible* enough to know whether they're doing the right thing.
+Add view modes for `T` (temperature), `|q|` (heat flux), and `φ`
+(gravitational potential) — small additions to `view-field.wgsl`.
+Add validation presets:
+
+* **Hall whistler dispersion** — single-mode plane wave, measure
+  phase velocity, compare to ω = k·v_A·√(1 + (k·d_i)²) (Tóth, Ma,
+  Gombosi 2008).
+* **Thermal conduction front** — isolated hot spot, watch it spread
+  along a uniform B (anisotropic test); compare to the analytic
+  diffusion solution.
+* **Cooling instability** — uniform gas at supercritical Λ;
+  watch fragmentation timescale.
+* **Jeans instability** — small density perturbation under
+  self-gravity; measure growth rate vs. Jeans λ.
+
+### 2. apply-bcs after extended physics
+
+Currently the extended-physics passes modify cells + face B + Bz
+without canonicalizing ghost cells afterward. Run `apply-bcs` once
+more after `_encodeExtendedPhysics` so the post-step state has
+consistent ghosts. Mirror the post-RKL2 pattern in
+`_encodeResistivitySuperStep`.
+
+### 3. Hall sub-cycling
+
+Highest-impact stability fix. Hall is dispersive (whistler waves),
+so RKL2's parabolic super-time-stepping doesn't directly apply.
+Right move is Tóth 2008 Hall sub-cycle inside a single hyperbolic
+Δt, with the sub-step CFL set by `dt ≤ dx² / (v_A·d_i)`. Either:
+
+* explicit sub-cycle with a CPU-counted N (mirrors the RKL2 host
+  orchestration in sim.js), or
+* O'Sullivan & Downes 2006 Hall Diffusion Scheme — hyperbolizes
+  the Hall term so the standard CFL covers it. More code but
+  cleaner.
+
+### 4. Conduction into RKL2
+
+Anisotropic conduction IS parabolic — it can ride on top of the
+existing RKL2 super-time-stepping machinery alongside resistivity.
+The clean integration: extend `apply-resistivity-init.wgsl` and
+`apply-resistivity-prev.wgsl` to compute the conduction operator
+L(E) alongside the resistive curl(η J) on B. Adds two more storage
+bindings to those shaders; check the per-stage 10-binding cap.
+
+### 5. Townsend cooling integration
+
+Explicit FE biases the cooling timestep. Townsend 2009 exact
+integration with a piecewise-power-law Λ(T) is the canonical fix
+— shader needs a small precomputed CDF table (one upload at init).
+
+### 6. Real ρ̄ reduction for Poisson
+
+Mirror compute-dt's per-tile shared-atomic reduction shape to
+compute the actual cell-averaged density. The center-cell stub
+breaks compatibility for asymmetric mass distributions.
+
+### 7. Hall split into corner-buffer + CT-update
+
+Two-pass structure to eliminate the within-pass race condition:
+
+* `compute-hall-emf.wgsl` — write corner E_H_z (and the in-plane
+  components for the Bz update) into a new buffer, no face B reads
+  from any other invocation's writes.
+* `apply-hall-ct.wgsl` — read the corner E_H buffer, update face
+  Bx/By and cell Bz from the curl.
+
+### 8. UI surface
+
+Sliders + toggles in the advanced settings dropdown:
+* "Hall d_i" log slider, with snap-to-0
+* "Cooling Λ_0" log slider, snap-to-0
+* "Conduction κ_∥" log slider, snap-to-0
+* "Conduction κ_⊥/κ_∥" linear 0–1
+* "Self-gravity G" log slider, snap-to-0
+* Mode group for EMF mode (BS / GS upwind)
+* Toggle row for positivity guard
+
+### 9. Per-preset extended-physics defaults
+
+Currently every preset gets the same set of feature defaults.
+Real physics asks for preset-specific values — Harris cares about
+Hall reconnection, not cooling; Brio-Wu doesn't want self-gravity
+in its 1D MHD shock tube; Sod doesn't have B for Hall to act on.
+Extend the preset object schema with optional `extendedPhysics` to
+override the global defaults per preset.
+
 ## References
 
 * Plan: `~/.claude/plans/geon-currently-uses-cpu-abstract-cat.md`
@@ -343,3 +454,15 @@ context) can plug in:
 * Colella & Woodward (1984) — PPM original paper
 * Gardiner & Stone (2005) — upwind CT EMF (landed in Session 4;
   eqns 41-45 with the HLLD contact velocity as the upwind selector)
+
+### Extended physics (Session 14)
+
+* Tóth, Ma, Gombosi (2008) — Hall MHD method + whistler test
+* O'Sullivan & Downes (2006) — Hall Diffusion Scheme (HDS)
+* Braginskii (1965) — anisotropic transport in magnetized plasma
+* Spitzer & Härm (1953) — parallel thermal conductivity
+* Cowie & McKee (1977) — saturated heat-flux limiter
+* Townsend (2009) — exact integration of optically-thin cooling
+* Hu, Adams & Shu (2013) — positivity-preserving limiters for
+  finite-volume MHD
+* Balsara & Spicer (1999) — arithmetic-mean CT EMF baseline
