@@ -187,14 +187,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                   select(0.5 * (ez_se + ez_ne), ez_ne, vy_ri < -TOL),
                   ez_se, vy_ri >  TOL);
 
-    // ── Gardiner-Stone corner EMF (collapsed eq 45) ─────────────────
-    // The four corrections each contribute ¼·(face_Ez - upwind_cell_Ez).
-    // (See derivation block above.) Reduces to BS arithmetic mean when
-    // face Ez == upwind cell Ez (uniform-field limit) and adds upwind-
-    // biased curvature otherwise.
-    let bs       = 0.25 * (ez_x_lo + ez_x_hi + ez_y_le + ez_y_ri);
-    let corr_y   = 0.25 * ((ez_x_lo - up_lo) + (ez_x_hi - up_hi));
-    let corr_x   = 0.25 * ((ez_y_le - up_le) + (ez_y_ri - up_ri));
-
-    Ez_edge[ez_edge_idx(ix, iy, n_total)] = bs + corr_y + corr_x;
+    // ── Balsara-Spicer 1999 arithmetic-mean corner EMF (temporary) ──
+    // The Gardiner-Stone 2005 upwind formulation above-the-line in
+    // the file header decomposes to:
+    //   Ez_corner = ½·(four face Ez) − ¼·(four upwind cell Ez)
+    // which is consistent in the smooth-flow limit but empirically
+    // produces a runaway CT B-update on Orszag-Tang at N=256, η=0.
+    // The OT cascade onsets at step ~250, exactly when the
+    // Riemann-solver face Ez at the four current sheets reaches
+    // ~2× the local cell Ez = vy·Bx − vx·By and the formula
+    // extrapolates outside the input range. The bisect that
+    // located this is documented in HANDOFF Session 9 — the upwind
+    // formula matches both the in-file derivation AND Stone+ 2008
+    // §3.5 eq 23, so the bug is subtle and pending re-investigation
+    // (likely flux-sign convention mismatch with HLLD's output, or
+    // a missing damping coefficient that Athena++ ships).
+    //
+    // Until the upwind formula is repaired, fall back to the
+    // Balsara-Spicer 1999 arithmetic mean. This costs us Session 4's
+    // claimed sharpness improvement on plane-parallel flows but
+    // restores OT stability. The cell-Ez upwind machinery above
+    // (lines 162-188) and the U0/Bx_face/By_face bindings (4-6)
+    // are left in place so re-introducing a corrected upwind term
+    // doesn't require pipeline-layout changes.
+    Ez_edge[ez_edge_idx(ix, iy, n_total)] = 0.25 * (ez_x_lo + ez_x_hi + ez_y_le + ez_y_ri);
 }
