@@ -22,7 +22,7 @@ Implementation plan (source of truth for design decisions):
 - **Riemann solver**: HLLD (Miyoshi & Kusano 2005) with HLLC and HLL fallbacks for degenerate branches
 - **Reconstruction**: PPM (Colella & Woodward 1984) with characteristic-variable limiting (Stone+ 2008 §3.4.2 — Athena/Athena++ default for MHD)
 - **Time integration**: RK3 SSP, three stages, single-submit-per-step
-- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008), Gardiner-Stone 2005 upwind EMF (HLLD contact velocity as upwind selector)
+- **Divergence cleaning**: constrained transport on a Yee-style staggered grid (Stone+ 2008), Balsara-Spicer 1999 arithmetic-mean corner EMF (the Gardiner-Stone 2005 upwind attempt was reverted Session 8 — see HANDOFF.md; upwind machinery in shader stays for re-implementation)
 - **Resistivity**: explicit central differences, η ∇²B applied per RK3 stage after CT update (SSP-compatible by linearity)
 - **Boundaries**: per-edge selectable — periodic / outflow / reflecting / driven
 - **Default view**: J_z (out-of-plane current density)
@@ -43,13 +43,14 @@ plasma/
 ├── AGENTS.md               ← this file
 ├── HANDOFF.md              ← next-step doc for the next instance / agent
 ├── LICENSE                 ← AGPL-3.0
+├── tests/                  ← convergence tests (Session 8): alfven-convergence.html (CPAW), acoustic-convergence.html (linear acoustic), README.md
 └── src/
     ├── config.js           ← grid size, CFL, γ, η, ghost width, BC enums, uniform layout, LIC constants
     ├── sim.js              ← orchestrator: BC → PPM → HLLD → EMF → CT → resistivity + LIC state
-    ├── presets.js          ← Sod, Brio-Wu, Orszag-Tang, Harris current sheet
+    ├── presets.js          ← Sod, Brio-Wu, Orszag-Tang, Harris + alfven-cpaw + acoustic-wave-hydro (Session 8 test presets)
     ├── colormaps.js        ← viridis LUT (7-stop polynomial fit, sampled at 256 stops)
     ├── ui.js               ← shared-* module wiring (Phase 5)
-    ├── stats-display.js    ← Stats tab: energy / β / |B|max / ∇·B norm / reconnection rate
+    ├── stats-display.js    ← Stats tab: energy / β / |B|max / ∇·B norm / reconnection rate + Session 8 conservation panel (7 quantities × drift % × sparklines)
     ├── probe.js            ← Probe tab: cell sampling + mini time-series
     └── gpu/
         ├── device.js       ← adapter + device init
@@ -63,7 +64,7 @@ plasma/
             ├── apply-bcs.wgsl                   ← ghost-cell fill (4 modes × 4 edges)
             ├── reconstruct-ppm.wgsl             ← per-direction PPM (CW 1984)
             ├── riemann-hlld.wgsl                ← HLLD (M&K 2005) + HLLC + HLL fallbacks
-            ├── compute-emf.wgsl                 ← Gardiner-Stone 2005 upwind Ez at corners
+            ├── compute-emf.wgsl                 ← Balsara-Spicer 1999 arithmetic-mean corner Ez (upwind machinery present but disabled — Session 8)
             ├── update-conserved-weighted.wgsl   ← RK3 SSP weighted U update
             ├── update-b-weighted.wgsl           ← RK3 SSP weighted face-B update (CT)
             ├── apply-resistivity.wgsl           ← η ∇²B per stage (post-CT)
@@ -83,7 +84,7 @@ plasma/
 | Reconstruction      | PPM (Colella & Woodward 1984) with characteristic-variable limiting (Stone+ 2008 §3.4.2); workgroup-shared primitive cache |
 | Riemann solver      | HLLD (Miyoshi & Kusano 2005) + HLLC + HLL fallbacks   |
 | Time integration    | RK3 SSP (Gottlieb-Shu 1998)                           |
-| Divergence-free B   | Constrained transport (Gardiner-Stone 2005 upwind EMF) |
+| Divergence-free B   | Constrained transport (Balsara-Spicer 1999 arithmetic-mean EMF; G&S upwind reverted Session 8) |
 | Resistivity         | Explicit η ∇²B, central differences, post-CT          |
 | Boundaries          | Per-edge: periodic / outflow / reflecting / driven    |
 | Pressure floor      | 1e-6                                                  |
@@ -160,6 +161,19 @@ regularization follows Athena++'s 4-case branch on `(c_f²−c_s²)`,
 III/IV/V) and Brio-Wu 1988 eq 45 for the perpendicular B unit vectors
 (β_t1=1, β_t2=0 when |B_⊥|=0). See `reconstruct-ppm.wgsl` header for
 the full derivation.
+
+A primitive-space monotonicity **safety net** is layered on top of the
+characteristic projection (Mignone 2014 §3.4 / Athena++ pattern). The
+projection `R · a_limited` is a linear combination across wave families,
+so a primitive component can come back with the opposite sign of its
+unlimited primitive delta — seeds 1–2 cell wavelength stripes in B at
+low η that only `η ∇²B` damps. Two steps after the projection: (A)
+clamp each face component to `[min(w_c, w_neighbor), max(w_c, w_neighbor)]`
+to eliminate sign flips and large overshoots; (B) re-apply the CW1984
+parabola overshoot check per primitive component via `ppm_limit_delta`.
+On smooth flows where the characteristic limit was already monotone in
+primitive vars, both steps are no-ops — the net is "free" except at
+the discontinuities where it earns its keep.
 
 ## Ghost-cell convention
 
