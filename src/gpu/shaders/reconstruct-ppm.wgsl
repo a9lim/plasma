@@ -19,6 +19,43 @@
 // primitive via the right-eigenvector matrix. Mathematically correct
 // for the hyperbolic system; standard in production MHD codes.
 //
+// ── Primitive-space safety net (PPM4 — McCorquodale & Colella 2011) ──
+// The characteristic back-projection R · a_limited is a linear
+// combination across wave families: a primitive component can come
+// back with the opposite sign of its unlimited primitive delta. This
+// seeds grid-scale (1-2 cell wavelength) oscillations in B that only
+// the explicit η ∇²B term damps — symptom is bright J_z stripes at low
+// η that grow until pressure/density floors cascade into NaN.
+//
+// Session 7 layered the Mignone-2014 §3.4 two-step net (clamp face to
+// neighbour range + re-apply CW1984 parabola check) on top of the
+// characteristic limit. That net killed the stripes but was
+// over-aggressive at smooth extrema: clamping w_face to
+// [min(w_c, w_neighbour), max(w_c, w_neighbour)] zeros the parabola
+// coefficient at any local max/min, which on the CPAW convergence
+// test dragged the asymptotic L1 slope from the expected ~3 down to
+// ~1 (the amplitude peaks dominate the smooth-flow error).
+//
+// Session 9 swaps in PPM4 (McCorquodale & Colella 2011 §4 / Colella &
+// Sekora 2008 eq 24; Athena++ `Reconstruction::PPMx` /
+// `ExtremaPreservingFn`). Per primitive component:
+//   - Detect a smooth extremum: the face-pair brackets cell center
+//     the wrong way OR the cell value is a local extremum in the
+//     3-cell stencil.
+//   - At smooth extrema, all four discrete second derivatives
+//     (cell-stencil d2w_L, d2w_c, d2w_R, and the face-parabola
+//     coefficient d2w_f) must agree in sign. If they do, the limited
+//     curvature is the median-of-three with safety factor C = 1.25:
+//         d2w_lim = sign(d2w_f) · min(|d2w_f|, C·|d2w_c|,
+//                                     C·|d2w_L|, C·|d2w_R|)
+//     and the face deltas are rescaled by d2w_lim / d2w_f to preserve
+//     the parabola SHAPE while bounding its curvature. If signs
+//     disagree, the parabola is dropped (piecewise-constant face).
+//   - Outside extrema (gradient zones, shocks), fall through to the
+//     Session 7 primitive-space CW1984 clamp + parabola check — that
+//     branch is still what stops the projection from seeding B
+//     stripes at discontinuities.
+//
 // The 7-wave MHD primitive eigensystem (sweep-aligned permutation
 // (ρ, v_n, v_t1, v_t2, B_t1, B_t2, p); B_n is a parameter, not a wave):
 //   0: u−c_f   (left-going fast magnetosonic)
@@ -88,7 +125,12 @@
 //      CW 1984 overshoot check (2·dL² − dL·dR − 2·dR² > 0 etc.).
 //   9. Project back: dL' = R·a_L, dR' = R·a_R.
 //  10. Recover face states: q_L = q_c − dL', q_R = q_c + dR'.
-//  11. Floor density and pressure to keep downstream cons-recovery sane.
+//  11. PPM4 extremum-preserving safety net (McCorquodale-Colella 2011
+//      — see block above): per primitive component, detect smooth
+//      extrema and rescale the face deltas by the median-of-three
+//      limited curvature; outside extrema, fall through to the
+//      Session 7 CW1984 clamp + parabola check.
+//  12. Floor density and pressure to keep downstream cons-recovery sane.
 //
 // Bindings:
 //   0 uniforms (uniform)
@@ -494,6 +536,204 @@ fn ppm_limit_char(aL: CharVec7, aR: CharVec7) -> CharLR {
     return out;
 }
 
+// ── PPM4 extremum-preserving safety net (McCorquodale & Colella 2011) ─
+// Replaces the Mignone-2014 clamp+CW1984 safety net (Session 7). The
+// earlier net was over-aggressive at smooth extrema: a primitive
+// component sitting at a true local max/min got clamped to the
+// neighbor range and the parabola's curvature was zeroed, dropping the
+// effective order of accuracy at amplitude peaks. On the CPAW
+// convergence test this dragged the asymptotic L1 slope from the
+// expected ~3 down to ~1.
+//
+// PPM4 (McCorquodale & Colella 2011 §4; Colella & Sekora 2008 eq 24;
+// Athena++ `Reconstruction::PPMx` / `ExtremaPreservingFn` in
+// src/reconstruct/ppm.cpp) keeps the CW1984 monotonicity branch as the
+// default but BYPASSES it at smooth extrema. A smooth extremum is
+// detected per primitive component by:
+//   (a) the face-state pair brackets cell center the wrong way —
+//       (w_R_raw − w_c) · (w_c − w_L_raw) ≤ 0 — OR the cell value is
+//       a local extremum among its three-cell stencil:
+//       (w_{j+1} − w_c) · (w_c − w_{j-1}) ≤ 0
+//   (b) all four discrete second derivatives (cell-stencil d2w_L,
+//       d2w_c, d2w_R, and the parabola coefficient d2w_f from the
+//       raw face states) agree in sign.
+// Per CS08 eq 24, the "median-of-three with safety factor" limited
+// second derivative is
+//      d2w_lim = sign(d2w_f) · min(|d2w_f|, C·|d2w_c|,
+//                                  C·|d2w_L|, C·|d2w_R|)
+// with C = 1.25. The face states are then rescaled by the ratio
+// d2w_lim / d2w_f — this preserves the parabola SHAPE (asymmetric face
+// distances stay proportional) while bounding its curvature relative
+// to the cell-stencil context. Smooth extrema where the parabola is
+// well-supported by neighbours pass through with d2w_lim/d2w_f close
+// to 1; spurious 2-Δx ringing where the parabola is much sharper than
+// its neighbours' is folded down toward zero.
+//
+// Outside extrema (the common case — gradient zones), we fall through
+// to the existing primitive-space CW1984 monotonicity check from
+// Session 7's safety net, which is what stops the characteristic
+// projection from seeding grid-scale B stripes at discontinuities.
+//
+// Reference: Athena++ commit history of src/reconstruct/ppm.cpp; this
+// implementation matches `Reconstruction::PPMx` algorithmically (the
+// 4-d2-sign-agree predicate and the C=1.25 median-of-three bound).
+struct PrimFaces {
+    L: PrimVec7,
+    R: PrimVec7,
+};
+
+// Per-component PPM4 limiter. Takes BOTH the raw 4th-order face
+// interpolants (which carry the smooth-flow accuracy) AND the
+// characteristic-limited face result (which is dissipative at smooth
+// extrema but well-behaved at discontinuities). Detects whether the
+// cell is a smooth extremum from the RAW interpolants + cell-stencil;
+// if so, returns the PPM4-curvature-bounded reconstruction from raw;
+// otherwise returns the characteristic-limited result re-checked
+// against primitive monotonicity (the Session 7 net behaviour). Scalar
+// so the transpiler's SROA pass handles it as a tiny inlined helper.
+fn ppm4_limit_component(
+    w_L_raw:  f32,   // raw 4th-order left  interpolant
+    w_R_raw:  f32,   // raw 4th-order right interpolant
+    w_L_char: f32,   // characteristic-limited left  face
+    w_R_char: f32,   // characteristic-limited right face
+    w_m2:     f32,
+    w_m1:     f32,
+    w_c:      f32,
+    w_p1:     f32,
+    w_p2:     f32,
+) -> vec2<f32> {
+    // Discrete second derivatives.
+    //   d2w_c — from the central 3-cell stencil (w_{j-1}, w_j, w_{j+1})
+    //   d2w_L — from the left  3-cell stencil (w_{j-2}, w_{j-1}, w_j)
+    //   d2w_R — from the right 3-cell stencil (w_j, w_{j+1}, w_{j+2})
+    //   d2w_f — parabola curvature implied by the RAW face pair
+    //           (factor of 6 makes it dimensionally match d2w_c when
+    //           the face states sit at the cell-edge of a quadratic).
+    // Critical: d2w_f MUST come from the raw interpolants — using the
+    // characteristic-limited faces would zero d2w_f at exactly the
+    // smooth extrema we're trying to preserve.
+    let d2c = w_m1 - 2.0 * w_c  + w_p1;
+    let d2L = w_m2 - 2.0 * w_m1 + w_c;
+    let d2R = w_c  - 2.0 * w_p1 + w_p2;
+    let d2f = 6.0 * (w_L_raw - 2.0 * w_c + w_R_raw);
+
+    // Smooth-extremum detector (Athena++ ppm.cpp ExtremaPreservingFn):
+    //   (a) the cell value is a discrete local extremum in the 3-cell
+    //       stencil — (w_{j+1} − w_c) · (w_c − w_{j-1}) ≤ 0
+    //   (b) OR the RAW face-pair parabola has an interior extremum —
+    //       (w_R_raw − w_c) · (w_c − w_L_raw) ≤ 0
+    // Test (b) uses the RAW 4th-order interpolants, not the
+    // characteristic-limited faces, so the characteristic clip can't
+    // spuriously trigger it. This is what makes the predicate fire on
+    // the full neighbourhood of a smooth peak (one cell either side of
+    // the discrete max), restoring the parabola wherever the
+    // characteristic limit had zeroed it for being above a "monotone"
+    // threshold that doesn't apply to smooth flows.
+    let cell_bracket = (w_p1   - w_c) * (w_c - w_m1);
+    let face_bracket = (w_R_raw - w_c) * (w_c - w_L_raw);
+    let is_extremum  = (cell_bracket <= 0.0) || (face_bracket <= 0.0);
+
+    // Default branch (non-extremum): pass through the characteristic-
+    // limited face result, then re-apply the Session 7 CW1984 primitive
+    // monotonicity check to catch any sign-flipped projections at
+    // strong MHD discontinuities. This is the Mignone-2014 §3.4 net,
+    // which earns its keep at shocks.
+    let L_clamp = clamp(w_L_char, min(w_c, w_m1), max(w_c, w_m1));
+    let R_clamp = clamp(w_R_char, min(w_c, w_p1), max(w_c, w_p1));
+    let r_cw    = ppm_limit_delta(w_c - L_clamp, R_clamp - w_c);
+    let L_cw    = w_c - r_cw.x;
+    let R_cw    = w_c + r_cw.y;
+
+    if (!is_extremum) {
+        return vec2<f32>(L_cw, R_cw);
+    }
+
+    // Extremum branch — recover the parabola coefficient from the raw
+    // interpolants, bounded by the median-of-three of the cell-stencil
+    // d2's. All four d2's must agree in sign (Athena++ predicate) for
+    // the parabola to be a legitimate smooth extremum well-supported by
+    // its neighbours; otherwise zero out the curvature.
+    let s_c = sign(d2c);
+    let s_L = sign(d2L);
+    let s_R = sign(d2R);
+    let s_f = sign(d2f);
+    let signs_agree = (s_c == s_f) && (s_L == s_f) && (s_R == s_f) && (s_f != 0.0);
+
+    let C = 1.25;
+    var d2_lim = 0.0;
+    if (signs_agree) {
+        let bound = min(abs(d2f), C * min(abs(d2c), min(abs(d2L), abs(d2R))));
+        d2_lim = s_f * bound;
+    }
+
+    // Guard against d2f near zero (≈ linear profile — no curvature to
+    // scale) — fall through to CW1984 (the parabola is irrelevant
+    // anyway).
+    if (abs(d2f) <= 1.0e-30) {
+        return vec2<f32>(L_cw, R_cw);
+    }
+
+    // signs_agree=false → d2_lim = 0 → scale = 0 → faces collapse to
+    // the cell value. This is the Athena++ ExtremaPreservingFn
+    // prescription: at a suspected extremum where the cell-stencil d2's
+    // don't all agree with the face-parabola sign, the parabola is
+    // dropped to first-order (piecewise constant). Less restrictive
+    // than CW1984's clamp-to-neighbour-range and gives the right
+    // smooth-flow behaviour: when the neighbourhood really is smooth,
+    // signs agree, scale ≈ 1, raw passes through.
+    let scale = d2_lim / d2f;
+    // CS08 prescription: keep the parabola SHAPE (sign + relative face
+    // distances from cell center) and scale only the curvature.
+    // scale ∈ (0, 1] when signs_agree: d2_lim has the same sign as d2f
+    // and |d2_lim| ≤ |d2f|. At a well-resolved smooth peak the bound
+    // is tight (scale ≈ 1) → raw interpolant passes through unchanged
+    // and 3rd-order convergence is restored. At a poorly-resolved peak
+    // (2-Δx ringing) the scale folds the parabola down toward the
+    // cell-stencil median curvature.
+    let L_ppm4 = w_c + (w_L_raw - w_c) * scale;
+    let R_ppm4 = w_c + (w_R_raw - w_c) * scale;
+    return vec2<f32>(L_ppm4, R_ppm4);
+}
+
+fn primitive_safety_net_ppm4(
+    w_left_raw:   PrimVec7,
+    w_right_raw:  PrimVec7,
+    w_left_char:  PrimVec7,
+    w_right_char: PrimVec7,
+    w_c:  PrimVec7,
+    w_m2: PrimVec7,
+    w_m1: PrimVec7,
+    w_p1: PrimVec7,
+    w_p2: PrimVec7,
+) -> PrimFaces {
+    let r_rho = ppm4_limit_component(w_left_raw.rho, w_right_raw.rho,
+                                     w_left_char.rho, w_right_char.rho,
+                                     w_m2.rho, w_m1.rho, w_c.rho, w_p1.rho, w_p2.rho);
+    let r_vn  = ppm4_limit_component(w_left_raw.vn,  w_right_raw.vn,
+                                     w_left_char.vn,  w_right_char.vn,
+                                     w_m2.vn,  w_m1.vn,  w_c.vn,  w_p1.vn,  w_p2.vn );
+    let r_vt1 = ppm4_limit_component(w_left_raw.vt1, w_right_raw.vt1,
+                                     w_left_char.vt1, w_right_char.vt1,
+                                     w_m2.vt1, w_m1.vt1, w_c.vt1, w_p1.vt1, w_p2.vt1);
+    let r_vt2 = ppm4_limit_component(w_left_raw.vt2, w_right_raw.vt2,
+                                     w_left_char.vt2, w_right_char.vt2,
+                                     w_m2.vt2, w_m1.vt2, w_c.vt2, w_p1.vt2, w_p2.vt2);
+    let r_bt1 = ppm4_limit_component(w_left_raw.bt1, w_right_raw.bt1,
+                                     w_left_char.bt1, w_right_char.bt1,
+                                     w_m2.bt1, w_m1.bt1, w_c.bt1, w_p1.bt1, w_p2.bt1);
+    let r_bt2 = ppm4_limit_component(w_left_raw.bt2, w_right_raw.bt2,
+                                     w_left_char.bt2, w_right_char.bt2,
+                                     w_m2.bt2, w_m1.bt2, w_c.bt2, w_p1.bt2, w_p2.bt2);
+    let r_p   = ppm4_limit_component(w_left_raw.p,   w_right_raw.p,
+                                     w_left_char.p,   w_right_char.p,
+                                     w_m2.p,   w_m1.p,   w_c.p,   w_p1.p,   w_p2.p  );
+
+    var out: PrimFaces;
+    out.L = PrimVec7(r_rho.x, r_vn.x, r_vt1.x, r_vt2.x, r_bt1.x, r_bt2.x, r_p.x);
+    out.R = PrimVec7(r_rho.y, r_vn.y, r_vt1.y, r_vt2.y, r_bt1.y, r_bt2.y, r_p.y);
+    return out;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -648,9 +888,29 @@ fn main(
     let dL_lim = project_from_char(lim.L, eig);
     let dR_lim = project_from_char(lim.R, eig);
 
-    // Recover limited face states.
-    let w_left  = prim_sub(w_c, dL_lim);
-    let w_right = prim_add(w_c, dR_lim);
+    // Recover raw characteristic-limited face states.
+    let w_left_raw  = prim_sub(w_c, dL_lim);
+    let w_right_raw = prim_add(w_c, dR_lim);
+
+    // PPM4 extremum-preserving safety net (McCorquodale & Colella 2011)
+    // — at smooth extrema (cell value is a local extremum in the 3-cell
+    // primitive stencil), bypass both the characteristic limit and the
+    // CW1984 monotonicity clamp; reconstruct the face deltas from the
+    // RAW 4th-order interpolants scaled by the median-of-three-limited
+    // parabola curvature (C·|d2w|, C = 1.25). Outside extrema, fall
+    // through to the Session 7 primitive-space CW1984 clamp + parabola
+    // check on the characteristic-limited face values. The extremum
+    // bypass needs the raw interpolants — qL_raw / qR_raw above — to
+    // recover d2w_f without the characteristic clip having zeroed it.
+    // See the header above ppm4_limit_component for derivation +
+    // Athena++ provenance.
+    let safe = primitive_safety_net_ppm4(
+        qL_raw, qR_raw,
+        w_left_raw, w_right_raw,
+        w_c, w_m2, w_m1, w_p1, w_p2,
+    );
+    let w_left  = safe.L;
+    let w_right = safe.R;
 
     // Pack and floor.
     let pp_L = pack_prim_pair_from_vec7(w_left,  bn_c, axis);
