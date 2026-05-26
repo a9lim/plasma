@@ -323,6 +323,30 @@ export class PlasmaBuffers {
                  | GPUBufferUsage.COPY_SRC,
         });
 
+        // ── Conservation diagnostics (Session 8) ───────────────────
+        // Two-pass reduction: per-tile partials → final 7 scalars.
+        // Sized for the per-axis tile count at the current resolution
+        // (ceil(N/WG)² × 7 × 4 B). At 256² this is 32² × 28 = 28 KB;
+        // at 1024² it's 128² × 28 = ~459 KB. Negligible vs the U/B
+        // buffers but kept resolution-specific so setResolution()
+        // reallocates correctly.
+        const CONS_WG = 8;
+        this.cons_tiles_per_axis = Math.ceil(n / CONS_WG);
+        const consTileCount = this.cons_tiles_per_axis * this.cons_tiles_per_axis;
+        this.cons_tile_partials = device.createBuffer({
+            label: 'plasma.cons_tile_partials',
+            size: consTileCount * 7 * F32_BYTES,
+            usage: GPUBufferUsage.STORAGE,
+        });
+        // Final output: 7 live slots (mass, mom_xyz, energy, mag_energy,
+        // divB_L1) + 1 pad slot for 32 B alignment. STORAGE | COPY_SRC
+        // so stats-display can pull it via the existing readback batch.
+        this.cons_out = device.createBuffer({
+            label: 'plasma.cons_out',
+            size: 8 * F32_BYTES,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
+
         // LIC animation + intensity state (host-side; sim.js pushes via uniforms).
         this._licPhase     = 0;
         this._licIntensity = LIC_INTENSITY_DEFAULT;

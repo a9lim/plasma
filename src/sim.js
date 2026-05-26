@@ -464,6 +464,39 @@ export class Sim {
         });
     }
 
+    // Conservation diagnostics reduction (Session 8). Reads the
+    // POST-step destination buffers — the bind group is built per
+    // (stage 3 dst) side, since stage 3's dst is the next step's U_n.
+    // Output: `cons_out` (7 f32 + pad). One bind group per pipeline.
+    _conservationTileBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.conservationTile.bg',
+            layout: this.pipelines.layouts.conservationTile,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.cons_tile_partials } },
+            ],
+        });
+    }
+
+    _conservationFinalizeBG() {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.conservationFinalize.bg',
+            layout: this.pipelines.layouts.conservationFinalize,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: b.cons_tile_partials } },
+                { binding: 2, resource: { buffer: b.cons_out } },
+            ],
+        });
+    }
+
     _energyFloorBG(U0_out, U1_out, Bx, By) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -696,6 +729,14 @@ export class Sim {
             stage1: { a: buildStage(1, sides.a), b: buildStage(1, sides.b) },
             stage2: { a: buildStage(2, sides.a), b: buildStage(2, sides.b) },
             stage3: { a: buildStage(3, sides.a), b: buildStage(3, sides.b) },
+            // Conservation reduction reads the POST-step state — stage
+            // 3's dst, which is U_next at encode time. Side-dependent
+            // because U_next flips with the ping-pong.
+            consTile: {
+                a: this._conservationTileBG(sides.a.U0_next, sides.a.U1_next, sides.a.Bx_next, sides.a.By_next),
+                b: this._conservationTileBG(sides.b.U0_next, sides.b.U1_next, sides.b.Bx_next, sides.b.By_next),
+            },
+            consFinalize: this._conservationFinalizeBG(),
         };
 
         // Renderer / LIC bind groups also depend on the primary handles
@@ -874,6 +915,26 @@ export class Sim {
         this._encodeStage(pass, 3, side);
 
         pass.end();
+
+        // Pass 3: conservation diagnostics reduction over the just-
+        // written destination state (stage 3 dst === U_next at this
+        // point, before the swap below). Two dispatches in one pass —
+        // per-tile partials, then a single-workgroup finalize. Output
+        // (cons_out) is pulled by stats-display via the existing
+        // readback batch at its own cadence; we just write it here.
+        // Folding it inside the RK3 timestamp pass would corrupt the
+        // GPU-step measurement, so it gets its own pass.
+        {
+            const consPass = encoder.beginComputePass({ label: 'plasma.conservationReduce' });
+            const tilesPerAxis = Math.ceil(this.n / WG);
+            consPass.setPipeline(this.pipelines.pipelines.conservationTile);
+            consPass.setBindGroup(0, this._bgCache.consTile[side]);
+            consPass.dispatchWorkgroups(tilesPerAxis, tilesPerAxis, 1);
+            consPass.setPipeline(this.pipelines.pipelines.conservationFinalize);
+            consPass.setBindGroup(0, this._bgCache.consFinalize);
+            consPass.dispatchWorkgroups(1, 1, 1);
+            consPass.end();
+        }
 
         // Resolve the timestamp queries into the GPU-side resolve buffer.
         // Readback (mapAsync) is owned by StatsDisplay so we don't block

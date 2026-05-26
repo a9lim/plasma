@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 12;
+const SHADER_VERSION = 14;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -248,6 +248,32 @@ function licNormalizeBGL(device) {
     ]);
 }
 
+// Conservation diagnostics (Session 8). Two-pass reduction:
+// `tile` writes per-workgroup partial sums into the tile-partials
+// buffer; `finalize` collapses those into the 7-slot output. Each
+// pipeline binds its own BGL — the tile entry needs the U/B inputs,
+// the finalize entry only needs the partials. Same module, two
+// pipeline layouts. Mirrors compute-dt's "reset / reduce / finalize"
+// shape but split across two files because the bindings differ.
+function conservationTileBGL(device) {
+    return bgl(device, 'plasma.conservationTile.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // U0
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },  // U1
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // tile_partials
+    ]);
+}
+
+function conservationFinalizeBGL(device) {
+    return bgl(device, 'plasma.conservationFinalize.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },  // tile_partials
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },  // cons_out
+    ]);
+}
+
 // New in Round 2. Magnetic-pressure-aware energy floor. Runs between
 // update-conserved-weighted (step 7) and update-b-weighted (step 8) —
 // uses stage-input face B to bound E in the just-written U1. 4 storage
@@ -268,6 +294,7 @@ export async function createPipelines(device, format) {
         applyBcsModule, applyResistivityModule, energyFloorModule,
         dtModule, viewModule, colormapModule, compositeModule, licAdvectModule,
         licReduceModule, licNormalizeModule,
+        consReduceModule, consFinalizeModule,
     ] = await Promise.all([
         makeModule(device, 'plasma.reconstruct-ppm',          'reconstruct-ppm.wgsl'),
         makeModule(device, 'plasma.riemann-hlld',             'riemann-hlld.wgsl'),
@@ -284,6 +311,8 @@ export async function createPipelines(device, format) {
         makeModule(device, 'plasma.lic-advect',               'lic-advect.wgsl'),
         makeModule(device, 'plasma.lic-reduce',               'lic-reduce.wgsl'),
         makeModule(device, 'plasma.lic-normalize',            'lic-normalize.wgsl'),
+        makeModule(device, 'plasma.conservation-reduce',      'conservation-reduce.wgsl'),
+        makeModule(device, 'plasma.conservation-finalize',    'conservation-finalize.wgsl'),
     ]);
 
     const reconstructLayout = reconstructPpmBGL(device);
@@ -301,6 +330,8 @@ export async function createPipelines(device, format) {
     const licAdvectLayout   = licAdvectBGL(device);
     const licReduceLayout   = licReduceBGL(device);
     const licNormalizeLayout = licNormalizeBGL(device);
+    const conservationTileLayout     = conservationTileBGL(device);
+    const conservationFinalizeLayout = conservationFinalizeBGL(device);
 
     const mkPipeLayout = (bgl) => device.createPipelineLayout({ bindGroupLayouts: [bgl] });
 
@@ -410,6 +441,17 @@ export async function createPipelines(device, format) {
         compute: { module: licNormalizeModule, entryPoint: 'main' },
     });
 
+    const conservationTile = device.createComputePipeline({
+        label: 'plasma.conservation-reduce.tile',
+        layout: mkPipeLayout(conservationTileLayout),
+        compute: { module: consReduceModule, entryPoint: 'tile' },
+    });
+    const conservationFinalize = device.createComputePipeline({
+        label: 'plasma.conservation-finalize',
+        layout: mkPipeLayout(conservationFinalizeLayout),
+        compute: { module: consFinalizeModule, entryPoint: 'finalize' },
+    });
+
     return {
         layouts: {
             reconstruct: reconstructLayout,
@@ -427,6 +469,8 @@ export async function createPipelines(device, format) {
             licAdvect:   licAdvectLayout,
             licReduce:   licReduceLayout,
             licNormalize: licNormalizeLayout,
+            conservationTile:     conservationTileLayout,
+            conservationFinalize: conservationFinalizeLayout,
         },
         pipelines: {
             reconstructPpm, riemannHlld, computeEmf,
@@ -436,6 +480,7 @@ export async function createPipelines(device, format) {
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite, licAdvect,
             licReduceReset, licReduce, licNormalize,
+            conservationTile, conservationFinalize,
         },
     };
 }

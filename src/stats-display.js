@@ -95,9 +95,11 @@ export class StatsDisplay {
 
     _resetBaseline() {
         this._baseline = null;
+        this._consBaseline = null;
         resetSparkHistory(this._sparkEnergy.hist);
         resetSparkHistory(this._sparkBeta.hist);
         resetSparkHistory(this._sparkDivB.hist);
+        for (const s of this._consSparks) resetSparkHistory(s.hist);
     }
 
     _build() {
@@ -135,6 +137,40 @@ export class StatsDisplay {
         this._sparkDivB = buildSpark();
         divB.row.append(this._sparkDivB.wrap);
         this.root.append(divB.row);
+
+        // Conservation diagnostics — GPU-side per-step reduction over
+        // interior cells. Seven quantities: mass, three momentum
+        // components, total energy, magnetic energy, |∇·B| L1.
+        // First six show drift % vs. the first sampled baseline (the
+        // truth-teller for a research MHD code); divB shows the raw
+        // L1 value (CT preserves this at fp32 machine eps, so any
+        // drift away from ~1e-6 signals a CT bug). Baseline resets on
+        // preset / resolution change via _resetBaseline.
+        this.root.append(groupLabel('Conservation'));
+        const consSpecs = [
+            { key: 'mass',  label: '∫ρ',         drift: true },
+            { key: 'momx',  label: '∫ρv_x',      drift: true },
+            { key: 'momy',  label: '∫ρv_y',      drift: true },
+            { key: 'momz',  label: '∫ρv_z',      drift: true },
+            { key: 'eTot',  label: '∫E',         drift: true },
+            { key: 'eMag',  label: '∫½|B|²',     drift: true },
+            { key: 'divB',  label: '⟨|∇·B|⟩',    drift: false },
+        ];
+        this._consRefs   = {};
+        this._consSparks = [];
+        for (const s of consSpecs) {
+            const r = statRow(s.label);
+            const spark = buildSpark();
+            r.row.append(spark.wrap);
+            this.root.append(r.row);
+            if (s.drift) {
+                const d = statRow('Δ %', { sub: true });
+                this.root.append(d.row);
+                this._consRefs[s.key + 'Drift'] = d.value;
+            }
+            this._consRefs[s.key] = r.value;
+            this._consSparks.push({ key: s.key, ...spark });
+        }
 
         // Reconnection rate (visible only when Harris)
         this._reconWrap = el('div');
@@ -199,6 +235,11 @@ export class StatsDisplay {
             { buf: b.Bx_n, byteOffset: 0, byteSize: xfaceCells * F32 },
             { buf: b.By_n, byteOffset: 0, byteSize: yfaceCells * F32 },
             { buf: b.dt,   byteOffset: 0, byteSize: F32 },
+            // Conservation diagnostics — 8 × f32 (7 live + 1 pad). The
+            // GPU-side reduction runs at the end of every sim step; we
+            // pull the current value at the same cadence as everything
+            // else here. Negligible bandwidth: 32 B vs ~640 KB for U/B.
+            { buf: b.cons_out, byteOffset: 0, byteSize: 8 * F32 },
         ];
         // Timestamp resolve buffer (2 × u64 = 16 B) when the device
         // supports `timestamp-query`. Batched alongside the other reads so
@@ -220,6 +261,9 @@ export class StatsDisplay {
         const Bxf = new Float32Array(bufs[2]);
         const Byf = new Float32Array(bufs[3]);
         const dtArr = new Float32Array(bufs[4]);
+        // Conservation: 8 f32 — [mass, mom_x, mom_y, mom_z, E_tot,
+        // E_mag, divB_L1, _pad]. Sums (NOT pre-multiplied by dx²).
+        const consArr = new Float32Array(bufs[5]);
 
         // Decode the two 64-bit timestamps (ns since some device epoch) into
         // a step time in ms. We read as two BigUint64s — the high bits of
@@ -240,10 +284,10 @@ export class StatsDisplay {
             }
         }
 
-        this._compute(U0, U1, Bxf, Byf, dtArr[0], n, nT, gpuMs);
+        this._compute(U0, U1, Bxf, Byf, dtArr[0], n, nT, gpuMs, consArr);
     }
 
-    _compute(U0, U1, Bxf, Byf, dt, n, nT, gpuMs) {
+    _compute(U0, U1, Bxf, Byf, dt, n, nT, gpuMs, consArr) {
         const ghost = GHOST_WIDTH;
         const dx = this.sim.dx;
         const dxInv = 1 / dx;
@@ -386,6 +430,56 @@ export class StatsDisplay {
         pushSparkSample(this._sparkEnergy.hist, Etot);
         pushSparkSample(this._sparkBeta.hist, betaMean);
         pushSparkSample(this._sparkDivB.hist, divBNorm);
+
+        // ── Conservation diagnostics (GPU-reduced) ───────────────
+        // consArr layout (from conservation-finalize.wgsl): seven
+        // straight sums over interior cells (NOT pre-multiplied by
+        // dx²) followed by a pad slot. Scale by cellArea here so the
+        // numbers match the "∫" framing in the UI labels and the
+        // CPU-computed Etot above (post-scale they're in the same
+        // unit system).
+        const massSum = consArr[0] * cellArea;
+        const momX    = consArr[1] * cellArea;
+        const momY    = consArr[2] * cellArea;
+        const momZ    = consArr[3] * cellArea;
+        const eGpu    = consArr[4] * cellArea;
+        const eMagGpu = consArr[5] * cellArea;
+        // ∇·B reported as mean L1 per cell — divides the summed |∇·B|
+        // by the interior cell count. Independent of dx (the divB
+        // shader formula already carries the 1/dx factor). Reads as
+        // ~machine-eps when CT is healthy.
+        const divBMean = consArr[6] / Math.max(nCells, 1);
+
+        // Capture baseline on the first sample where mass is non-zero —
+        // before any sim.step() has run the cons_out buffer is still
+        // the WebGPU zero-init, so latching that would make every
+        // subsequent drift % read as ±∞.
+        if (!this._consBaseline && massSum !== 0 && Number.isFinite(massSum)) {
+            this._consBaseline = {
+                mass: massSum, momx: momX, momy: momY, momz: momZ,
+                eTot: eGpu, eMag: eMagGpu,
+            };
+        }
+        const driftPct = (cur, base) =>
+            (base !== 0 && Number.isFinite(base))
+                ? 100 * (cur - base) / Math.abs(base)
+                : 0;
+        const consVals = {
+            mass: massSum, momx: momX, momy: momY, momz: momZ,
+            eTot: eGpu, eMag: eMagGpu, divB: divBMean,
+        };
+        for (const k of ['mass', 'momx', 'momy', 'momz', 'eTot', 'eMag']) {
+            this._consRefs[k].textContent = fmt(consVals[k]);
+            if (this._consBaseline) {
+                const d = driftPct(consVals[k], this._consBaseline[k]);
+                this._consRefs[k + 'Drift'].textContent = (d >= 0 ? '+' : '') + d.toFixed(3) + '%';
+            } else {
+                this._consRefs[k + 'Drift'].textContent = '—';
+            }
+        }
+        this._consRefs.divB.textContent = fmt(divBMean);
+        for (const s of this._consSparks) pushSparkSample(s.hist, consVals[s.key]);
+
         this._drawSparks();
     }
 
@@ -400,5 +494,6 @@ export class StatsDisplay {
         draw(this._sparkEnergy);
         draw(this._sparkBeta);
         draw(this._sparkDivB);
+        for (const s of this._consSparks) draw(s);
     }
 }
