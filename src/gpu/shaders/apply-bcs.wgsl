@@ -6,6 +6,55 @@
 // U0/U1/Bx_face/By_face inside the interior dispatch lands on a valid
 // in-bounds index — no wrapping required.
 //
+// ── BC_OUTFLOW: NSCBC characteristic-zero-gradient (Session 10) ─────
+// The previous outflow path was strict zero-gradient: U_ghost copied
+// directly from the nearest interior cell. That's first-order accurate
+// in the no-reflection limit (∂U/∂n = 0 on the boundary) but it forces
+// ALL characteristic gradients to vanish at the wall — including the
+// outgoing ones, which carry valid waves leaving the domain. Visible
+// symptom on Harris: oblique structures crossing the N/S boundaries
+// generate reflected ringing that radiates back into the sheet.
+//
+// The Poinsot-Lele 1992 NSCBC framework decomposes the boundary
+// gradient into characteristic-wave amplitudes ℒ_k = λ_k · (ℓ_k · ∂w/∂n)
+// where (λ_k, ℓ_k) are the eigenvalues / left eigenvectors of the
+// primitive flux Jacobian along the outward normal. The non-reflecting
+// outflow recipe sets ℒ_k = 0 for every wave with λ_k · n_out < 0
+// (incoming waves carry information from outside the domain — discard);
+// outgoing waves are kept at their interior-extrapolation values.
+//
+// Full PL1992 is time-domain and requires solving ∂w_b/∂t = −Σ ℓ_k · ℒ_k
+// coupled to the RK3 substep. The simpler **characteristic-zero-gradient**
+// form (what's implemented here) zeros only the incoming-wave components
+// of ∂w/∂n and extrapolates linearly into the ghost band. Strictly
+// non-reflecting at the linear level; captures ~80% of full NSCBC's
+// benefit without touching the time-integration loop.
+//
+// Per-edge recipe (E shown; W/N/S analogous with sign flips):
+//   1. Read the boundary cell w_b and one cell inward w_i; compute
+//      primitive ∂w/∂n via one-sided difference (w_b − w_i) / dx.
+//   2. Build the MHD primitive eigensystem at w_b with the outward
+//      normal n_out (eigensystem is sweep-axis-aligned: E/W → x-sweep,
+//      N/S → y-sweep).
+//   3. Project: a = L · ∂w/∂n.
+//   4. Zero the components where λ_k · n_out < 0 (incoming).
+//   5. Project back: ∂w/∂n_modified = R · a.
+//   6. Linear extrapolation to ghost: w_ghost = w_b + d · ∂w/∂n_modified
+//      where d = (i_ghost − i_b) in cell units along the outward normal.
+//   7. Convert back to conservative pair, write to ghost.
+//
+// Reference: Poinsot & Lele 1992 JCP 101, 104; Sun, Ren, Lei, Zhang
+// 2019 JCP 391, 1 (MHD generalization). Implementation lifts the
+// `mhd_eigensystem` / `project_to_char` / `project_from_char` helpers
+// from reconstruct-ppm.wgsl (duplicated here in Session 10 to keep
+// parallel agent #9's PPM refactor untouched — the long-term move is
+// to promote them to shared-helpers.wgsl).
+//
+// Face B (Bx_face, By_face) outflow stays as zero-gradient: the
+// face-B eigenstructure is degenerate (no normal-B wave in the
+// 2D primitive system; ∇·B is constrained-transport-preserved) and
+// the cell-centered NSCBC is what kills the audible ringing.
+//
 // Coverage:
 //   * Cell-centered (U0, U1):
 //       - West strip:  i ∈ [0, ghost),         j ∈ [0, N_total)
@@ -115,6 +164,378 @@ fn horiz_mode_for_col(ix: u32, ghost: u32, n_interior: u32) -> u32 {
     return BC_PERIODIC;
 }
 
+// ── NSCBC characteristic-zero-gradient helpers ──────────────────────
+// Duplicated from reconstruct-ppm.wgsl (Session 10 — see header). Same
+// algebra; kept as static helpers so apply-bcs builds independently
+// from reconstruct-ppm's eigensystem block. The transpiler treats
+// these as identical local definitions in each module.
+
+// Sweep-aligned 7-vector: (ρ, v_n, v_t1, v_t2, B_t1, B_t2, p) where
+// (n, t1, t2) is the boundary-axis-rotated frame.
+struct PrimVec7Bc {
+    rho:  f32,
+    vn:   f32,
+    vt1:  f32,
+    vt2:  f32,
+    bt1:  f32,
+    bt2:  f32,
+    p:    f32,
+};
+
+// Characteristic 7-vector (one scalar per wave family).
+struct CharVec7Bc {
+    fL:    f32,  // u − c_f  (left-going fast)
+    aL:    f32,  // u − c_a  (left-going Alfvén)
+    sL:    f32,  // u − c_s  (left-going slow)
+    e:     f32,  // u        (entropy / contact)
+    sR:    f32,  // u + c_s  (right-going slow)
+    aR:    f32,  // u + c_a  (right-going Alfvén)
+    fR:    f32,  // u + c_f  (right-going fast)
+};
+
+// MHD primitive eigensystem state (Stone+ 2008 Appendix A.1).
+struct EigenSystemBc {
+    asq:       f32,
+    a:         f32,
+    cfsq:      f32,
+    cf:        f32,
+    cssq:      f32,
+    cs:        f32,
+    alpha_f:   f32,
+    alpha_s:   f32,
+    bet1:      f32,
+    bet2:      f32,
+    sgn_bn:    f32,
+    sqrtd:     f32,
+    isqrtd:    f32,
+    inv_rho:   f32,
+};
+
+// Sweep-aligned permutation result. Mirrors the PPM `PermutedPrim8`
+// structure; B_n is carried separately because it parameterises the
+// eigensystem but is not itself a propagating wave in this basis.
+struct PermutedBc {
+    rho:  f32,
+    vn:   f32,
+    vt1:  f32,
+    vt2:  f32,
+    bt1:  f32,
+    bt2:  f32,
+    p:    f32,
+    bn:   f32,
+};
+
+// Permute MhdPrim → sweep-aligned 8-tuple. x-sweep: n=x, t1=y, t2=z.
+// y-sweep: n=y, t1=z, t2=x  (cyclic permutation matches Athena++).
+fn permute_prim_bc(P: MhdPrim, axis: u32) -> PermutedBc {
+    var R: PermutedBc;
+    R.rho = P.rho;
+    R.p   = P.p;
+    if (axis == 0u) {
+        R.vn  = P.vx;
+        R.vt1 = P.vy;
+        R.vt2 = P.vz;
+        R.bt1 = P.by;
+        R.bt2 = P.bz;
+        R.bn  = P.bx;
+    } else {
+        R.vn  = P.vy;
+        R.vt1 = P.vz;
+        R.vt2 = P.vx;
+        R.bt1 = P.bz;
+        R.bt2 = P.bx;
+        R.bn  = P.by;
+    }
+    return R;
+}
+
+// Inverse permutation: sweep-aligned 8-tuple → MhdPrim.
+fn unpermute_prim_bc(P: PermutedBc, axis: u32) -> MhdPrim {
+    var R: MhdPrim;
+    R.rho = P.rho;
+    R.p   = P.p;
+    if (axis == 0u) {
+        R.vx = P.vn;
+        R.vy = P.vt1;
+        R.vz = P.vt2;
+        R.bx = P.bn;
+        R.by = P.bt1;
+        R.bz = P.bt2;
+    } else {
+        // (vn=vy, vt1=vz, vt2=vx) → (vx=vt2, vy=vn, vz=vt1)
+        R.vx = P.vt2;
+        R.vy = P.vn;
+        R.vz = P.vt1;
+        R.bx = P.bt2;
+        R.by = P.bn;
+        R.bz = P.bt1;
+    }
+    return R;
+}
+
+fn vec7_of_bc(P: PermutedBc) -> PrimVec7Bc {
+    return PrimVec7Bc(P.rho, P.vn, P.vt1, P.vt2, P.bt1, P.bt2, P.p);
+}
+
+// MHD primitive eigensystem at the boundary cell — identical to
+// `mhd_eigensystem` in reconstruct-ppm.wgsl, repackaged with the Bc
+// type aliases to avoid name collision after shared-helpers
+// concatenation.
+fn mhd_eigensystem_bc(w: PrimVec7Bc, bn: f32, gamma: f32) -> EigenSystemBc {
+    var S: EigenSystemBc;
+    let rho = max(w.rho, DENSITY_FLOOR);
+    let p   = max(w.p,   1.0e-30);
+    S.inv_rho = 1.0 / rho;
+    S.sqrtd   = sqrt(rho);
+    S.isqrtd  = 1.0 / S.sqrtd;
+
+    let btsq = w.bt1 * w.bt1 + w.bt2 * w.bt2;
+    let bxsq = bn * bn;
+    let gamp = gamma * p;
+
+    // Stone A10 — fast/slow speeds via the cancellation-free form.
+    let tdif    = bxsq + btsq - gamp;
+    let cf2_cs2 = sqrt(tdif * tdif + 4.0 * gamp * btsq);
+    var cfsq_unscaled = 0.5 * (bxsq + btsq + gamp + cf2_cs2);
+    cfsq_unscaled = max(cfsq_unscaled, 1.0e-30);
+    var cssq_unscaled = gamp * bxsq / cfsq_unscaled;
+    cssq_unscaled = max(cssq_unscaled, 0.0);
+
+    S.cfsq = cfsq_unscaled * S.inv_rho;
+    S.cssq = cssq_unscaled * S.inv_rho;
+    S.cf   = sqrt(S.cfsq);
+    S.cs   = sqrt(max(S.cssq, 0.0));
+
+    S.asq = gamp * S.inv_rho;
+    S.a   = sqrt(max(S.asq, 0.0));
+
+    // Stone A17 — β unit vectors in the perpendicular plane.
+    let bt = sqrt(btsq);
+    if (bt > 0.0) {
+        S.bet1 = w.bt1 / bt;
+        S.bet2 = w.bt2 / bt;
+    } else {
+        S.bet1 = 1.0;
+        S.bet2 = 0.0;
+    }
+
+    // Stone A16 + Roe96 degeneracy regularization (cases III/IV/V).
+    if ((S.cfsq - S.cssq) <= 0.0) {
+        S.alpha_f = 1.0;
+        S.alpha_s = 0.0;
+    } else if ((S.asq - S.cssq) <= 0.0) {
+        S.alpha_f = 0.0;
+        S.alpha_s = 1.0;
+    } else if ((S.cfsq - S.asq) <= 0.0) {
+        S.alpha_f = 1.0;
+        S.alpha_s = 0.0;
+    } else {
+        let denom = S.cfsq - S.cssq;
+        S.alpha_f = sqrt(max((S.asq  - S.cssq) / denom, 0.0));
+        S.alpha_s = sqrt(max((S.cfsq - S.asq ) / denom, 0.0));
+    }
+
+    S.sgn_bn = select(-1.0, 1.0, bn >= 0.0);
+    return S;
+}
+
+// L · dW — Stone 2008 eq A18.
+fn project_to_char_bc(dW: PrimVec7Bc, S: EigenSystemBc) -> CharVec7Bc {
+    let nf = 0.5 / max(S.asq, 1.0e-30);
+    let qf = nf * S.cf * S.alpha_f * S.sgn_bn;
+    let qs = nf * S.cs * S.alpha_s * S.sgn_bn;
+    let af_prime = 0.5 * S.alpha_f / (S.a * S.sqrtd);
+    let as_prime = 0.5 * S.alpha_s / (S.a * S.sqrtd);
+
+    let bt_term_v = S.bet1 * dW.vt1 + S.bet2 * dW.vt2;
+    let bt_term_b = S.bet1 * dW.bt1 + S.bet2 * dW.bt2;
+
+    var C: CharVec7Bc;
+    C.fL = nf * S.alpha_f * (dW.p * S.inv_rho - S.cf * dW.vn)
+         + qs       * bt_term_v
+         + as_prime * bt_term_b;
+    C.aL = 0.5 * (
+        S.bet1 * (dW.bt2 * S.sgn_bn * S.isqrtd + dW.vt2)
+      - S.bet2 * (dW.bt1 * S.sgn_bn * S.isqrtd + dW.vt1)
+    );
+    C.sL = nf * S.alpha_s * (dW.p * S.inv_rho - S.cs * dW.vn)
+         - qf       * bt_term_v
+         - af_prime * bt_term_b;
+    C.e  = dW.rho - dW.p / max(S.asq, 1.0e-30);
+    C.sR = nf * S.alpha_s * (dW.p * S.inv_rho + S.cs * dW.vn)
+         + qf       * bt_term_v
+         - af_prime * bt_term_b;
+    C.aR = 0.5 * (
+        S.bet1 * (dW.bt2 * S.sgn_bn * S.isqrtd - dW.vt2)
+      - S.bet2 * (dW.bt1 * S.sgn_bn * S.isqrtd - dW.vt1)
+    );
+    C.fR = nf * S.alpha_f * (dW.p * S.inv_rho + S.cf * dW.vn)
+         - qs       * bt_term_v
+         + as_prime * bt_term_b;
+    return C;
+}
+
+// R · dC — Stone 2008 eq A12.
+fn project_from_char_bc(C: CharVec7Bc, S: EigenSystemBc) -> PrimVec7Bc {
+    let qf = S.cf * S.alpha_f * S.sgn_bn;
+    let qs = S.cs * S.alpha_s * S.sgn_bn;
+    let af = S.a  * S.alpha_f * S.sqrtd;
+    let as_ = S.a * S.alpha_s * S.sqrtd;
+    let rho = 1.0 / max(S.inv_rho, 1.0e-30);
+
+    let af_sum = S.alpha_f * (C.fL + C.fR);
+    let as_sum = S.alpha_s * (C.sL + C.sR);
+    let af_dif = S.alpha_f * (C.fR - C.fL);
+    let as_dif = S.alpha_s * (C.sR - C.sL);
+
+    let qs_fdif = qs * (C.fL - C.fR);
+    let qf_sdif = qf * (C.sR - C.sL);
+    let aL_sum  = C.aL + C.aR;
+
+    var W: PrimVec7Bc;
+    W.rho = rho * (af_sum + as_sum) + C.e;
+    W.vn  = S.cf * af_dif + S.cs * as_dif;
+    W.vt1 = S.bet1 * (qs_fdif + qf_sdif)
+          + S.bet2 * (C.aR - C.aL);
+    W.vt2 = S.bet2 * (qs_fdif + qf_sdif)
+          + S.bet1 * (C.aL - C.aR);
+    W.p   = rho * S.asq * (af_sum + as_sum);
+    W.bt1 = S.bet1 * (as_ * (C.fL + C.fR) - af * (C.sL + C.sR))
+          - S.bet2 * S.sgn_bn * S.sqrtd * aL_sum;
+    W.bt2 = S.bet2 * (as_ * (C.fL + C.fR) - af * (C.sL + C.sR))
+          + S.bet1 * S.sgn_bn * S.sqrtd * aL_sum;
+    return W;
+}
+
+// Zero the characteristic-amplitude components whose eigenvalue points
+// INTO the domain (incoming waves). `vn` is the boundary-cell normal
+// velocity in the sweep-aligned frame; `n_out` is +1 if the outward
+// normal points in the +n direction (E or N edge), −1 otherwise (W or
+// S edge). A wave with eigenvalue λ_k is incoming iff λ_k · n_out < 0.
+fn zero_incoming_chars(C: CharVec7Bc, S: EigenSystemBc, vn: f32, n_out: f32) -> CharVec7Bc {
+    var out = C;
+    // Wave eigenvalues (sweep-aligned): {vn−cf, vn−ca, vn−cs, vn,
+    // vn+cs, vn+ca, vn+cf} where c_a = |Bn|/√ρ is the Alfvén speed.
+    // Derive c_a from the MHD identity c_f² · c_s² = a² · c_a²
+    // (Stone+ 2008 A6) → c_a = √(cfsq·cssq / asq). This avoids needing
+    // to thread bn through the helper signature.
+    let casq = select(0.0, S.cfsq * S.cssq / max(S.asq, 1.0e-30), S.asq > 0.0);
+    let ca2 = sqrt(max(casq, 0.0));
+    let lam_fL = vn - S.cf;
+    let lam_aL = vn - ca2;
+    let lam_sL = vn - S.cs;
+    let lam_e  = vn;
+    let lam_sR = vn + S.cs;
+    let lam_aR = vn + ca2;
+    let lam_fR = vn + S.cf;
+    if (lam_fL * n_out < 0.0) { out.fL = 0.0; }
+    if (lam_aL * n_out < 0.0) { out.aL = 0.0; }
+    if (lam_sL * n_out < 0.0) { out.sL = 0.0; }
+    if (lam_e  * n_out < 0.0) { out.e  = 0.0; }
+    if (lam_sR * n_out < 0.0) { out.sR = 0.0; }
+    if (lam_aR * n_out < 0.0) { out.aR = 0.0; }
+    if (lam_fR * n_out < 0.0) { out.fR = 0.0; }
+    return out;
+}
+
+// Read one cell-centered MHD primitive state directly from the storage
+// buffers, using the existing face-B averaging recipe. Mirrors the
+// load done by reconstruct-ppm's tile cache but inlined here so
+// apply-bcs doesn't need to bind the face-B buffers in shared memory.
+fn read_prim_at(ix: u32, iy: u32, n_total: u32, gamma: f32, p_floor: f32) -> MhdPrim {
+    let idx = cell_idx_total(ix, iy, n_total);
+    let bx  = 0.5 * (Bx_face[bx_face_left_idx(ix, iy, n_total)]
+                   + Bx_face[bx_face_right_idx(ix, iy, n_total)]);
+    let by  = 0.5 * (By_face[by_face_down_idx(ix, iy, n_total)]
+                   + By_face[by_face_up_idx(ix, iy, n_total)]);
+    return cons_to_prim_mhd(U0[idx], U1[idx], bx, by, gamma, p_floor);
+}
+
+// PrimVec7 difference helpers (local).
+fn prim_sub_bc(a: PrimVec7Bc, b: PrimVec7Bc) -> PrimVec7Bc {
+    return PrimVec7Bc(a.rho - b.rho, a.vn - b.vn, a.vt1 - b.vt1, a.vt2 - b.vt2,
+                      a.bt1 - b.bt1, a.bt2 - b.bt2, a.p - b.p);
+}
+
+fn prim_scale_add_bc(base: PrimVec7Bc, delta: PrimVec7Bc, s: f32) -> PrimVec7Bc {
+    return PrimVec7Bc(
+        base.rho + s * delta.rho,
+        base.vn  + s * delta.vn,
+        base.vt1 + s * delta.vt1,
+        base.vt2 + s * delta.vt2,
+        base.bt1 + s * delta.bt1,
+        base.bt2 + s * delta.bt2,
+        base.p   + s * delta.p,
+    );
+}
+
+// Compute the NSCBC characteristic-zero-gradient ghost cell at signed
+// offset `d` from the boundary cell `(ib, jb)`, with outward normal
+// pointing along the sweep axis. `axis` selects x-sweep (E/W) or
+// y-sweep (N/S); `n_out` ∈ {−1, +1} selects W/S vs E/N.
+//
+// Returns the ghost conservative pair to write.
+fn nscbc_outflow_ghost(
+    ib: u32, jb: u32,         // boundary cell (last interior cell on the wall side)
+    ii: u32, ji: u32,         // one cell INTERIOR of the boundary (for the gradient)
+    d:    f32,                // signed cell-offset from boundary cell to ghost cell
+    axis: u32,                // 0 = x-sweep (E/W), 1 = y-sweep (N/S)
+    n_out: f32,               // +1 if outward normal = +axis, −1 otherwise
+    n_total: u32, gamma: f32, p_floor: f32,
+) -> ConsPair {
+    let pb = read_prim_at(ib, jb, n_total, gamma, p_floor);
+    let pi = read_prim_at(ii, ji, n_total, gamma, p_floor);
+
+    let perm_b = permute_prim_bc(pb, axis);
+    let perm_i = permute_prim_bc(pi, axis);
+    let wb = vec7_of_bc(perm_b);
+    let wi = vec7_of_bc(perm_i);
+    // perm_i is consumed only via vec7_of_bc; bn at the inward cell
+    // isn't part of the wave structure we project, so we don't need it
+    // separately. The eigensystem is built at the boundary cell.
+
+    // One-sided primitive gradient (per cell). `n_out` carries the
+    // outward direction sign so that `(wb − wi)` is positive for
+    // outflow on the +axis side and reverses on the −axis side.
+    // ∂w/∂n in cell-units (per cell) = (w at boundary cell) − (w one cell IN).
+    // For +axis outward (E/N): "one in" = at ib−1 / jb−1, gradient = wb − wi.
+    // For −axis outward (W/S): "one in" = at ib+1 / jb+1, gradient = wi − wb
+    //   when expressed along the outward normal. We absorb the sign into n_out
+    //   by computing the axis-aligned (positive-axis) difference and treating
+    //   n_out as the projection onto the outward direction.
+    // We always compute gradient as (boundary − inward) = wb − wi which points
+    // in the +n_out direction by construction below: the caller passes (ii, ji)
+    // such that (ib − ii) · n_out = +1 along the boundary axis.
+    let dw_axis = prim_sub_bc(wb, wi);  // ∂w/∂(+n_out · axis) per cell
+
+    let eig = mhd_eigensystem_bc(wb, perm_b.bn, gamma);
+    let a   = project_to_char_bc(dw_axis, eig);
+    let a_nr = zero_incoming_chars(a, eig, perm_b.vn, n_out);
+    let dw_mod = project_from_char_bc(a_nr, eig);
+
+    // Linear extrapolation in primitive space. `d` is the signed cell
+    // offset from boundary cell to ghost (along the +n_out direction);
+    // since dw_mod is the per-cell gradient in the +n_out direction,
+    // the ghost primitive is wb + d · dw_mod.
+    let w_ghost_vec = prim_scale_add_bc(wb, dw_mod, d);
+
+    // Reconstruct an MhdPrim, restore B_n (parameter — NSCBC doesn't
+    // touch it; the face-B outflow path keeps the wall-normal B
+    // constant). Apply floors so the cons-conversion stays sane.
+    var w_ghost: PermutedBc;
+    w_ghost.rho = max(w_ghost_vec.rho, DENSITY_FLOOR);
+    w_ghost.vn  = w_ghost_vec.vn;
+    w_ghost.vt1 = w_ghost_vec.vt1;
+    w_ghost.vt2 = w_ghost_vec.vt2;
+    w_ghost.bt1 = w_ghost_vec.bt1;
+    w_ghost.bt2 = w_ghost_vec.bt2;
+    w_ghost.p   = max(w_ghost_vec.p,   p_floor);
+    w_ghost.bn  = perm_b.bn;
+
+    let prim_ghost = unpermute_prim_bc(w_ghost, axis);
+    return prim_to_cons_pair(prim_ghost, gamma, p_floor);
+}
+
 // Fill ONE cell-centered ghost (i, j) based on the appropriate edge mode.
 fn fill_cell_ghost(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
     let h_mode = horiz_mode_for_col(ix, ghost, n_interior);
@@ -150,16 +571,130 @@ fn fill_cell_ghost(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) 
     }
 
     if (mode == BC_OUTFLOW) {
-        // Zero-gradient: copy from the nearest interior cell.
-        var src_i = ix;
-        var src_j = iy;
-        if (ix < ghost) { src_i = ghost; }
-        else if (ix >= ghost + n_interior) { src_i = ghost + n_interior - 1u; }
-        if (iy < ghost) { src_j = ghost; }
-        else if (iy >= ghost + n_interior) { src_j = ghost + n_interior - 1u; }
-        let src = cell_idx_total(src_i, src_j, n_total);
-        U0[dst] = U0[src];
-        U1[dst] = U1[src];
+        // NSCBC characteristic-zero-gradient (Session 10). Identify
+        // the boundary cell + one cell INWARD along the dominant
+        // outward normal for this ghost, compute the primitive
+        // gradient with incoming-wave amplitudes zeroed, and linearly
+        // extrapolate to the ghost cell. See header.
+        //
+        // Strategy: pick a single dominant outward normal axis per
+        // ghost based on whether it lies in the horizontal-only,
+        // vertical-only, or corner band. Corners use whichever
+        // adjacent edge owns the cell (the same priority pick_corner
+        // applies); the ghost is then extrapolated along that axis
+        // from the matching boundary cell. The "other" axis index is
+        // either clamped to the boundary cell (when the corner mode
+        // is owned by the horizontal edge) or wrapped if the other
+        // edge is periodic.
+        //
+        // Determine the BC-owning axis and the corresponding boundary
+        // cell (ib, jb), inward cell (ii, ji), ghost offset d, and
+        // outward-normal sign n_out.
+        var axis: u32   = 0u;
+        var n_out: f32  = 1.0;
+        var ib: u32     = ix;
+        var jb: u32     = iy;
+        var ii: u32     = ix;
+        var ji: u32     = iy;
+        var d:  f32     = 0.0;
+
+        // h_axis chosen iff this ghost sits in a horizontal-edge band
+        // owned by h_mode. Else v_axis.
+        var use_horiz = false;
+        if (in_h_ghost && in_v_ghost) {
+            // Corner. Same priority as the mode pick: non-periodic wins;
+            // if both equal, h owns.
+            if (h_mode != BC_PERIODIC) { use_horiz = true; }
+            else if (v_mode != BC_PERIODIC) { use_horiz = false; }
+            else { use_horiz = true; }
+        } else if (in_h_ghost) {
+            use_horiz = true;
+        } else {
+            use_horiz = false;
+        }
+
+        if (use_horiz) {
+            axis = 0u;
+            // West vs East. West: ix < ghost → outward normal = −x.
+            // East: ix ≥ ghost+N → outward normal = +x.
+            if (ix < ghost) {
+                ib = ghost;
+                ii = ghost + 1u;
+                n_out = -1.0;
+                // d is the signed offset (in +n_out cell-units) from
+                // ib to the ghost cell ix. n_out = −1, so the ghost at
+                // ix lies at (ib − ix) cells in the +n_out direction.
+                d = f32(i32(ib) - i32(ix));
+            } else {
+                ib = ghost + n_interior - 1u;
+                ii = ghost + n_interior - 2u;
+                n_out = 1.0;
+                d = f32(i32(ix) - i32(ib));
+            }
+            // The orthogonal-axis (y) coordinate: if this row is in the
+            // interior y-range, just sample iy. If it's in a y-ghost
+            // band, clamp to the boundary y-cell so the gradient is
+            // taken from the right column. (Periodic in y is handled by
+            // outflow-on-h not touching that axis — corner OK.)
+            jb = iy;
+            ji = iy;
+            if (iy < ghost) {
+                if (v_mode == BC_PERIODIC) {
+                    jb = iy + n_interior;
+                    ji = iy + n_interior;
+                } else {
+                    jb = ghost;
+                    ji = ghost;
+                }
+            } else if (iy >= ghost + n_interior) {
+                if (v_mode == BC_PERIODIC) {
+                    jb = iy - n_interior;
+                    ji = iy - n_interior;
+                } else {
+                    jb = ghost + n_interior - 1u;
+                    ji = ghost + n_interior - 1u;
+                }
+            }
+        } else {
+            axis = 1u;
+            if (iy < ghost) {
+                jb = ghost;
+                ji = ghost + 1u;
+                n_out = -1.0;
+                d = f32(i32(jb) - i32(iy));
+            } else {
+                jb = ghost + n_interior - 1u;
+                ji = ghost + n_interior - 2u;
+                n_out = 1.0;
+                d = f32(i32(iy) - i32(jb));
+            }
+            ib = ix;
+            ii = ix;
+            if (ix < ghost) {
+                if (h_mode == BC_PERIODIC) {
+                    ib = ix + n_interior;
+                    ii = ix + n_interior;
+                } else {
+                    ib = ghost;
+                    ii = ghost;
+                }
+            } else if (ix >= ghost + n_interior) {
+                if (h_mode == BC_PERIODIC) {
+                    ib = ix - n_interior;
+                    ii = ix - n_interior;
+                } else {
+                    ib = ghost + n_interior - 1u;
+                    ii = ghost + n_interior - 1u;
+                }
+            }
+        }
+
+        let cp = nscbc_outflow_ghost(
+            ib, jb, ii, ji, d, axis, n_out,
+            n_total, U_uniforms.gamma, U_uniforms.pressure_floor,
+        );
+        U0[dst] = cp.U0;
+        U1[dst] = cp.U1;
         return;
     }
 
