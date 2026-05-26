@@ -98,27 +98,35 @@
 
 // Main physics-state Uniforms (64 B). Written when a physics parameter
 // changes (preset/eta/cfl/gamma/view_mode/resolution/pressure_floor). Slots
-// 5,6,7,14 are reserved (previously held LIC fields — now in a separate
-// LicUniforms buffer rewritten per render frame). Slot 11 holds the
-// pressure floor (was the dead _pad_sweep slot reclaimed for live UI).
-// Slot 12 holds the CFL number (was the unused step_parity slot).
+// 6,7,14 are reserved (previously held LIC fields — now in a separate
+// LicUniforms buffer rewritten per render frame). Slot 5 was reclaimed
+// in Session 8 for the anomalous-resistivity α coefficient. Slot 11 holds
+// the pressure floor (was the dead _pad_sweep slot reclaimed for live UI).
+// Slot 12 holds the CFL number (was the unused step_parity slot). Slot 14
+// was reclaimed in Session 8 for the anomalous-resistivity J_crit threshold.
+//
+// Resistivity model:
+//   η_local(J) = eta + eta_anom_alpha · ((|J|/eta_anom_jcrit − 1)_+)²
+// where (·)_+ is the positive part. eta = base (Spitzer/uniform) resistivity;
+// eta_anom_alpha = 0 disables anomalous boost entirely (constant-η baseline).
+// |J| = |J_z| in 2.5D (only Jz is nonzero from in-plane fields).
 struct Uniforms {
-    dx:            f32,
-    gamma:         f32,
-    view_min:      f32,
-    view_max:      f32,
-    eta:           f32,
-    _pad_lic_0:    f32,  // reserved (was lic_phase — now in LicUniforms)
-    _pad_lic_1:    f32,  // reserved (was lic_intensity — now in LicUniforms)
-    _pad_lic_2:    f32,  // reserved (was lic_drift_x — now in LicUniforms)
-    grid_n:        u32,  // INTERIOR grid resolution per axis
-    grid_n_total:  u32,  // grid_n + 2*ghost_w (total storage width per axis)
-    ghost_w:       u32,  // ghost-cell width per side (= 2 in Phase 4)
-    pressure_floor:f32,  // minimum p in cons→prim recovery (UI slider)
-    cfl:           f32,  // hyperbolic CFL number — consumed by compute-dt
-    view_mode:     u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
-    _pad_lic_3:    f32,  // reserved (was lic_drift_y — now in LicUniforms)
-    noise_n:       u32,  // noise-buffer side length (square, default 1024)
+    dx:              f32,
+    gamma:           f32,
+    view_min:        f32,
+    view_max:        f32,
+    eta:             f32,  // base resistivity (η_0)
+    eta_anom_alpha:  f32,  // anomalous boost coefficient (slot 5; was _pad_lic_0)
+    _pad_lic_1:      f32,  // reserved (was lic_intensity — now in LicUniforms)
+    _pad_lic_2:      f32,  // reserved (was lic_drift_x — now in LicUniforms)
+    grid_n:          u32,  // INTERIOR grid resolution per axis
+    grid_n_total:    u32,  // grid_n + 2*ghost_w (total storage width per axis)
+    ghost_w:         u32,  // ghost-cell width per side (= 2 in Phase 4)
+    pressure_floor:  f32,  // minimum p in cons→prim recovery (UI slider)
+    cfl:             f32,  // hyperbolic CFL number — consumed by compute-dt
+    view_mode:       u32,  // 0=ρ, 1=p, 2=|v|, 3=|B|, 4=Jz
+    eta_anom_jcrit:  f32,  // anomalous activation threshold |J_crit| (slot 14; was _pad_lic_3)
+    noise_n:         u32,  // noise-buffer side length (square, default 1024)
 };
 
 // Sweep-direction uniform — 16 B. Two of these (sweepDir_x = 0u,
@@ -355,3 +363,32 @@ struct PrimPair {
 fn normal_velocity_mhd(P: MhdPrim, axis: u32) -> f32 {
     if (axis == 0u) { return P.vx; } else { return P.vy; }
 }
+
+// ── Anomalous resistivity ──────────────────────────────────────────
+// Ad-hoc closure used by both the Hall-MHD and PIC-validated MRX
+// literature (e.g., Birn et al. 2001 GEM challenge; Schumlak 2017;
+// Trintchouk & Yamada 2003). Triggers enhanced (fast) reconnection
+// only where local current density exceeds a critical value, leaving
+// bulk plasma at the base Spitzer-like resistivity.
+//
+// Form:  η(|J|) = η_0 + α · max(0, |J|/J_crit − 1)²
+// With α = 0 this reduces exactly to constant resistivity. The (·)²
+// makes the boost smooth at the threshold; squared form is the
+// default used by most reconnection models.
+fn anomalous_eta(j_mag: f32, eta0: f32, alpha: f32, jcrit: f32) -> f32 {
+    if (alpha <= 0.0) { return eta0; }
+    let jcrit_safe = max(jcrit, 1.0e-12);
+    let r = j_mag / jcrit_safe;
+    let excess = max(0.0, r - 1.0);
+    return eta0 + alpha * excess * excess;
+}
+
+// J_z recipe (inlined by callers — WGSL pointer-to-storage parameters
+// aren't universally supported across implementations and add no value
+// here):
+//   bx_c(ix, iy) = 0.5 · (Bx_face[ix, iy] + Bx_face[ix+1, iy])
+//   by_c(ix, iy) = 0.5 · (By_face[ix, iy] + By_face[ix, iy+1])
+//   J_z(ix, iy)  = (by_c(ix+1, iy) − by_c(ix-1, iy)) / (2·dx)
+//                − (bx_c(ix,   iy+1) − bx_c(ix,   iy-1)) / (2·dx)
+// (∂By/∂x − ∂Bx/∂y, central differences). Used by view-field, apply-
+// resistivity, and compute-dt's η-max reduction.

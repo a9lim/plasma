@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 18;
+const SHADER_VERSION = 20;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -65,7 +65,8 @@ function dtBGL(device) {
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },  // Bx_face
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },  // By_face
         { binding: 5, visibility: COMPUTE, buffer: RW_STO },  // wavespeed atomic
-        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },  // dt_buf (4 f32 slots)
+        { binding: 7, visibility: COMPUTE, buffer: RW_STO },  // eta_max atomic
     ]);
 }
 
@@ -175,21 +176,65 @@ function applyBcsBGL(device) {
     ]);
 }
 
-// New in Phase 4. Explicit resistive diffusion. Two entry points
-// (snapshot + main) share the same BGL; snapshot writes the snap
-// buffers and main reads them — so all six face/cell bindings are rw.
-// 7 storage bindings total (under the 10-per-stage cap).
-function applyResistivityBGL(device) {
-    return bgl(device, 'plasma.applyResistivity.bgl', [
+// Session 8 — RKL2 super-time-stepping rewrite of resistive diffusion.
+// Three pipelines, three bind-group layouts:
+//
+//   applyResSnapshotBGL  Race-free per-cell src → dst copy. Used to seed
+//                        Y_init / Y_pprev / Y_prev at super-step start
+//                        and to copy Y_s back into the main destination
+//                        at end. Same kernel, different bind groups per
+//                        invocation (host varies src/dst handles).
+//   applyResInitBGL      Pass 1 of one RKL2 substep. Writes
+//                        Y_tmp = (1−μ−ν)·U^n + ν·Y_{j-2} + γ̃·Δt·L(U^n).
+//                        9 storage bindings.
+//   applyResPrevBGL      Pass 2 of one RKL2 substep. Adds
+//                        μ·Y_{j-1} + μ̃·Δt·L(Y_{j-1}) to tmp accumulator.
+//                        8 storage bindings.
+//
+// See apply-resistivity.wgsl header for the full RKL2 method overview
+// and host orchestration in sim.js _encodeResistivitySuperStep.
+function applyResSnapshotBGL(device) {
+    return bgl(device, 'plasma.applyResSnapshot.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
-        { binding: 1, visibility: COMPUTE, buffer: UNIFORM },   // stage_params
-        { binding: 2, visibility: COMPUTE, buffer: RW_STO },    // Bx_face   (dst)
-        { binding: 3, visibility: COMPUTE, buffer: RW_STO },    // By_face   (dst)
-        { binding: 4, visibility: COMPUTE, buffer: RW_STO },    // U1_out    (dst; Bz in .y)
-        { binding: 5, visibility: COMPUTE, buffer: RO_STO },    // dt_buf
-        { binding: 6, visibility: COMPUTE, buffer: RW_STO },    // Bx_snap
-        { binding: 7, visibility: COMPUTE, buffer: RW_STO },    // By_snap
-        { binding: 8, visibility: COMPUTE, buffer: RW_STO },    // U1_snap
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },   // Bx_src
+        { binding: 2, visibility: COMPUTE, buffer: RO_STO },   // By_src
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },   // U1_src
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },   // Bx_dst
+        { binding: 5, visibility: COMPUTE, buffer: RW_STO },   // By_dst
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // U1_dst
+    ]);
+}
+
+function applyResInitBGL(device) {
+    return bgl(device, 'plasma.applyResInit.bgl', [
+        { binding: 0,  visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1,  visibility: COMPUTE, buffer: UNIFORM },  // sts_meta
+        { binding: 2,  visibility: COMPUTE, buffer: RO_STO },   // sts_coeffs
+        { binding: 3,  visibility: COMPUTE, buffer: RO_STO },   // Bx_init
+        { binding: 4,  visibility: COMPUTE, buffer: RO_STO },   // By_init
+        { binding: 5,  visibility: COMPUTE, buffer: RO_STO },   // U1_init
+        { binding: 6,  visibility: COMPUTE, buffer: RO_STO },   // Bx_pprev
+        { binding: 7,  visibility: COMPUTE, buffer: RO_STO },   // By_pprev
+        { binding: 8,  visibility: COMPUTE, buffer: RO_STO },   // U1_pprev
+        { binding: 9,  visibility: COMPUTE, buffer: RW_STO },   // Bx_tmp
+        { binding: 10, visibility: COMPUTE, buffer: RW_STO },   // By_tmp
+        { binding: 11, visibility: COMPUTE, buffer: RW_STO },   // U1_tmp
+    ]);
+}
+
+function applyResPrevBGL(device) {
+    return bgl(device, 'plasma.applyResPrev.bgl', [
+        { binding: 0,  visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1,  visibility: COMPUTE, buffer: UNIFORM },  // sts_meta
+        { binding: 2,  visibility: COMPUTE, buffer: RO_STO },   // sts_coeffs
+        { binding: 3,  visibility: COMPUTE, buffer: RO_STO },   // Bx_init (η_local only)
+        { binding: 4,  visibility: COMPUTE, buffer: RO_STO },   // By_init (η_local only)
+        { binding: 5,  visibility: COMPUTE, buffer: RO_STO },   // Bx_prev
+        { binding: 6,  visibility: COMPUTE, buffer: RO_STO },   // By_prev
+        { binding: 7,  visibility: COMPUTE, buffer: RO_STO },   // U1_prev
+        { binding: 8,  visibility: COMPUTE, buffer: RW_STO },   // Bx_tmp
+        { binding: 9,  visibility: COMPUTE, buffer: RW_STO },   // By_tmp
+        { binding: 10, visibility: COMPUTE, buffer: RW_STO },   // U1_tmp
     ]);
 }
 
@@ -302,7 +347,8 @@ function energyFloorBGL(device) {
 export async function createPipelines(device, format) {
     const [
         ppmModule, hlldModule, emfModule, updateUWModule, updateBWModule,
-        applyBcsModule, applyResistivityModule, energyFloorModule,
+        applyBcsModule, applyResSnapshotModule,
+        applyResInitModule, applyResPrevModule, energyFloorModule,
         dtModule, viewModule, colormapModule, compositeModule, licAdvectModule,
         licReduceModule, licNormalizeModule,
         consReduceModule, consFinalizeModule,
@@ -313,7 +359,9 @@ export async function createPipelines(device, format) {
         makeModule(device, 'plasma.update-conserved-weighted', 'update-conserved-weighted.wgsl'),
         makeModule(device, 'plasma.update-b-weighted',         'update-b-weighted.wgsl'),
         makeModule(device, 'plasma.apply-bcs',                 'apply-bcs.wgsl'),
-        makeModule(device, 'plasma.apply-resistivity',         'apply-resistivity.wgsl'),
+        makeModule(device, 'plasma.apply-resistivity.snapshot','apply-resistivity.wgsl'),
+        makeModule(device, 'plasma.apply-resistivity.init',    'apply-resistivity-init.wgsl'),
+        makeModule(device, 'plasma.apply-resistivity.prev',    'apply-resistivity-prev.wgsl'),
         makeModule(device, 'plasma.energy-floor',              'energy-floor.wgsl'),
         makeModule(device, 'plasma.compute-dt',               'compute-dt.wgsl'),
         makeModule(device, 'plasma.view-field',               'view-field.wgsl'),
@@ -331,8 +379,10 @@ export async function createPipelines(device, format) {
     const emfLayout         = emfBGL(device);
     const updateULayout     = updateConservedWeightedBGL(device);
     const updateBLayout     = updateBWeightedBGL(device);
-    const applyBcsLayout    = applyBcsBGL(device);
-    const applyResLayout    = applyResistivityBGL(device);
+    const applyBcsLayout      = applyBcsBGL(device);
+    const applyResSnapLayout  = applyResSnapshotBGL(device);
+    const applyResInitLayout  = applyResInitBGL(device);
+    const applyResPrevLayout  = applyResPrevBGL(device);
     const energyFloorLayout = energyFloorBGL(device);
     const dtLayout          = dtBGL(device);
     const viewLayout        = viewBGL(device);
@@ -376,15 +426,20 @@ export async function createPipelines(device, format) {
         layout: mkPipeLayout(applyBcsLayout),
         compute: { module: applyBcsModule, entryPoint: 'main' },
     });
-    const applyResistivity = device.createComputePipeline({
-        label: 'plasma.apply-resistivity',
-        layout: mkPipeLayout(applyResLayout),
-        compute: { module: applyResistivityModule, entryPoint: 'main' },
-    });
     const applyResSnapshot = device.createComputePipeline({
         label: 'plasma.apply-resistivity.snapshot',
-        layout: mkPipeLayout(applyResLayout),
-        compute: { module: applyResistivityModule, entryPoint: 'snapshot' },
+        layout: mkPipeLayout(applyResSnapLayout),
+        compute: { module: applyResSnapshotModule, entryPoint: 'snapshot' },
+    });
+    const applyResInit = device.createComputePipeline({
+        label: 'plasma.apply-resistivity.init',
+        layout: mkPipeLayout(applyResInitLayout),
+        compute: { module: applyResInitModule, entryPoint: 'main' },
+    });
+    const applyResPrev = device.createComputePipeline({
+        label: 'plasma.apply-resistivity.prev',
+        layout: mkPipeLayout(applyResPrevLayout),
+        compute: { module: applyResPrevModule, entryPoint: 'main' },
     });
     const energyFloor = device.createComputePipeline({
         label: 'plasma.energy-floor',
@@ -470,9 +525,11 @@ export async function createPipelines(device, format) {
             emf:         emfLayout,
             updateU:     updateULayout,
             updateB:     updateBLayout,
-            applyBcs:    applyBcsLayout,
-            applyRes:    applyResLayout,
-            energyFloor: energyFloorLayout,
+            applyBcs:     applyBcsLayout,
+            applyResSnap: applyResSnapLayout,
+            applyResInit: applyResInitLayout,
+            applyResPrev: applyResPrevLayout,
+            energyFloor:  energyFloorLayout,
             dt:          dtLayout,
             view:        viewLayout,
             colormap:    colormapLayout,
@@ -486,7 +543,8 @@ export async function createPipelines(device, format) {
         pipelines: {
             reconstructPpm, riemannHlld, computeEmf,
             updateConservedWeighted, updateBWeighted,
-            applyBcs, applyResistivity, applyResSnapshot,
+            applyBcs,
+            applyResSnapshot, applyResInit, applyResPrev,
             energyFloor,
             dtReset, dtReduce, dtFinalize,
             viewField, colormap, composite, licAdvect,

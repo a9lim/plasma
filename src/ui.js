@@ -95,6 +95,18 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'p-floor (log10)', min: -8, max: -3, step: 0.5,
               value: Math.log10(sim.pressureFloor), format: v => '1e' + v.toFixed(1),
               onChange: v => sim.setPressureFloor(Math.pow(10, v)) },
+            // Anomalous resistivity — α = 0 disables the boost (sim runs
+            // with constant η_0). α > 0 activates Birn-2001-style
+            // |J|>J_crit enhanced resistivity for fast reconnection.
+            // Slider is log10 in [−6, 0] = [1e-6, 1.0] plus an explicit
+            // "off" snap at the bottom.
+            { type: 'slider', label: 'η-anom α (log10)', min: -6, max: 0, step: 0.25,
+              value: (sim.etaAnomAlpha > 0 ? Math.log10(sim.etaAnomAlpha) : -6.5),
+              format: v => (v <= -6.05 ? 'off' : '1e' + v.toFixed(2)),
+              onChange: v => sim.setEtaAnomAlpha(v <= -6.05 ? 0 : Math.pow(10, v)) },
+            { type: 'slider', label: 'η-anom J_crit', min: 1, max: 100, step: 1,
+              value: sim.etaAnomJcrit, format: v => v.toFixed(0),
+              onChange: v => sim.setEtaAnomJcrit(v) },
             { type: 'slider', label: 'LIC intensity', min: 0, max: 2, step: 0.05,
               value: sim.licIntensity, format: v => v.toFixed(2),
               onChange: v => sim.setLicIntensity(v) },

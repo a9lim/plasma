@@ -1,171 +1,108 @@
 // ─── apply-resistivity.wgsl ───────────────────────────────────────────
-// Explicit resistive diffusion. Two entry points run back-to-back per
-// stage:
+// RKL2 super-time-stepping for resistive diffusion (Meyer, Diehl & Kupka
+// 2014 — Algorithm 1 / Eq 13). One super-step covers the hyperbolic Δt
+// with s first-order Laplacian substeps, each within the standard
+// forward-Euler stability bound  Δt_sub ≤ ½ · dx² / η_max.
 //
-//   1. `snapshot` — race-free per-cell copy of (Bx_face, By_face, U1)
-//      → (Bx_snap, By_snap, U1_snap). Each invocation touches only its
-//      own cell, so there are no neighbor reads and no race possible.
+// Stability boundary (RKL2):  Δt_super ≤ ((s² + s − 2) / 2) · dt_parabolic
+// So for moderate-to-high η where dt_parabolic ≪ dt_hyperbolic,
+// `s = ceil(0.5 · (√(1 + 8 · dt_super/dt_parabolic) − 1))` cleanly
+// outruns forward-Euler (s grows as √(ratio) but does ~s²-fast work).
 //
-//   2. `main` — adds η ∇²B to (Bx_face, By_face, U1.y), reading the
-//      Laplacian's 5-point stencil from the SNAPSHOTS. Because the
-//      snapshots are populated by a prior dispatch (which WebGPU
-//      sequences-after), the reads are guaranteed race-free.
+// Recurrence (MDK14 eq 13):
+//   Y_0 = U^n
+//   Y_1 = U^n + μ̃_1 · Δt · L(U^n)                                     (j=1)
+//   Y_j = μ_j · Y_{j-1} + ν_j · Y_{j-2} + (1 − μ_j − ν_j) · U^n
+//         + μ̃_j · Δt · L(Y_{j-1}) + γ̃_j · Δt · L(U^n)                 (j ≥ 2)
+//   U^{n+1} = Y_s
 //
-// History: this shader used to do an in-place RMW on `read_write`
-// storage, relying on the (incorrect) assumption that neighbor reads
-// inside a dispatch return pre-call values. They don't — WebGPU has no
-// cross-invocation memory ordering inside a dispatch, so neighbor reads
-// at workgroup-tile boundaries pick up post-write values from already-
-// executed tiles. At low η the noise was below the floor; at high η
-// it manifested as regular-spacing bright "blebs" at ~workgroup tile
-// stride. The snapshot pass eliminates the race entirely.
+// L(B) = η ∇²B applied component-wise. η is allowed to be SPATIALLY-
+// VARYING (anomalous resistivity, Birn 2001 GEM closure):
+//   η_local(i, j) = η_0 + α · max(0, |J_z(i,j)| / J_crit − 1)²
+// J_z is computed from face B via central differences. η is FROZEN at
+// the start of the super-step (sampled from U^n) — RKL2's stability
+// proof assumes a linear time-invariant operator, and re-evaluating η
+// every substep would re-enter nonlinear territory. With α = 0 (anomalous
+// off) the local-η evaluation skips the J_z compute entirely and returns
+// the uniform η_0.
 //
-// Update form (per stage, per component B_k):
-//   B_k_out[i,j] = B_k_snap[i,j] + dt_w · dt · η · ∇²B_k_snap[i,j]
-// where ∇² is the standard 5-point central-difference Laplacian.
-// SSP-compatible by linearity.
+// Operator splitting: Lie split (resistivity AFTER the hyperbolic step).
+// 1st-order. Strang doubles the cost for negligible gain given the rest
+// of the scheme is also 1st-order in time.
 //
-// dt_w is the per-stage SSP weight (1, 1/4, 2/3); dt comes from compute-
-// dt and includes the parabolic CFL via dt_res = 0.5 · dx² / η (taken
-// as min with the hyperbolic CFL inside compute-dt.wgsl).
+// ── Pass split / bind-group rationale ─────────────────────────────────
+// The recurrence reads three field snapshots (Y_init = U^n, Y_pprev,
+// Y_prev) and writes one (Y_curr). Combined into ONE kernel that would
+// be 4 buffer sets × 3 components = 12 storage bindings, over the
+// per-stage 10 cap. We split into two single-bind-group kernels (in
+// separate files) plus a shared snapshot kernel:
 //
-// Bindings:
-//   0 uniforms       (uniform)
-//   1 stage_params   (uniform)        — (a0, a1, dt_w, _) — only dt_w used
-//   2 Bx_face        (rw)             — destination (main writes)
-//   3 By_face        (rw)             — destination (main writes)
-//   4 U1_out         (rw)             — destination; Bz lives in U1.y
-//   5 dt_buf         (ro)
-//   6 Bx_snap        (rw)             — snapshot writes here; main reads
-//   7 By_snap        (rw)             — snapshot writes here; main reads
-//   8 U1_snap        (rw)             — snapshot writes here; main reads
-
-struct StageParamsResis {
-    a0:    f32,
-    a1:    f32,
-    dt_w:  f32,
-    _pad:  f32,
-};
+//   `snapshot`              dst = src (per-cell, race-free).
+//   `apply-resistivity-init` Y_tmp = (1−μ−ν)·U^n + ν·Y_{j-2} + γ̃·Δt·L(U^n).
+//                            Reads init + pprev; writes tmp. 9 storage.
+//   `apply-resistivity-prev` Y_tmp += μ·Y_{j-1} + μ̃·Δt·L(Y_{j-1}).
+//                            Reads init (η_local only) + prev; rw tmp. 8 storage.
+//
+// Host orchestration (sim.js `_encodeResistivitySuperStep`):
+//
+//   1.  `snapshot` ×3        — copy dst → init, dst → pprev, dst → prev.
+//                              (super-step boot; init stays frozen after.)
+//   2.  For j = 1..s:
+//         a. `apply-resistivity-init`  (writes tmp using ν_j, γ̃_j)
+//         b. `apply-resistivity-prev`  (adds μ_j Y_{j-1} + μ̃_j L(Y_{j-1}))
+//         c. Rotate roles by rebinding (no GPU copies):
+//                 new_prev  ← tmp           (was Y_j)
+//                 new_pprev ← old prev      (was Y_{j-1})
+//                 new_tmp   ← old pprev     (was Y_{j-2}, free to overwrite)
+//   3.  Copy final Y_s (in `prev` after substep s's rotation) → dst.
+//
+// Total buffer-set footprint: dst (1) + init (1) + 3 rotating sets
+// (pprev, prev, tmp) = 5 × 3 buffers = 15 GPU buffers. At N=256:
+// 15 × (260²) × 4 B ≈ 4 MB. Negligible vs the U/B main buffers.
+//
+// ── This file: `snapshot` only ────────────────────────────────────────
+// The init / prev kernels live in apply-resistivity-init.wgsl and
+// apply-resistivity-prev.wgsl respectively. Separating shader files
+// keeps each pipeline at one bind-group with under 10 storage entries.
+//
+// Bindings (snapshot):
+//   0  uniforms
+//   1  Bx_src   (ro)
+//   2  By_src   (ro)
+//   3  U1_src   (ro)
+//   4  Bx_dst   (rw)
+//   5  By_dst   (rw)
+//   6  U1_dst   (rw)
 
 @group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
-@group(0) @binding(1) var<uniform> stage_params: StageParamsResis;
-@group(0) @binding(2) var<storage, read_write> Bx_face:  array<f32>;
-@group(0) @binding(3) var<storage, read_write> By_face:  array<f32>;
-@group(0) @binding(4) var<storage, read_write> U1_out:   array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read>       dt_buf:   array<f32, 1>;
-@group(0) @binding(6) var<storage, read_write> Bx_snap:  array<f32>;
-@group(0) @binding(7) var<storage, read_write> By_snap:  array<f32>;
-@group(0) @binding(8) var<storage, read_write> U1_snap:  array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       Bx_src: array<f32>;
+@group(0) @binding(2) var<storage, read>       By_src: array<f32>;
+@group(0) @binding(3) var<storage, read>       U1_src: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> Bx_dst: array<f32>;
+@group(0) @binding(5) var<storage, read_write> By_dst: array<f32>;
+@group(0) @binding(6) var<storage, read_write> U1_dst: array<vec4<f32>>;
 
-// Per-cell copy dst → snap. Race-free: each invocation touches only its
-// own buffer cell, no neighbor reads. Dispatched over (N+3)² so that
-// the snapshotted region covers exactly the Laplacian's read footprint:
-// interior cells [ghost, ghost+N) plus one ghost-cell margin on every
-// side (the 5-point stencil reads (i±1, j) and (i, j±1)). Bx_face and
-// By_face have one extra index along their normal axis, so the N+3 wide
-// dispatch covers them too. Indices are shifted by (ghost − 1) inside
-// the shader.
+// Race-free per-cell copy. (N+3)² dispatch with (ghost-1) shift —
+// covers interior + 1-cell ghost margin (the RKL2 5-point Laplacian
+// footprint) + the extra face-index along the normal axis.
 @compute @workgroup_size(8, 8, 1)
 fn snapshot(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_total = U_uniforms.grid_n_total;
     let ghost   = U_uniforms.ghost_w;
-    let eta     = U_uniforms.eta;
-    // Skip the copy entirely when ideal MHD is active — main will also
-    // early-out, so the snapshots are never consumed.
-    if (eta == 0.0) { return; }
 
-    // Shift dispatch index into [ghost-1, ghost+N+2). Covers interior +
-    // 1-cell ghost margin (Laplacian footprint) + the extra face index
-    // along the normal axis (high-end bound below picks this up).
     let ix = gid.x + ghost - 1u;
     let iy = gid.y + ghost - 1u;
 
-    // U1: N_total × N_total
     if (ix < n_total && iy < n_total) {
         let c = cell_idx_total(ix, iy, n_total);
-        U1_snap[c] = U1_out[c];
+        U1_dst[c] = U1_src[c];
     }
-    // Bx_face: (N_total+1) × N_total
     if (ix <= n_total && iy < n_total) {
         let cx = bx_face_idx(ix, iy, n_total);
-        Bx_snap[cx] = Bx_face[cx];
+        Bx_dst[cx] = Bx_src[cx];
     }
-    // By_face: N_total × (N_total+1)
     if (ix < n_total && iy <= n_total) {
         let cy = by_face_idx(ix, iy, n_total);
-        By_snap[cy] = By_face[cy];
-    }
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let n_total    = U_uniforms.grid_n_total;
-    let n_interior = U_uniforms.grid_n;
-    let ghost      = U_uniforms.ghost_w;
-    let eta        = U_uniforms.eta;
-    let dx         = U_uniforms.dx;
-    let dt         = dt_buf[0];
-    let coef       = stage_params.dt_w * dt * eta / (dx * dx);
-
-    // Early-out: if η is exactly zero, nothing to do (and the snapshot
-    // dispatch above also no-op'd, so reads from snap would be stale).
-    if (eta == 0.0) { return; }
-
-    // Same dispatch shape as `snapshot` — (N+3)² with a (ghost-1) shift.
-    // The main pass only writes interior cells/faces; the dispatch is
-    // sized to match the snapshot's so a single workgroup count suffices
-    // for both. The interior-bounds checks below filter the extras out.
-    let ix = gid.x + ghost - 1u;
-    let iy = gid.y + ghost - 1u;
-
-    // ── Bz diffusion (cell-centered, U1.y) ──────────────────────────
-    if (ix >= ghost && ix < ghost + n_interior &&
-        iy >= ghost && iy < ghost + n_interior) {
-        let c    = cell_idx_total(ix,      iy,      n_total);
-        let xl   = cell_idx_total(ix - 1u, iy,      n_total);
-        let xr   = cell_idx_total(ix + 1u, iy,      n_total);
-        let yd   = cell_idx_total(ix,      iy - 1u, n_total);
-        let yu   = cell_idx_total(ix,      iy + 1u, n_total);
-        // Read center + neighbors from SNAPSHOT (race-free).
-        let bz_c = U1_snap[c].y;
-        let lap  = U1_snap[xr].y + U1_snap[xl].y + U1_snap[yu].y + U1_snap[yd].y - 4.0 * bz_c;
-        // Write back to dst U1, preserving the other components (which
-        // weren't touched by this stage's CT update).
-        var u1   = U1_out[c];
-        u1.y = bz_c + coef * lap;
-        U1_out[c] = u1;
-    }
-
-    // ── Bx_face diffusion ────────────────────────────────────────────
-    // Truly INTERIOR x-faces (between two interior cells) are at
-    //   i ∈ [ghost+1, ghost + n_interior),  j ∈ [ghost, ghost + n_interior).
-    // The boundary x-faces (i = ghost on the W wall, i = ghost + n_interior
-    // on the E wall) are OWNED by the BC shader and not diffused —
-    // diffusing them would clobber reflecting (Bx=0) or driven values.
-    if (ix > ghost && ix < ghost + n_interior &&
-        iy >= ghost && iy < ghost + n_interior) {
-        let c  = bx_face_idx(ix,      iy,      n_total);
-        let xl = bx_face_idx(ix - 1u, iy,      n_total);
-        let xr = bx_face_idx(ix + 1u, iy,      n_total);
-        let yd = bx_face_idx(ix,      iy - 1u, n_total);
-        let yu = bx_face_idx(ix,      iy + 1u, n_total);
-        let v   = Bx_snap[c];
-        let lap = Bx_snap[xr] + Bx_snap[xl] + Bx_snap[yu] + Bx_snap[yd] - 4.0 * v;
-        Bx_face[c] = v + coef * lap;
-    }
-
-    // ── By_face diffusion ────────────────────────────────────────────
-    // Truly INTERIOR y-faces:
-    //   i ∈ [ghost, ghost + n_interior),    j ∈ [ghost+1, ghost + n_interior).
-    if (ix >= ghost && ix < ghost + n_interior &&
-        iy > ghost && iy < ghost + n_interior) {
-        let c  = by_face_idx(ix,      iy,      n_total);
-        let xl = by_face_idx(ix - 1u, iy,      n_total);
-        let xr = by_face_idx(ix + 1u, iy,      n_total);
-        let yd = by_face_idx(ix,      iy - 1u, n_total);
-        let yu = by_face_idx(ix,      iy + 1u, n_total);
-        let v   = By_snap[c];
-        let lap = By_snap[xr] + By_snap[xl] + By_snap[yu] + By_snap[yd] - 4.0 * v;
-        By_face[c] = v + coef * lap;
+        By_dst[cy] = By_src[cy];
     }
 }

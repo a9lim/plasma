@@ -290,6 +290,13 @@ export function makeOrszagTangPreset(n = GRID_N) {
  *   y=a:  Bx ≈ 0.762, ρ ≈ 0.62, p ≈ 0.42
  *
  * BCs: periodic x (W=E=periodic), outflow y (N=S=outflow). η = 1e-3.
+ *
+ * Anomalous resistivity (Session 8): set α > 0 in the Advanced settings
+ * dropdown to enable fast reconnection — η(|J|) = η_0 + α·max(0, |J|/J_crit−1)².
+ * At Harris's J_z ≈ B_0/a = 10 at the sheet center, sensible defaults
+ * are α ≈ 1e-3, J_crit ≈ 10–20: leaves the bulk plasma at η_0 = 1e-3
+ * Sweet-Parker (slow) reconnection but spikes η at the X-point to seed
+ * Petschek-like fast reconnection + plasmoid generation.
  */
 export function makeHarrisPreset(n = GRID_N) {
     const gamma = 5.0 / 3.0;

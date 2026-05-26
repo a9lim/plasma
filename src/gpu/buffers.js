@@ -116,17 +116,60 @@ export class PlasmaBuffers {
         // Per-stage scratch: Ez_edge recomputed each stage.
         this.Ez_edge = mkStorage('plasma.Ez_edge', u_f32_edge_bytes);
 
-        // ── Resistivity snapshot buffers ────────────────────────────
-        // apply-resistivity's 5-point Laplacian reads neighbors. WebGPU
-        // has no cross-invocation memory ordering inside a dispatch, so
-        // in-place read-modify-write on a `read_write` storage buffer
-        // races at workgroup-tile boundaries (manifests as regular-
-        // spacing artifacts at high η). Fix: snapshot dst → snap BEFORE
-        // the Laplacian, then have apply-resistivity read from snap
-        // (race-free) and write to dst.
-        this.Bx_res_snap = mkStorage('plasma.Bx_res_snap', u_f32_xface_bytes);
-        this.By_res_snap = mkStorage('plasma.By_res_snap', u_f32_yface_bytes);
-        this.U1_res_snap = mkStorage('plasma.U1_res_snap', u_v4_cell_bytes);
+        // ── RKL2 super-time-stepping buffers ────────────────────────
+        // Resistive diffusion runs as ONE RKL2 super-step at the end of
+        // each RK3 macro-step (Lie split). RKL2's recurrence (MDK 2014
+        // eq 13) reads three field snapshots per substep — Y_init = U^n,
+        // Y_{j-1}, Y_{j-2} — so we keep four buffer sets in play:
+        //   - dst  (the destination buffer the RK3 step wrote into;
+        //           overwritten at the end of the super-step with Y_s).
+        //   - init  (frozen U^n for the duration of the super-step).
+        //   - 3 rotating sets (pprev, prev, tmp) — see apply-resistivity*.wgsl
+        //     headers for the role-rotation pattern.
+        // 4 sets × 3 components = 12 new GPU buffers (init + pprev + prev
+        // + tmp). At N=256: ~3 MB total. Negligible vs the main U/B
+        // storage.
+        this.Bx_res_init = mkStorage('plasma.Bx_res_init', u_f32_xface_bytes);
+        this.By_res_init = mkStorage('plasma.By_res_init', u_f32_yface_bytes);
+        this.U1_res_init = mkStorage('plasma.U1_res_init', u_v4_cell_bytes);
+
+        this.Bx_res_pprev = mkStorage('plasma.Bx_res_pprev', u_f32_xface_bytes);
+        this.By_res_pprev = mkStorage('plasma.By_res_pprev', u_f32_yface_bytes);
+        this.U1_res_pprev = mkStorage('plasma.U1_res_pprev', u_v4_cell_bytes);
+
+        this.Bx_res_prev = mkStorage('plasma.Bx_res_prev', u_f32_xface_bytes);
+        this.By_res_prev = mkStorage('plasma.By_res_prev', u_f32_yface_bytes);
+        this.U1_res_prev = mkStorage('plasma.U1_res_prev', u_v4_cell_bytes);
+
+        this.Bx_res_tmp = mkStorage('plasma.Bx_res_tmp', u_f32_xface_bytes);
+        this.By_res_tmp = mkStorage('plasma.By_res_tmp', u_f32_yface_bytes);
+        this.U1_res_tmp = mkStorage('plasma.U1_res_tmp', u_v4_cell_bytes);
+
+        // RKL2 coefficient buffer — packed (μ, ν, μ̃, γ̃) per substep.
+        // Re-uploaded once per super-step (s coefficients × 4 f32).
+        // STS_COEFFS_MAX_S = 100 caps in-browser super-step length —
+        // Athena++ uses 200 in batch runs; 100 is safer for an
+        // interactive sim (a single super-step never blocks the UI
+        // for more than a few ms).
+        const STS_COEFFS_MAX_S = 100;
+        this.sts_coeffs_max_s = STS_COEFFS_MAX_S;
+        this.sts_coeffs = device.createBuffer({
+            label: 'plasma.sts_coeffs',
+            size:  STS_COEFFS_MAX_S * 4 * F32_BYTES,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        // RKL2 per-substep meta — (substep_idx, s_total, dt_super, _pad).
+        // Rewritten per substep via queue.writeBuffer (16 B, cheap).
+        // Bound by both apply-resistivity-init and -prev as a uniform.
+        this.sts_meta = device.createBuffer({
+            label: 'plasma.sts_meta',
+            size:  16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.stsMetaHost = new ArrayBuffer(16);
+        this.stsMetaU32  = new Uint32Array(this.stsMetaHost);
+        this.stsMetaF32  = new Float32Array(this.stsMetaHost);
 
         // ── PPM edge states — 4 buffers × 2 axes = 8 buffers ───────
         this.edge_l_x_0 = mkStorage('plasma.edge_l_x_0', u_v4_cell_bytes);
@@ -163,20 +206,38 @@ export class PlasmaBuffers {
             size: 16,
             usage: GPUBufferUsage.STORAGE,
         });
+        // dt buffer expanded to 4 f32 slots (Session 8 — RKL2):
+        //   [0] dt_hyp        (hyperbolic dt used by RK3 + RKL2 super-step)
+        //   [1] dt_parabolic  (forward-Euler resistive bound; diagnostic only)
+        //   [2] eta_max       (per-cell anomalous-η maximum; diagnostic)
+        //   [3] _pad
+        // Slots 1-3 are diagnostic; consumers (update-conserved-weighted,
+        // update-b-weighted, stats-display) all read slot 0 as before.
+        // Sized to 32 B (4 × f32 + nothing) — uniform binding still valid.
         this.dt = device.createBuffer({
             label: 'plasma.dt',
-            size: 16,
+            size: 32,
             // STORAGE: written by compute-dt's atomicMax reduction.
             // UNIFORM: read by update-conserved-weighted (where dropping it
             //   from the storage count is what gets us under the 10-binding
-            //   per-stage limit). Other consumers (update-b-weighted,
-            //   apply-resistivity) still bind it as storage; either is fine.
+            //   per-stage limit). Other consumers (update-b-weighted) still
+            //   bind it as storage; either is fine.
             // COPY_SRC: stats-display reads dt back via ReadbackPool each
-            //   sample (12 Hz at 256²). Without this the copy validates out
-            //   and dt reads back as 0 — which is why simTime sat at 0 even
-            //   independently of the simTime-ratchet bug HANDOFF flagged.
+            //   sample (12 Hz at 256²). The RKL2 host-side substep count
+            //   computation also reads dt_hyp + dt_parabolic from this
+            //   buffer (via a separate readback path in sim.js).
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM
                  | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        });
+
+        // η_max reduction target — compute-dt's `reduce` writes the
+        // per-cell anomalous-η maximum here via the same atomicMax-on-
+        // bitcast<u32> pattern as wavespeed. compute-dt's `finalize`
+        // reads it back to populate dt_buf[1] / [2].
+        this.eta_max_buf = device.createBuffer({
+            label: 'plasma.eta_max',
+            size: 16,
+            usage: GPUBufferUsage.STORAGE,
         });
 
         // ── Uniforms: single physics-state buffer ──────────────────
@@ -371,6 +432,10 @@ export class PlasmaBuffers {
         // fallbacks if a particular slider hasn't fired yet.
         this._cfl = undefined;
         this._pressureFloor = PRESSURE_FLOOR;
+        // Anomalous resistivity defaults — α = 0 means constant η_0
+        // (RKL2 still runs but reduces to forward-Euler stability).
+        this._etaAnomAlpha = 0;
+        this._etaAnomJcrit = 10.0;
     }
 
     /**
@@ -495,16 +560,19 @@ export class PlasmaBuffers {
      */
     pushUniforms({
         dx, gamma, viewMin, viewMax, gridN, viewMode, eta, cfl, pressureFloor,
+        etaAnomAlpha, etaAnomJcrit,
     } = {}) {
         if (eta           !== undefined) this._eta           = eta;
         if (cfl           !== undefined) this._cfl           = cfl;
         if (pressureFloor !== undefined) this._pressureFloor = pressureFloor;
+        if (etaAnomAlpha  !== undefined) this._etaAnomAlpha  = etaAnomAlpha;
+        if (etaAnomJcrit  !== undefined) this._etaAnomJcrit  = etaAnomJcrit;
         this.uniformF32[0] = dx;
         this.uniformF32[1] = gamma;
         this.uniformF32[2] = viewMin;
         this.uniformF32[3] = viewMax;
         this.uniformF32[4] = this._eta;
-        this.uniformF32[5] = 0; // _pad_lic_0
+        this.uniformF32[5] = (this._etaAnomAlpha ?? 0);  // anomalous-η α (slot 5)
         this.uniformF32[6] = 0; // _pad_lic_1
         this.uniformF32[7] = 0; // _pad_lic_2
         this.uniformU32[8]  = gridN >>> 0;
@@ -514,9 +582,30 @@ export class PlasmaBuffers {
         this.uniformF32[12] = (this._cfl ?? 0.4); // cfl as f32
         this.uniformU32[13] = (viewMode ?? this._viewMode) >>> 0;
         if (viewMode !== undefined) this._viewMode = viewMode;
-        this.uniformF32[14] = 0; // _pad_lic_3
+        this.uniformF32[14] = (this._etaAnomJcrit ?? 10.0);  // anomalous-η J_crit (slot 14)
         this.uniformU32[15] = this.noise_n >>> 0;
         this.device.queue.writeBuffer(this.uniform, 0, this.uniformHost);
+    }
+
+    /**
+     * Upload a packed RKL2 coefficient array. `arr` must be a Float32Array
+     * of length 4 * s where s = sts_coeffs_max_s upper bound. Layout per
+     * substep j: (μ_j, ν_j, μ̃_j, γ̃_j).
+     */
+    pushStsCoeffs(arr) {
+        this.device.queue.writeBuffer(this.sts_coeffs, 0,
+            arr.buffer, arr.byteOffset, arr.byteLength);
+    }
+
+    /**
+     * Update the per-substep meta uniform — (substep_idx, s_total, dt_super).
+     */
+    pushStsMeta(substepIdx, sTotal, dtSuper) {
+        this.stsMetaU32[0] = substepIdx >>> 0;
+        this.stsMetaU32[1] = sTotal >>> 0;
+        this.stsMetaF32[2] = dtSuper;
+        this.stsMetaF32[3] = 0;
+        this.device.queue.writeBuffer(this.sts_meta, 0, this.stsMetaHost);
     }
 
     /**

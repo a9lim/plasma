@@ -48,6 +48,7 @@
 import { PlasmaBuffers } from './gpu/buffers.js';
 import { createPipelines } from './gpu/pipelines.js';
 import { PlasmaRenderer } from './gpu/render.js';
+import { ReadbackPool, readbackSlice } from './gpu/readback.js';
 import { makeOrszagTangPreset, PRESETS } from './presets.js';
 import { VIRIDIS } from './colormaps.js';
 import {
@@ -77,6 +78,12 @@ export class Sim {
         this.eta      = ETA_DEFAULT;
         this.cfl      = CFL;
         this.pressureFloor = PRESSURE_FLOOR;
+        // Anomalous resistivity coefficients. α = 0 means the constant-η
+        // baseline (no boost); α > 0 enables the Birn 2001 GEM-style
+        // η(|J|) = η_0 + α · max(0, |J|/J_crit − 1)² closure. J_crit is
+        // in code-units (J_z is computed from face B via central diff).
+        this.etaAnomAlpha = 0;
+        this.etaAnomJcrit = 10.0;
         // Per-preset η floor coefficient — η_min = etaFloorCoeff · dx
         // enforces a grid magnetic Reynolds limit so current-sheet
         // thinning can't outrun dissipation and NaN-cascade. 0 disables
@@ -87,6 +94,19 @@ export class Sim {
         this.stepCount = 0;
         this.simTime   = 0;
         this.lastDt    = 0;
+
+        // RKL2 super-step state — see _encodeResistivitySuperStep.
+        // The substep count is computed CPU-side from dt_hyp and
+        // dt_parabolic; we read both back async-1-step-lagged from
+        // dt_buf to avoid stalling the encode chain. Initial values
+        // assume a tiny ratio (s = 1) — corrected after the first
+        // post-step readback completes.
+        this._lastDtHyp        = 1.0e-4;
+        this._lastDtParabolic  = 1.0e30;
+        this._lastEtaMax       = 0;
+        this._lastSuperStepS   = 1;
+        this._dtReadbackBusy   = false;
+        this._dtReadbackPool   = null;  // lazy-init in init()
 
         // UI integration state — owned by Sim so save/load can capture it.
         this.running     = true;
@@ -118,6 +138,7 @@ export class Sim {
         this.pipelines = await createPipelines(this.device, this.format);
         this.buffers   = new PlasmaBuffers(this.device, this.n);
         this.renderer  = new PlasmaRenderer(this.device, this.context, this.pipelines, this.buffers);
+        this._dtReadbackPool = new ReadbackPool(this.device);
 
         // GPU-step timing infrastructure. Allocated only when the adapter
         // advertises `timestamp-query` (see device.js). The query set holds
@@ -239,13 +260,33 @@ export class Sim {
     }
 
     /**
-     * Update explicit resistivity. UI typically passes 0 for "ideal", but
-     * for presets with an active η floor (currently Orszag-Tang) the
-     * value is clamped up to getEtaMin() to keep current-sheet thinning
-     * within the grid's resolvable scales.
+     * Update explicit resistivity (the base η_0). UI typically passes 0
+     * for "ideal", but for presets with an active η floor (currently
+     * Orszag-Tang) the value is clamped up to getEtaMin() to keep
+     * current-sheet thinning within the grid's resolvable scales.
      */
     setEta(eta) {
         this.eta = Math.max(eta, this.getEtaMin());
+        this._pushUniforms();
+    }
+
+    /**
+     * Anomalous-η boost coefficient α. α = 0 disables the boost (sim
+     * runs with constant η_0). α > 0 activates the |J|>J_crit-triggered
+     * boost — see `anomalous_eta` in shared-helpers.wgsl. Birn 2001
+     * GEM closure.
+     */
+    setEtaAnomAlpha(alpha) {
+        this.etaAnomAlpha = Math.max(0, +alpha || 0);
+        this._pushUniforms();
+    }
+
+    /**
+     * Anomalous-η critical current density |J_crit|. Below this the
+     * boost is zero; above it grows quadratically in (|J|/J_crit − 1).
+     */
+    setEtaAnomJcrit(jcrit) {
+        this.etaAnomJcrit = Math.max(1e-6, +jcrit || 1e-6);
         this._pushUniforms();
     }
 
@@ -336,6 +377,8 @@ export class Sim {
             n: this.n,
             viewMode: this.viewMode,
             eta: this.eta,
+            etaAnomAlpha: this.etaAnomAlpha,
+            etaAnomJcrit: this.etaAnomJcrit,
             gamma: this.gamma,
             cfl: this.cfl,
             pressureFloor: this.pressureFloor,
@@ -354,7 +397,9 @@ export class Sim {
         if (obj.n && obj.n !== this.n) this.setResolution(obj.n);
         if (obj.preset) this.setPreset(obj.preset);
         if (obj.viewMode !== undefined) this.setViewMode(obj.viewMode);
-        if (obj.eta !== undefined)      this.setEta(obj.eta);
+        if (obj.eta !== undefined)          this.setEta(obj.eta);
+        if (obj.etaAnomAlpha !== undefined) this.setEtaAnomAlpha(obj.etaAnomAlpha);
+        if (obj.etaAnomJcrit !== undefined) this.setEtaAnomJcrit(obj.etaAnomJcrit);
         if (obj.gamma !== undefined)    this.setGamma(obj.gamma);
         if (obj.cfl !== undefined)      this.setCFL(obj.cfl);
         if (obj.pressureFloor !== undefined) this.setPressureFloor(obj.pressureFloor);
@@ -378,7 +423,13 @@ export class Sim {
             eta: this.eta,
             cfl: this.cfl,
             pressureFloor: this.pressureFloor,
+            etaAnomAlpha: this.etaAnomAlpha,
+            etaAnomJcrit: this.etaAnomJcrit,
         });
+        // Mirror the host-side cache so _encodeResistivitySuperStep
+        // can skip-test alpha without re-reading the GPU uniform.
+        this.buffers._etaAnomAlpha = this.etaAnomAlpha;
+        this.buffers._etaAnomJcrit = this.etaAnomJcrit;
     }
 
     /**
@@ -422,6 +473,7 @@ export class Sim {
                 { binding: 4, resource: { buffer: By_n } },
                 { binding: 5, resource: { buffer: b.wavespeed } },
                 { binding: 6, resource: { buffer: b.dt } },
+                { binding: 7, resource: { buffer: b.eta_max_buf } },
             ],
         });
     }
@@ -442,24 +494,75 @@ export class Sim {
         });
     }
 
-    _applyResBG(stageBuf, Bx, By, U1_out) {
+    // ── RKL2 super-time-stepping bind groups ────────────────────────
+    // The RKL2 implementation uses 5 buffer roles (dst, init, pprev,
+    // prev, tmp) × 3 components (Bx, By, U1), bound per substep through
+    // 3 different pipelines (snapshot, apply-resistivity-init,
+    // apply-resistivity-prev). Bind groups are NOT pre-baked per side —
+    // the resistivity super-step runs at the end of stage 3 on the SAME
+    // side's stage-3 dst buffers, and substep-to-substep rotation cycles
+    // through several different bind groups. We build fresh bind groups
+    // per super-step; the cost is small (< 50 µs each × 3 BGs × max 100
+    // substeps ≈ ~15 ms in the worst pathological super-step, single-
+    // digit ms in typical runs).
+    _applyResSnapBG(srcBx, srcBy, srcU1, dstBx, dstBy, dstU1) {
         const b = this.buffers;
         return this.device.createBindGroup({
-            label: 'plasma.applyRes.bg',
-            layout: this.pipelines.layouts.applyRes,
+            label: 'plasma.applyResSnap.bg',
+            layout: this.pipelines.layouts.applyResSnap,
             entries: [
                 { binding: 0, resource: { buffer: b.uniform } },
-                { binding: 1, resource: { buffer: stageBuf } },
-                { binding: 2, resource: { buffer: Bx } },
-                { binding: 3, resource: { buffer: By } },
-                { binding: 4, resource: { buffer: U1_out } },
-                { binding: 5, resource: { buffer: b.dt } },
-                // Snapshot buffers — see apply-resistivity.wgsl header.
-                // The snapshot dispatch writes these; the main dispatch
-                // reads them (race-free 5-point Laplacian).
-                { binding: 6, resource: { buffer: b.Bx_res_snap } },
-                { binding: 7, resource: { buffer: b.By_res_snap } },
-                { binding: 8, resource: { buffer: b.U1_res_snap } },
+                { binding: 1, resource: { buffer: srcBx } },
+                { binding: 2, resource: { buffer: srcBy } },
+                { binding: 3, resource: { buffer: srcU1 } },
+                { binding: 4, resource: { buffer: dstBx } },
+                { binding: 5, resource: { buffer: dstBy } },
+                { binding: 6, resource: { buffer: dstU1 } },
+            ],
+        });
+    }
+
+    _applyResInitBG(initBx, initBy, initU1, pprevBx, pprevBy, pprevU1,
+                    tmpBx, tmpBy, tmpU1) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyResInit.bg',
+            layout: this.pipelines.layouts.applyResInit,
+            entries: [
+                { binding: 0,  resource: { buffer: b.uniform } },
+                { binding: 1,  resource: { buffer: b.sts_meta } },
+                { binding: 2,  resource: { buffer: b.sts_coeffs } },
+                { binding: 3,  resource: { buffer: initBx } },
+                { binding: 4,  resource: { buffer: initBy } },
+                { binding: 5,  resource: { buffer: initU1 } },
+                { binding: 6,  resource: { buffer: pprevBx } },
+                { binding: 7,  resource: { buffer: pprevBy } },
+                { binding: 8,  resource: { buffer: pprevU1 } },
+                { binding: 9,  resource: { buffer: tmpBx } },
+                { binding: 10, resource: { buffer: tmpBy } },
+                { binding: 11, resource: { buffer: tmpU1 } },
+            ],
+        });
+    }
+
+    _applyResPrevBG(initBx, initBy, prevBx, prevBy, prevU1,
+                    tmpBx, tmpBy, tmpU1) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyResPrev.bg',
+            layout: this.pipelines.layouts.applyResPrev,
+            entries: [
+                { binding: 0,  resource: { buffer: b.uniform } },
+                { binding: 1,  resource: { buffer: b.sts_meta } },
+                { binding: 2,  resource: { buffer: b.sts_coeffs } },
+                { binding: 3,  resource: { buffer: initBx } },
+                { binding: 4,  resource: { buffer: initBy } },
+                { binding: 5,  resource: { buffer: prevBx } },
+                { binding: 6,  resource: { buffer: prevBy } },
+                { binding: 7,  resource: { buffer: prevU1 } },
+                { binding: 8,  resource: { buffer: tmpBx } },
+                { binding: 9,  resource: { buffer: tmpBy } },
+                { binding: 10, resource: { buffer: tmpU1 } },
             ],
         });
     }
@@ -725,7 +828,6 @@ export class Sim {
                                                 other.Bx, other.By,
                                                 dst.Bx, dst.By),
                 applyBcsDst:    this._applyBcsBG(dst.U0, dst.U1, dst.Bx, dst.By),
-                applyRes:       this._applyResBG(stageBuf, dst.Bx, dst.By, dst.U1),
             };
         };
 
@@ -777,22 +879,15 @@ export class Sim {
     /**
      * Encode one RK3 stage from the pre-baked bind-group cache.
      *
-     * `stageIdx` ∈ {1, 2, 3}; `side` ∈ {'a', 'b'}. The encoder also
-     * branches on `this.eta` to skip the resistive triad (9a/9b/9c) at
-     * ideal MHD (Change #7) and to skip the leading apply-bcs in stages
-     * 2 and 3 when η > 0, since stage k's 9a already filled stage k+1's
-     * src-ghosts (Change #6).
+     * `stageIdx` ∈ {1, 2, 3}; `side` ∈ {'a', 'b'}.
      *
-     * Asymmetry between paths:
-     *   η = 0: every stage runs step 1 (PPM ghosts) + the 7-pass core,
-     *          no resistive triad. Stage k+1's step 1 is the only place
-     *          stage k+1's src-ghosts get filled.
-     *   η > 0: stage 1 runs step 1 (fills U_n's ghosts before PPM). 9a
-     *          at the end of stages 1 and 2 fills the dst-ghosts, which
-     *          ARE the next stage's src-ghosts (dst_k === src_{k+1} for
-     *          k = 1, 2). So stages 2 and 3 skip step 1. Stage 3's own
-     *          9a is still needed (for its 9b/9c) but its ghost output
-     *          is discarded at the next step's step 1.
+     * Session 8 — resistive diffusion moved OUT of the per-stage path
+     * into a single RKL2 super-step at the END of the RK3 macro-step
+     * (Lie split). This drops the per-stage resistivity triad
+     * (9a / 9b / 9c) — and with it the post-CT apply-bcs that used to
+     * fill dst-ghosts. The apply-bcs at the START of each stage now
+     * always runs (no more η>0 skip), since stage-to-stage ghost
+     * carry-over is gone.
      */
     _encodeStage(pass, stageIdx, side) {
         const { pipelines } = this;
@@ -802,22 +897,16 @@ export class Sim {
         const gN2       = Math.ceil((N + 2) / WG);
         // apply-bcs covers (N_total+1)² (all ghost strips + boundary faces).
         const gTotalP1  = Math.ceil((this.n_total + 1) / WG);
-        // apply-resistivity now dispatches over the Laplacian read footprint
-        // (interior + 1-cell ghost margin + extra face index) = (N+3)².
-        // Shader shifts the index by (ghost - 1u) — see Change #10 in this
-        // round and the snapshot/main entry-point comments.
-        const gResis    = Math.ceil((N + 3) / WG);
 
         const bgs = this._bgCache[`stage${stageIdx}`][side];
 
         // 1. apply-bcs on src — fills ghosts for the upcoming PPM stencil.
-        //    Skipped in stages 2 and 3 when η > 0: stage k's 9a fed the
-        //    dst-ghosts (which alias stage k+1's src-ghosts for k=1,2).
-        if (this.eta <= 0 || stageIdx === 1) {
-            pass.setPipeline(pipelines.pipelines.applyBcs);
-            pass.setBindGroup(0, bgs.applyBcsSrc);
-            pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
-        }
+        //    Always runs now (Session 8): the per-stage resistivity triad
+        //    that used to fill dst-ghosts was retired in favour of a
+        //    single end-of-step RKL2 super-step.
+        pass.setPipeline(pipelines.pipelines.applyBcs);
+        pass.setBindGroup(0, bgs.applyBcsSrc);
+        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
 
         // 2-5. PPM + Riemann, both axes.
         pass.setPipeline(pipelines.pipelines.reconstructPpm);
@@ -862,36 +951,174 @@ export class Sim {
         pass.setBindGroup(0, bgs.updateB);
         pass.dispatchWorkgroups(gN1, gN1, 1);
 
-        // 9a/9b/9c — resistivity triad. Skipped entirely at η = 0
-        // (Change #7): the shaders no-op internally but we avoid issuing
-        // 6 dispatches per step on every ideal-MHD preset.
-        if (this.eta > 0) {
-            // 9a. Re-fill ghost cells on the DESTINATION buffer so the
-            // resistive Laplacian stencil sees BC-consistent values. The
-            // update-conserved/update-b kernels only wrote interior
-            // cells/faces; without this refill, the dst-buffer ghosts
-            // would carry stale data from previous steps.
-            pass.setPipeline(pipelines.pipelines.applyBcs);
-            pass.setBindGroup(0, bgs.applyBcsDst);
-            pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+        // Resistivity moved OUT of the per-stage path (Session 8).
+        // RKL2 super-step encoded once per RK3 macro-step — see
+        // `_encodeResistivitySuperStep` in `step()`.
+    }
 
-            // 9b. Snapshot dst → snap. Race-free per-cell copy; required
-            // because the next pass's 5-point Laplacian reads neighbours,
-            // and WebGPU has no cross-invocation memory ordering inside
-            // a dispatch — so reading from the same buffer being written
-            // racily picks up post-write values at workgroup-tile bounds.
-            // Dispatched over (N+3)² with (ghost-1) shift (Change #10).
-            pass.setPipeline(pipelines.pipelines.applyResSnapshot);
-            pass.setBindGroup(0, bgs.applyRes);
-            pass.dispatchWorkgroups(gResis, gResis, 1);
+    // ── RKL2 coefficient computation ────────────────────────────────
+    //
+    // Meyer, Diehl & Kupka (2014) §3, Algorithm 1 / Eq 13. Coefficients
+    //   b_0 = b_1 = 1/3,    b_j  = (j² + j − 2) / (2 j (j + 1)),  j ≥ 2
+    //   a_j = 1 − b_j
+    //   w_1 = 4 / (s² + s − 2)        (s ≥ 2; s = 1 special case)
+    //   μ̃_1 = b_1 · w_1,   ν_1 = 0,   μ_1 = 0,   γ̃_1 = 0           (j = 1)
+    //   For j ≥ 2:
+    //     μ_j         = (2j − 1)/j · b_j / b_{j-1}
+    //     ν_j         = -(j − 1)/j · b_j / b_{j-2}
+    //     μ̃_j         = μ_j · w_1
+    //     γ̃_j         = -a_{j-1} · μ̃_j
+    //
+    // Substep count from Δt_super and dt_parabolic:
+    //   s = ceil(0.5 · (√(1 + 8 · Δt_super / dt_parabolic) − 1))
+    // capped at sts_coeffs_max_s (100; brief-specified safety cap).
+    //
+    // For s = 1 we want pure forward Euler (Y_1 = U^n + Δt · L(U^n)) —
+    // achieved with the special-case μ̃_1 = 1 (the MDK formula divides
+    // by (s² + s − 2) which is zero at s = 1, hence the special case).
+    _computeRKL2Coeffs(dt_super, dt_parabolic, sMax) {
+        let s;
+        if (dt_parabolic >= 1e29 || dt_super <= 0) {
+            s = 1;
+        } else {
+            const ratio = dt_super / dt_parabolic;
+            const sRaw = 0.5 * (Math.sqrt(1 + 8 * ratio) - 1);
+            s = Math.max(1, Math.ceil(sRaw));
+            if (s > sMax) s = sMax;
+        }
 
-            // 9c. Resistivity (η ∇²B) — reads snap, writes dst. Same
-            // dispatch shape as 9b; interior-bounds checks inside the
-            // shader filter writes to interior cells/faces only.
-            pass.setPipeline(pipelines.pipelines.applyResistivity);
-            pass.setBindGroup(0, bgs.applyRes);
+        const coeffs = new Float32Array(sMax * 4);
+        if (s === 0) return { s, coeffsArr: coeffs };
+
+        const b = new Float64Array(s + 1);
+        const a = new Float64Array(s + 1);
+        b[0] = 1.0 / 3.0;
+        if (s >= 1) b[1] = 1.0 / 3.0;
+        for (let j = 2; j <= s; j++) {
+            b[j] = (j * j + j - 2) / (2.0 * j * (j + 1));
+        }
+        for (let j = 0; j <= s; j++) a[j] = 1.0 - b[j];
+
+        const w1 = (s >= 2) ? (4.0 / (s * s + s - 2)) : 1.0;
+        // j = 1: μ_1 = ν_1 = γ̃_1 = 0; μ̃_1 = b_1·w_1 for s ≥ 2, or 1 for s = 1.
+        const mu1tilde = (s === 1) ? 1.0 : b[1] * w1;
+        coeffs[0] = 0.0;
+        coeffs[1] = 0.0;
+        coeffs[2] = mu1tilde;
+        coeffs[3] = 0.0;
+
+        for (let j = 2; j <= s; j++) {
+            const mu   = (2.0 * j - 1) / j * b[j] / b[j - 1];
+            const nu   = -(j - 1) / j * b[j] / b[j - 2];
+            const muT  = mu * w1;
+            const gamT = -a[j - 1] * muT;
+            const base = (j - 1) * 4;
+            coeffs[base + 0] = mu;
+            coeffs[base + 1] = nu;
+            coeffs[base + 2] = muT;
+            coeffs[base + 3] = gamT;
+        }
+        return { s, coeffsArr: coeffs };
+    }
+
+    /**
+     * Encode the RKL2 super-step that diffuses face B + Bz by η over
+     * Δt = dt_hyp. Called once per RK3 macro-step, AFTER stage 3 has
+     * written the final hyperbolic state into the side's `next` buffers
+     * (which alias the stage-3 destination — see `_buildBindGroupCache`).
+     *
+     * Operator splitting: Lie (1st-order). The hyperbolic + ideal-MHD
+     * update completes first; resistivity applies on top.
+     *
+     * Skip-paths:
+     *   - eta == 0 AND alpha == 0: no resistivity at all. Skip.
+     *   - eta_max ≈ 0 (dt_parabolic huge): s = 1 forward Euler with
+     *     negligible Δt·L term. Still encoded — single substep is
+     *     cheap.
+     */
+    _encodeResistivitySuperStep(encoder, side, dt_super, dt_parabolic) {
+        const b = this.buffers;
+        const { pipelines } = this;
+        const alpha = b._etaAnomAlpha ?? 0;
+        if (this.eta <= 0 && alpha <= 0) return;
+
+        const { s, coeffsArr } = this._computeRKL2Coeffs(
+            dt_super, dt_parabolic, b.sts_coeffs_max_s,
+        );
+        if (s <= 0) return;
+        this._lastSuperStepS = s;
+
+        b.pushStsCoeffs(coeffsArr);
+
+        const N = this.n;
+        const gResis = Math.ceil((N + 3) / WG);
+
+        // dst buffers — stage 3 wrote into the side's `next` slot
+        // (before the post-step swap).
+        const handles = (side === 'a')
+            ? { Bx: b.Bx_b, By: b.By_b, U1: b.U1_b }
+            : { Bx: b.Bx_a, By: b.By_a, U1: b.U1_a };
+
+        const initSet = { Bx: b.Bx_res_init,  By: b.By_res_init,  U1: b.U1_res_init  };
+        const setA    = { Bx: b.Bx_res_pprev, By: b.By_res_pprev, U1: b.U1_res_pprev };
+        const setB    = { Bx: b.Bx_res_prev,  By: b.By_res_prev,  U1: b.U1_res_prev  };
+        const setC    = { Bx: b.Bx_res_tmp,   By: b.By_res_tmp,   U1: b.U1_res_tmp   };
+
+        const pass = encoder.beginComputePass({ label: 'plasma.rkl2' });
+
+        // Seed: dst → init, dst → A (pprev), dst → B (prev).
+        pass.setPipeline(pipelines.pipelines.applyResSnapshot);
+        for (const dest of [initSet, setA, setB]) {
+            const bg = this._applyResSnapBG(
+                handles.Bx, handles.By, handles.U1,
+                dest.Bx,    dest.By,    dest.U1,
+            );
+            pass.setBindGroup(0, bg);
             pass.dispatchWorkgroups(gResis, gResis, 1);
         }
+
+        // s substeps with role rotation.
+        let pprev = setA, prev = setB, tmp = setC;
+        for (let j = 1; j <= s; j++) {
+            b.pushStsMeta(j, s, dt_super);
+
+            const bgInit = this._applyResInitBG(
+                initSet.Bx, initSet.By, initSet.U1,
+                pprev.Bx,   pprev.By,   pprev.U1,
+                tmp.Bx,     tmp.By,     tmp.U1,
+            );
+            pass.setPipeline(pipelines.pipelines.applyResInit);
+            pass.setBindGroup(0, bgInit);
+            pass.dispatchWorkgroups(gResis, gResis, 1);
+
+            const bgPrev = this._applyResPrevBG(
+                initSet.Bx, initSet.By,
+                prev.Bx,    prev.By,    prev.U1,
+                tmp.Bx,     tmp.By,     tmp.U1,
+            );
+            pass.setPipeline(pipelines.pipelines.applyResPrev);
+            pass.setBindGroup(0, bgPrev);
+            pass.dispatchWorkgroups(gResis, gResis, 1);
+
+            // Rotate: new_pprev = old prev, new_prev = tmp,
+            //         new_tmp = old pprev (free to overwrite).
+            const oldPprev = pprev;
+            pprev = prev;
+            prev  = tmp;
+            tmp   = oldPprev;
+        }
+
+        // Copy Y_s back into dst. Y_s ended up in `prev` after substep s's
+        // rotation (substep s wrote into tmp, then rotation made it prev).
+        const bgFinal = this._applyResSnapBG(
+            prev.Bx, prev.By, prev.U1,
+            handles.Bx, handles.By, handles.U1,
+        );
+        pass.setPipeline(pipelines.pipelines.applyResSnapshot);
+        pass.setBindGroup(0, bgFinal);
+        pass.dispatchWorkgroups(gResis, gResis, 1);
+
+        pass.end();
     }
 
     step() {
@@ -928,7 +1155,19 @@ export class Sim {
 
         pass.end();
 
-        // Pass 3: conservation diagnostics reduction over the just-
+        // Pass 3 (Session 8): RKL2 super-step for resistive diffusion.
+        // Runs ON the side's stage-3 dst buffers (which alias U_next
+        // before the swap). Substep count `s` is sized from the
+        // PREVIOUS step's dt_hyp / dt_parabolic — readback is one-step
+        // lagged to avoid stalling the encode chain. Skipped entirely
+        // at η = 0 AND α = 0.
+        this._encodeResistivitySuperStep(
+            encoder, side,
+            this._lastDtHyp,
+            this._lastDtParabolic,
+        );
+
+        // Pass 4: conservation diagnostics reduction over the just-
         // written destination state (stage 3 dst === U_next at this
         // point, before the swap below). Two dispatches in one pass —
         // per-tile partials, then a single-workgroup finalize. Output
@@ -958,12 +1197,47 @@ export class Sim {
 
         device.queue.submit([encoder.finish()]);
 
+        // Kick off async readback of dt_buf (dt_hyp, dt_parabolic,
+        // eta_max). Used by the next step's RKL2 substep-count sizing
+        // — one-step lag is acceptable since dt evolves slowly. Skip if
+        // a previous readback is still in-flight.
+        this._maybeReadbackDt();
+
         b.swap();
         this.stepCount += 1;
         // simTime is advanced by the actual GPU-computed dt, which we
         // don't read back here; UI presents `stepCount * estimated_dt`
         // when needed, and stats-display.js does its own readback of
         // the dt buffer for accurate clock reporting.
+    }
+
+    /**
+     * Fire an async readback of dt_buf (3 f32 slots: dt_hyp, dt_parabolic,
+     * eta_max). Latest values populate _lastDtHyp / _lastDtParabolic /
+     * _lastEtaMax for the next step's RKL2 substep-count computation.
+     * Skips silently if a previous readback hasn't completed — at 60 fps
+     * the GPU finishes a 256² step in ~1–3 ms vs readback latency
+     * ~1–2 ms, so back-to-back submits sometimes overlap.
+     */
+    _maybeReadbackDt() {
+        if (this._dtReadbackBusy) return;
+        if (!this._dtReadbackPool) return;
+        this._dtReadbackBusy = true;
+        readbackSlice(this.device, this._dtReadbackPool,
+                      this.buffers.dt, 0, 12)
+            .then(ab => {
+                const arr = new Float32Array(ab);
+                if (Number.isFinite(arr[0]) && arr[0] > 0) this._lastDtHyp = arr[0];
+                if (Number.isFinite(arr[1]) && arr[1] > 0) this._lastDtParabolic = arr[1];
+                if (Number.isFinite(arr[2])) this._lastEtaMax = arr[2];
+            })
+            .catch(e => {
+                // Validation errors on stale buffers can fire during
+                // setResolution; drop silently and let the next call
+                // re-establish a healthy readback.
+                console.warn('[plasma] dt readback:', e);
+            })
+            .finally(() => { this._dtReadbackBusy = false; });
     }
 
     render() {
