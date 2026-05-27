@@ -22,7 +22,7 @@
  * SHADER_VERSION bumps when any WGSL file is edited.
  */
 
-const SHADER_VERSION = 28;
+const SHADER_VERSION = 30;
 
 async function fetchWGSL(filename) {
     const url = new URL(`./shaders/${filename}?v=${SHADER_VERSION}`, import.meta.url);
@@ -341,6 +341,7 @@ function applyCoolingBGL(device) {
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },   // Bx_face
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },   // By_face
         { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },   // microphysics table
     ]);
 }
 
@@ -357,7 +358,7 @@ function solvePoissonBGL(device) {
     ]);
 }
 
-// Gravity source-term application. Reads phi, writes momentum+E.
+// Gravity source-term application. Reads phi and face-B, writes momentum+E.
 function applyGravityBGL(device) {
     return bgl(device, 'plasma.applyGravity.bgl', [
         { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
@@ -365,6 +366,8 @@ function applyGravityBGL(device) {
         { binding: 2, visibility: COMPUTE, buffer: RW_STO },   // U1
         { binding: 3, visibility: COMPUTE, buffer: RO_STO },   // phi
         { binding: 4, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
+        { binding: 5, visibility: COMPUTE, buffer: RO_STO },   // Bx_face
+        { binding: 6, visibility: COMPUTE, buffer: RO_STO },   // By_face
     ]);
 }
 
@@ -379,6 +382,7 @@ function applyConductionBGL(device) {
         { binding: 4, visibility: COMPUTE, buffer: RO_STO },   // By_face
         { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
         { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // conduction_dE
+        { binding: 7, visibility: COMPUTE, buffer: RO_STO },   // microphysics table
     ]);
 }
 
@@ -394,6 +398,66 @@ function applyHallBGL(device) {
         { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
         { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // hall_E
         { binding: 7, visibility: COMPUTE, buffer: RW_STO },   // hall_mb0
+    ]);
+}
+
+// Ambipolar diffusion + Biermann battery. Frozen-state EMF/source scratch
+// followed by CT/Bz application, separate from Hall because ambipolar is
+// dissipative and should not use Hall's magnetic-energy repair.
+function applyNonidealBGL(device) {
+    return bgl(device, 'plasma.applyNonideal.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },   // U0
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },   // U1
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },   // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },   // By_face
+        { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // nonideal_E
+    ]);
+}
+
+// Unified generalized-Ohm layer. Computes Hall + ambipolar + Biermann from
+// one frozen state, applies the nondissipative Hall part with energy repair,
+// then applies dissipative/non-barotropic terms without repair.
+function applyOhmBGL(device) {
+    return bgl(device, 'plasma.applyOhm.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RO_STO },   // U0
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },   // U1
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },   // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },   // By_face
+        { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // ohm_E total + battery
+        { binding: 7, visibility: COMPUTE, buffer: RW_STO },   // hall_E
+        { binding: 8, visibility: COMPUTE, buffer: RW_STO },   // hall_mb0
+        { binding: 9, visibility: COMPUTE, buffer: RO_STO },   // microphysics table
+    ]);
+}
+
+// Viscous momentum/energy transport. compute_delta reads frozen gradients
+// into a vec4 scratch; apply_delta mutates U0/U1.
+function applyViscosityBGL(device) {
+    return bgl(device, 'plasma.applyViscosity.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RW_STO },   // U0
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },   // U1
+        { binding: 3, visibility: COMPUTE, buffer: RO_STO },   // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RO_STO },   // By_face
+        { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
+        { binding: 6, visibility: COMPUTE, buffer: RW_STO },   // viscosity_dU
+        { binding: 7, visibility: COMPUTE, buffer: RO_STO },   // microphysics table
+    ]);
+}
+
+// Axisymmetric cylindrical source layer + boundary sponge.
+function applyGeometryBGL(device) {
+    return bgl(device, 'plasma.applyGeometry.bgl', [
+        { binding: 0, visibility: COMPUTE, buffer: UNIFORM },
+        { binding: 1, visibility: COMPUTE, buffer: RW_STO },   // U0
+        { binding: 2, visibility: COMPUTE, buffer: RW_STO },   // U1
+        { binding: 3, visibility: COMPUTE, buffer: RW_STO },   // Bx_face
+        { binding: 4, visibility: COMPUTE, buffer: RW_STO },   // By_face
+        { binding: 5, visibility: COMPUTE, buffer: UNIFORM },  // dt_buf
     ]);
 }
 
@@ -420,6 +484,7 @@ export async function createPipelines(device, format) {
         licReduceModule, licNormalizeModule,
         consReduceModule, consFinalizeModule,
         coolingModule, poissonModule, gravityModule, conductionModule, hallModule,
+        nonidealModule, ohmModule, viscosityModule, geometryModule,
     ] = await Promise.all([
         makeModule(device, 'plasma.reconstruct-ppm',          'reconstruct-ppm.wgsl'),
         makeModule(device, 'plasma.riemann-hlld',             'riemann-hlld.wgsl'),
@@ -446,6 +511,10 @@ export async function createPipelines(device, format) {
         makeModule(device, 'plasma.apply-gravity',            'apply-gravity.wgsl'),
         makeModule(device, 'plasma.apply-conduction',         'apply-conduction.wgsl'),
         makeModule(device, 'plasma.apply-hall',               'apply-hall.wgsl'),
+        makeModule(device, 'plasma.apply-nonideal',           'apply-nonideal.wgsl'),
+        makeModule(device, 'plasma.apply-ohm',                'apply-ohm.wgsl'),
+        makeModule(device, 'plasma.apply-viscosity',          'apply-viscosity.wgsl'),
+        makeModule(device, 'plasma.apply-geometry',           'apply-geometry.wgsl'),
     ]);
 
     const reconstructLayout = reconstructPpmBGL(device);
@@ -473,6 +542,10 @@ export async function createPipelines(device, format) {
     const gravityLayout     = applyGravityBGL(device);
     const conductionLayout  = applyConductionBGL(device);
     const hallLayout        = applyHallBGL(device);
+    const nonidealLayout    = applyNonidealBGL(device);
+    const ohmLayout         = applyOhmBGL(device);
+    const viscosityLayout   = applyViscosityBGL(device);
+    const geometryLayout    = applyGeometryBGL(device);
 
     const mkPipeLayout = (bgl) => device.createPipelineLayout({ bindGroupLayouts: [bgl] });
 
@@ -650,6 +723,52 @@ export async function createPipelines(device, format) {
         layout: mkPipeLayout(hallLayout),
         compute: { module: hallModule, entryPoint: 'repair_energy' },
     });
+    const computeNonidealEmf = device.createComputePipeline({
+        label: 'plasma.apply-nonideal.compute-emf',
+        layout: mkPipeLayout(nonidealLayout),
+        compute: { module: nonidealModule, entryPoint: 'compute_emf' },
+    });
+    const applyNonideal = device.createComputePipeline({
+        label: 'plasma.apply-nonideal.apply-update',
+        layout: mkPipeLayout(nonidealLayout),
+        compute: { module: nonidealModule, entryPoint: 'apply_update' },
+    });
+    const ohmPipeLayout = mkPipeLayout(ohmLayout);
+    const computeOhmEmf = device.createComputePipeline({
+        label: 'plasma.apply-ohm.compute-emf',
+        layout: ohmPipeLayout,
+        compute: { module: ohmModule, entryPoint: 'compute_emf' },
+    });
+    const applyOhmHall = device.createComputePipeline({
+        label: 'plasma.apply-ohm.apply-hall',
+        layout: ohmPipeLayout,
+        compute: { module: ohmModule, entryPoint: 'apply_hall_update' },
+    });
+    const repairOhmHallEnergy = device.createComputePipeline({
+        label: 'plasma.apply-ohm.repair-hall-energy',
+        layout: ohmPipeLayout,
+        compute: { module: ohmModule, entryPoint: 'repair_hall_energy' },
+    });
+    const applyOhmDissipative = device.createComputePipeline({
+        label: 'plasma.apply-ohm.apply-dissipative',
+        layout: ohmPipeLayout,
+        compute: { module: ohmModule, entryPoint: 'apply_dissipative_update' },
+    });
+    const computeViscosityDelta = device.createComputePipeline({
+        label: 'plasma.apply-viscosity.compute-delta',
+        layout: mkPipeLayout(viscosityLayout),
+        compute: { module: viscosityModule, entryPoint: 'compute_delta' },
+    });
+    const applyViscosityDelta = device.createComputePipeline({
+        label: 'plasma.apply-viscosity.apply-delta',
+        layout: mkPipeLayout(viscosityLayout),
+        compute: { module: viscosityModule, entryPoint: 'apply_delta' },
+    });
+    const applyGeometry = device.createComputePipeline({
+        label: 'plasma.apply-geometry',
+        layout: mkPipeLayout(geometryLayout),
+        compute: { module: geometryModule, entryPoint: 'main' },
+    });
 
     return {
         layouts: {
@@ -677,6 +796,10 @@ export async function createPipelines(device, format) {
             gravity:    gravityLayout,
             conduction: conductionLayout,
             hall:       hallLayout,
+            nonideal:   nonidealLayout,
+            ohm:        ohmLayout,
+            viscosity:  viscosityLayout,
+            geometry:   geometryLayout,
         },
         pipelines: {
             reconstructPpm, riemannHlld, computeEmf,
@@ -694,6 +817,10 @@ export async function createPipelines(device, format) {
             applyGravity,
             computeConductionDelta, applyConductionDelta,
             computeHallEmf, applyHall, repairHallEnergy,
+            computeNonidealEmf, applyNonideal,
+            computeOhmEmf, applyOhmHall, repairOhmHallEnergy, applyOhmDissipative,
+            computeViscosityDelta, applyViscosityDelta,
+            applyGeometry,
         },
     };
 }

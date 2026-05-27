@@ -34,9 +34,11 @@
 
 import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, PRESSURE_FLOOR, ETA_DEFAULT,
-    BC_PERIODIC, BC_OUTFLOW, BASE_PHYSICS_FLAGS, EXTENDED_PHYSICS_FLAGS,
+    BC_PERIODIC, BC_OUTFLOW, BC_DRIVEN, BASE_PHYSICS_FLAGS, EXTENDED_PHYSICS_FLAGS,
     FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
-    COOLING_CURVE_TABLE,
+    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_HEATING,
+    COOLING_CURVE_TABLE, COOLING_CURVE_TABULATED,
+    GEOMETRY_CARTESIAN,
 } from './config.js';
 
 /** Cell-centered flat index in ghost-padded storage. */
@@ -57,15 +59,18 @@ function byFaceIdx(i, j, nTotal) { return j * nTotal + i; }
 function writeCell(U0, U1, idx, rho, vx, vy, vz, p, bx_c, by_c, bz, gamma) {
     const ke = 0.5 * rho * (vx*vx + vy*vy + vz*vz);
     const mb = 0.5 * (bx_c*bx_c + by_c*by_c + bz*bz);
-    const E  = Math.max(p, PRESSURE_FLOOR) / (gamma - 1) + ke + mb;
+    const pSafe = Math.max(p, PRESSURE_FLOOR);
+    const eint = pSafe / (gamma - 1);
+    const entropy = pSafe / Math.max(rho, 1e-6) ** gamma;
+    const E  = eint + ke + mb;
     U0[4 * idx + 0] = rho;
     U0[4 * idx + 1] = rho * vx;
     U0[4 * idx + 2] = rho * vy;
     U0[4 * idx + 3] = rho * vz;
     U1[4 * idx + 0] = E;
     U1[4 * idx + 1] = bz;
-    U1[4 * idx + 2] = 0;
-    U1[4 * idx + 3] = 0;
+    U1[4 * idx + 2] = eint;
+    U1[4 * idx + 3] = entropy;
 }
 
 /**
@@ -292,7 +297,11 @@ export function makeOrszagTangExtendedPreset(n = GRID_N) {
             coolingLambda0: 0.01,
             coolingTFloor: 1.0e-4,
             coolingTRef: 1.0,
-            coolingCurveMode: COOLING_CURVE_TABLE,
+            coolingCurveMode: COOLING_CURVE_TABULATED,
+            coolingMetallicity: 1.0,
+            heatingGamma0: 2.0e-3,
+            heatingDensityExp: 1.0,
+            heatingTCut: 8.0,
             conductionKappa: 1.0e-3,
             conductionIsoFrac: 0.1,
             conductionSatFrac: 0.3,
@@ -300,8 +309,122 @@ export function makeOrszagTangExtendedPreset(n = GRID_N) {
             gravityGy: 0.0,
             gravityG: 1.0e-3,
             gravityPoissonIters: 30,
+            gravitySoftening: 0.05,
+            gravityPoissonOmega: 0.8,
             hallElectronPressureFrac: 0.5,
+            ambipolarEta: 3.0e-4,
+            biermannCoeff: 1.0e-4,
+            neutralFrac: 0.05,
+            ionizationT0: 0.5,
+            viscosityNu: 5.0e-4,
+            viscosityBulk: 2.0e-4,
+            viscosityAnisoFrac: 0.5,
+            viscosityShock: 5.0e-4,
+            sourceSubstepsMax: 12,
+            geometryMode: GEOMETRY_CARTESIAN,
+            geometryRMin: 0.0,
+            spongeWidth: 0.0,
+            spongeStrength: 0.0,
         },
+    };
+}
+
+/**
+ * Driven magnetized wind against a dense cloud.
+ *
+ * This is not a canonical convergence test; it is a "realistic boundary"
+ * playground: a west driven inflow, open NSCBC outflow elsewhere, tabulated
+ * cooling/heating, Spitzer-like conduction, viscosity, weak partial
+ * ionization, Biermann seed field generation, and a small Hall term.
+ */
+export function makeDrivenWindPreset(n = GRID_N) {
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+    const gamma = 5.0 / 3.0;
+    const L = 2.0;
+    const dx = L / n;
+    const ambient = {
+        rho: 0.20, p: 0.035,
+        vx: 0.0, vy: 0.0, vz: 0.0,
+        bx: 0.12, by: 0.015, bz: 0.03,
+    };
+    const wind = {
+        rho: 0.75, p: 0.055,
+        vx: 1.15, vy: 0.02, vz: 0.0,
+        bx: ambient.bx, by: ambient.by, bz: ambient.bz,
+    };
+    const cloud = { x: 0.85 * L, y: 0.50 * L, sigma: 0.16 * L, contrast: 6.0 };
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            const x = (i - ghost + 0.5) * dx;
+            const y = (j - ghost + 0.5) * dx;
+            const r2 = (x - cloud.x) ** 2 + (y - cloud.y) ** 2;
+            const clump = Math.exp(-r2 / (2 * cloud.sigma * cloud.sigma));
+            const rho = ambient.rho * (1 + cloud.contrast * clump);
+            const p = ambient.p * (1 + 0.35 * clump);
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho, ambient.vx, ambient.vy, ambient.vz, p,
+                      ambient.bx, ambient.by, ambient.bz, gamma);
+        }
+    }
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT + 1; i++) {
+            Bx_face[bxFaceIdx(i, j, nT)] = ambient.bx;
+        }
+    }
+    for (let j = 0; j < nT + 1; j++) {
+        for (let i = 0; i < nT; i++) {
+            By_face[byFaceIdx(i, j, nT)] = ambient.by;
+        }
+    }
+
+    return {
+        id: 'driven-wind-cloud',
+        label: 'Driven wind + cloud',
+        gamma,
+        domainLength: L,
+        eta: 2.0e-4,
+        bc: {
+            modeN: BC_OUTFLOW, modeS: BC_OUTFLOW,
+            modeE: BC_OUTFLOW, modeW: BC_DRIVEN,
+            driven: {
+                rho: wind.rho, vx: wind.vx, vy: wind.vy, vz: wind.vz,
+                bx: wind.bx, by: wind.by, bz: wind.bz, p: wind.p,
+            },
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS
+                | FLAG_COOLING | FLAG_HEATING | FLAG_CONDUCTION | FLAG_HALL
+                | FLAG_AMBIPOLAR | FLAG_BIERMANN | FLAG_VISCOSITY,
+            hallDi: 0.006,
+            hallSubstepsMax: 8,
+            hallElectronPressureFrac: 0.45,
+            coolingLambda0: 8.0e-3,
+            coolingTFloor: 2.0e-3,
+            coolingTRef: 0.2,
+            coolingCurveMode: COOLING_CURVE_TABULATED,
+            coolingMetallicity: 0.8,
+            heatingGamma0: 6.0e-4,
+            heatingDensityExp: 1.0,
+            heatingTCut: 2.0,
+            conductionKappa: 3.0e-5,
+            conductionIsoFrac: 0.05,
+            conductionSatFrac: 0.25,
+            ambipolarEta: 1.5e-4,
+            neutralFrac: 0.12,
+            ionizationT0: 0.18,
+            biermannCoeff: 3.0e-5,
+            viscosityNu: 1.0e-4,
+            viscosityBulk: 5.0e-5,
+            viscosityAnisoFrac: 0.35,
+            viscosityShock: 2.0e-4,
+            sourceSubstepsMax: 16,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 0,
+        viewMin: ambient.rho * 0.8,
+        viewMax: ambient.rho * (1 + cloud.contrast),
+        verifyTime: 0.6,
     };
 }
 
@@ -974,6 +1097,7 @@ export const PRESETS = {
     'brio-wu': makeBrioWuPreset,
     'orszag-tang': makeOrszagTangPreset,
     'orszag-tang-extended': makeOrszagTangExtendedPreset,
+    'driven-wind-cloud': makeDrivenWindPreset,
     'harris': makeHarrisPreset,
     'alfven-cpaw': makeAlfvenCpawPreset,
     'acoustic-wave-hydro': makeAcousticWaveHydroPreset,

@@ -89,14 +89,16 @@
 // Cell-centered conserved state, packed as TWO vec4<f32> arrays per
 // ping-pong slot:
 //   U0[idx] = (ρ, ρ·vx, ρ·vy, ρ·vz)
-//   U1[idx] = (E,  Bz,    _pad,  _pad)
+//   U1[idx] = (E,  Bz,    e_int, K)
 // where E is total energy density:
 //   E = p/(γ-1) + ½·ρ·|v|² + ½·|B|²
+// and e_int/K are the dual-energy auxiliaries:
+//   e_int = p/(γ-1),  K = p / ρ^γ.
 //
 // ── γ & floors ──────────────────────────────────────────────────────
 // γ comes from the Uniforms; pressure & density floors match config.js.
 
-// Main physics-state Uniforms (128 B). Written when a physics parameter
+// Main physics-state Uniforms (256 B). Written when a physics parameter
 // changes (preset/eta/cfl/gamma/view_mode/resolution/pressure_floor). Slots
 // 6,7,14 are reserved (previously held LIC fields — now in a separate
 // LicUniforms buffer rewritten per render frame). Slot 5 was reclaimed
@@ -145,6 +147,39 @@ struct Uniforms {
     emf_mode:                    u32,  // 0 = BS arithmetic mean, 1 = GS upwind
     cooling_curve_mode:          u32,  // 0 = √T brems, 1 = piecewise power-law table
     hall_electron_pressure_frac: f32,  // p_e / p for generalized Ohm's law pressure term
+    // ── Higher-fidelity source physics (slots 32-63) ───────────────
+    cooling_metallicity:      f32,  // CIE/table metallicity multiplier (solar = 1)
+    heating_gamma0:           f32,  // volumetric heating scale (0 = off)
+    heating_density_exp:      f32,  // heating ∝ ρ^a
+    heating_T_cut:            f32,  // optional hot-gas heating cutoff; <=0 disables
+    ambipolar_eta:            f32,  // η_A coefficient for ion-neutral drift diffusion
+    biermann_coeff:           f32,  // Biermann battery strength
+    neutral_frac:             f32,  // base neutral fraction multiplier
+    ionization_T0:            f32,  // neutral fraction turnover temperature
+    viscosity_nu:             f32,  // kinematic shear viscosity
+    viscosity_bulk:           f32,  // bulk viscosity coefficient
+    viscosity_aniso_frac:     f32,  // Braginskii-like B-aligned fraction
+    viscosity_shock:          f32,  // extra compression-triggered artificial viscosity
+    source_substeps_max:      u32,  // shared cap for explicit source sub-cycles
+    geometry_mode:            u32,  // 0 = Cartesian, 1 = cylindrical axisymmetry
+    geometry_r_min:           f32,  // radial origin offset / axis guard
+    gravity_softening:        f32,  // screened-Poisson softening length
+    gravity_poisson_omega:    f32,  // weighted-Jacobi relaxation parameter
+    sponge_width:             f32,  // sponge width in grid cells
+    sponge_strength:          f32,  // damping rate for boundary sponge
+    cooling_table_mix:        f32,  // reserved blend/scale for external tables
+    _pad_ext_52:              f32,
+    _pad_ext_53:              f32,
+    _pad_ext_54:              f32,
+    _pad_ext_55:              f32,
+    _pad_ext_56:              f32,
+    _pad_ext_57:              f32,
+    _pad_ext_58:              f32,
+    _pad_ext_59:              f32,
+    _pad_ext_60:              f32,
+    _pad_ext_61:              f32,
+    _pad_ext_62:              f32,
+    _pad_ext_63:              f32,
 };
 
 // Flag bits — keep in sync with FLAG_* constants in config.js.
@@ -155,6 +190,12 @@ const FLAG_CONDUCTION:   u32 = 1u << 3u;
 const FLAG_HALL:         u32 = 1u << 4u;
 const FLAG_POSITIVITY:   u32 = 1u << 5u;
 const FLAG_EMF_UPWIND:   u32 = 1u << 6u;
+const FLAG_AMBIPOLAR:    u32 = 1u << 7u;
+const FLAG_BIERMANN:     u32 = 1u << 8u;
+const FLAG_VISCOSITY:    u32 = 1u << 9u;
+const FLAG_GEOMETRY:     u32 = 1u << 10u;
+const FLAG_SPONGE:       u32 = 1u << 11u;
+const FLAG_HEATING:      u32 = 1u << 12u;
 
 fn flag_set(flags: u32, bit: u32) -> bool {
     return (flags & bit) != 0u;
@@ -214,6 +255,7 @@ struct BcUniforms {
 // slot 11) — pass it explicitly to helpers below. The shader-side
 // default (matching config.js) is 1e-6.
 const DENSITY_FLOOR:  f32 = 1.0e-6;
+const DUAL_ENERGY_FRACTION: f32 = 1.0e-3;
 
 // ── Indexing helpers ────────────────────────────────────────────────
 // Phase 4 drops wrap_idx in favour of direct indexing into ghost-padded
@@ -288,6 +330,32 @@ struct MhdCons {
     bz:   f32,
 };
 
+fn entropy_proxy(rho: f32, p: f32, gamma: f32, p_floor: f32) -> f32 {
+    return max(p, p_floor) / pow(max(rho, DENSITY_FLOOR), gamma);
+}
+
+fn pressure_from_dual_energy(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32, gamma: f32, p_floor: f32) -> f32 {
+    let rho = max(U0.x, DENSITY_FLOOR);
+    let vx = U0.y / rho;
+    let vy = U0.z / rho;
+    let vz = U0.w / rho;
+    let ke = 0.5 * rho * (vx*vx + vy*vy + vz*vz);
+    let mb = 0.5 * (bx_c*bx_c + by_c*by_c + U1.y*U1.y);
+    let eth_total = U1.x - ke - mb;
+    let eth_floor = p_floor / max(gamma - 1.0, 1.0e-6);
+    let total_ok = eth_total > max(eth_floor, DUAL_ENERGY_FRACTION * max(abs(U1.x), eth_floor))
+                && eth_total == eth_total;
+    let dual_eth = max(U1.z, eth_floor);
+    let eth = select(dual_eth, eth_total, total_ok);
+    return max((gamma - 1.0) * eth, p_floor);
+}
+
+fn pack_u1_aux(E: f32, bz: f32, rho: f32, p: f32, gamma: f32, p_floor: f32) -> vec4<f32> {
+    let p_safe = max(p, p_floor);
+    let eth = p_safe / max(gamma - 1.0, 1.0e-6);
+    return vec4<f32>(E, bz, eth, entropy_proxy(rho, p_safe, gamma, p_floor));
+}
+
 fn cons_to_prim_mhd(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32, gamma: f32, p_floor: f32) -> MhdPrim {
     var P: MhdPrim;
     P.rho = max(U0.x, DENSITY_FLOOR);
@@ -297,9 +365,7 @@ fn cons_to_prim_mhd(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32, gamma: f
     P.bx  = bx_c;
     P.by  = by_c;
     P.bz  = U1.y;
-    let ke = 0.5 * P.rho * (P.vx*P.vx + P.vy*P.vy + P.vz*P.vz);
-    let mb = 0.5 * (P.bx*P.bx + P.by*P.by + P.bz*P.bz);
-    P.p   = max((gamma - 1.0) * (U1.x - ke - mb), p_floor);
+    P.p   = pressure_from_dual_energy(U0, U1, bx_c, by_c, gamma, p_floor);
     return P;
 }
 
@@ -382,7 +448,7 @@ fn prim_to_cons_pair(P: MhdPrim, gamma: f32, p_floor: f32) -> ConsPair {
     let E   = p / (gamma - 1.0) + ke + mb;
     var R: ConsPair;
     R.U0 = vec4<f32>(rho, rho*P.vx, rho*P.vy, rho*P.vz);
-    R.U1 = vec4<f32>(E, P.bz, 0.0, 0.0);
+    R.U1 = pack_u1_aux(E, P.bz, rho, p, gamma, p_floor);
     return R;
 }
 

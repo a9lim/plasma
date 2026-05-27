@@ -30,6 +30,11 @@ for.
 | [`sessions/session-11.md`](sessions/session-11.md) | RKL2 curl(η J) on Yee grid + corner BC composition |
 | [`sessions/session-12.md`](sessions/session-12.md) | Fifth Harris bug: dst-ghost staleness + ρ-floor momentum blowup |
 | [`sessions/session-13.md`](sessions/session-13.md) | RKL2 substep correctness (writeBuffer race + 2D FE bound + MDK margin) |
+| [`sessions/session-14.md`](sessions/session-14.md) | Extended physics breadth pass |
+| [`sessions/session-15.md`](sessions/session-15.md) | Per-preset source opt-in + subcycling hardening |
+| [`sessions/session-16.md`](sessions/session-16.md) | Transport, cooling, Ohm, and gravity realism pass |
+| [`sessions/session-17.md`](sessions/session-17.md) | Second realism layer: heating, ambipolar, Biermann, viscosity, geometry |
+| [`sessions/session-18.md`](sessions/session-18.md) | Tabulated microphysics, dual energy, unified Ohm, driven wind/cloud |
 
 Session 1 was the initial scaffold (no retro — see the Phase 1
 commit message instead).

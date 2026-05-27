@@ -55,6 +55,7 @@ import {
     VIEW_DENSITY, BC_PERIODIC, ETA_DEFAULT, PRESSURE_FLOOR,
     LIC_NOISE_N, LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, LIC_NOISE_SEED,
 } from '../config.js';
+import { buildMicrophysicsTable, MICRO_TABLE_ENTRIES, MICRO_STRIDE } from '../microphysics.js';
 
 const VEC4_BYTES = 16;
 const F32_BYTES  = 4;
@@ -294,6 +295,23 @@ export class PlasmaBuffers {
                  | GPUBufferUsage.COPY_DST,
         });
 
+        // Explicit viscosity and non-ideal induction sub-step Δt buffers.
+        // These mirror hall_dt / cond_dt but are sized host-side from the
+        // newly exposed transport coefficients rather than from compute-dt's
+        // storage-binding-limited reduction pass.
+        this.visc_dt = device.createBuffer({
+            label: 'plasma.visc_dt',
+            size: 32,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM
+                 | GPUBufferUsage.COPY_DST,
+        });
+        this.nonideal_dt = device.createBuffer({
+            label: 'plasma.nonideal_dt',
+            size: 32,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.UNIFORM
+                 | GPUBufferUsage.COPY_DST,
+        });
+
         // Conduction parabolic-speed reduction target. Same atomic
         // pattern as eta_max_buf and hall_speed_buf. compute-dt's
         // finalize writes the result into dt_buf[4] for host readback.
@@ -397,6 +415,17 @@ export class PlasmaBuffers {
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
 
+        // ── Tabulated microphysics closures ────────────────────────
+        // 64 vec4 rows: cooling, neutral fraction, Spitzer resistivity,
+        // and transport scale families. See src/microphysics.js for the
+        // family layout and the dimensional interpretation.
+        this.microphysics = device.createBuffer({
+            label: 'plasma.microphysics',
+            size: MICRO_TABLE_ENTRIES * MICRO_STRIDE * F32_BYTES,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this.uploadMicrophysicsTable(buildMicrophysicsTable());
+
         // ── View field (interior cells only, packed contiguous) ────
         // The view-field shader writes only into interior cells. We
         // allocate (N+4)² so existing indexing works; viz reads from the
@@ -466,6 +495,8 @@ export class PlasmaBuffers {
         this.conduction_dE = mkStorage('plasma.conduction_dE', u_f32_cell_bytes);
         this.hall_E        = mkStorage('plasma.hall_E',        u_v4_edge_bytes);
         this.hall_mb0      = mkStorage('plasma.hall_mb0',      u_f32_cell_bytes);
+        this.nonideal_E    = mkStorage('plasma.nonideal_E',    u_v4_edge_bytes);
+        this.viscosity_dU  = mkStorage('plasma.viscosity_dU',  u_v4_cell_bytes);
 
         // ── Self-gravity Poisson buffers (extended physics) ────────
         // phi / phi_next form a Jacobi ping-pong for ∇²φ = 4πGρ.
@@ -628,6 +659,8 @@ export class PlasmaBuffers {
         encoder.clearBuffer(this.conduction_dE);
         encoder.clearBuffer(this.hall_E);
         encoder.clearBuffer(this.hall_mb0);
+        encoder.clearBuffer(this.nonideal_E);
+        encoder.clearBuffer(this.viscosity_dU);
         encoder.clearBuffer(this.phi);
         encoder.clearBuffer(this.phi_next);
         encoder.clearBuffer(this.rho_mean);
@@ -635,6 +668,8 @@ export class PlasmaBuffers {
         // Session 15: sub-cycle dt buffers + their reduction targets.
         encoder.clearBuffer(this.hall_dt);
         encoder.clearBuffer(this.cond_dt);
+        encoder.clearBuffer(this.visc_dt);
+        encoder.clearBuffer(this.nonideal_dt);
         encoder.clearBuffer(this.cond_speed_buf);
         this.device.queue.submit([encoder.finish()]);
     }
@@ -650,6 +685,15 @@ export class PlasmaBuffers {
         const f32 = new Float32Array(256 * 4);
         for (let i = 0; i < uint8.length; i++) f32[i] = uint8[i] / 255;
         this.device.queue.writeBuffer(this.lut, 0, f32.buffer);
+    }
+
+    uploadMicrophysicsTable(table) {
+        const expected = MICRO_TABLE_ENTRIES * MICRO_STRIDE;
+        if (!(table instanceof Float32Array) || table.length !== expected) {
+            throw new Error(`uploadMicrophysicsTable: expected Float32Array(${expected})`);
+        }
+        this.device.queue.writeBuffer(this.microphysics, 0,
+            table.buffer, table.byteOffset, table.byteLength);
     }
 
     /**
@@ -669,6 +713,7 @@ export class PlasmaBuffers {
      *   slot 15     u32: noise_n
      *   slot 30     u32: cooling_curve_mode
      *   slot 31     f32: hall_electron_pressure_frac
+     *   slot 32..63 Session-17 source physics and reserved headroom
      *
      * Any field not passed in the args object falls back to the host-side
      * cache (so callers that only know about a subset don't clobber
@@ -683,6 +728,12 @@ export class PlasmaBuffers {
         conductionKappa, conductionIsoFrac, conductionSatFrac,
         gravityGx, gravityGy, gravityG, gravityPoissonIters,
         coolingCurveMode, hallElectronPressureFrac,
+        coolingMetallicity, heatingGamma0, heatingDensityExp, heatingTCut,
+        ambipolarEta, biermannCoeff, neutralFrac, ionizationT0,
+        viscosityNu, viscosityBulk, viscosityAnisoFrac, viscosityShock,
+        sourceSubstepsMax, geometryMode, geometryRMin,
+        gravitySoftening, gravityPoissonOmega,
+        spongeWidth, spongeStrength, coolingTableMix,
         physicsFlags, emfMode,
     } = {}) {
         if (eta           !== undefined) this._eta           = eta;
@@ -705,6 +756,26 @@ export class PlasmaBuffers {
         if (gravityPoissonIters !== undefined) this._gravityPoissonIters = gravityPoissonIters;
         if (coolingCurveMode    !== undefined) this._coolingCurveMode    = coolingCurveMode;
         if (hallElectronPressureFrac !== undefined) this._hallElectronPressureFrac = hallElectronPressureFrac;
+        if (coolingMetallicity  !== undefined) this._coolingMetallicity  = coolingMetallicity;
+        if (heatingGamma0       !== undefined) this._heatingGamma0       = heatingGamma0;
+        if (heatingDensityExp   !== undefined) this._heatingDensityExp   = heatingDensityExp;
+        if (heatingTCut         !== undefined) this._heatingTCut         = heatingTCut;
+        if (ambipolarEta        !== undefined) this._ambipolarEta        = ambipolarEta;
+        if (biermannCoeff       !== undefined) this._biermannCoeff       = biermannCoeff;
+        if (neutralFrac         !== undefined) this._neutralFrac         = neutralFrac;
+        if (ionizationT0        !== undefined) this._ionizationT0        = ionizationT0;
+        if (viscosityNu         !== undefined) this._viscosityNu         = viscosityNu;
+        if (viscosityBulk       !== undefined) this._viscosityBulk       = viscosityBulk;
+        if (viscosityAnisoFrac  !== undefined) this._viscosityAnisoFrac  = viscosityAnisoFrac;
+        if (viscosityShock      !== undefined) this._viscosityShock      = viscosityShock;
+        if (sourceSubstepsMax   !== undefined) this._sourceSubstepsMax   = sourceSubstepsMax;
+        if (geometryMode        !== undefined) this._geometryMode        = geometryMode;
+        if (geometryRMin        !== undefined) this._geometryRMin        = geometryRMin;
+        if (gravitySoftening    !== undefined) this._gravitySoftening    = gravitySoftening;
+        if (gravityPoissonOmega !== undefined) this._gravityPoissonOmega = gravityPoissonOmega;
+        if (spongeWidth         !== undefined) this._spongeWidth         = spongeWidth;
+        if (spongeStrength      !== undefined) this._spongeStrength      = spongeStrength;
+        if (coolingTableMix     !== undefined) this._coolingTableMix     = coolingTableMix;
         if (physicsFlags        !== undefined) this._physicsFlags        = physicsFlags;
         if (emfMode             !== undefined) this._emfMode             = emfMode;
         // ── Slots 0-15: original layout ────────────────────────────
@@ -742,6 +813,28 @@ export class PlasmaBuffers {
         this.uniformU32[29] = (this._emfMode             ?? 0) >>> 0;
         this.uniformU32[30] = (this._coolingCurveMode    ?? 1) >>> 0;
         this.uniformF32[31] = (this._hallElectronPressureFrac ?? 0);
+        // ── Slots 32-63: higher-fidelity source physics ────────────
+        this.uniformF32[32] = (this._coolingMetallicity  ?? 1.0);
+        this.uniformF32[33] = (this._heatingGamma0       ?? 0);
+        this.uniformF32[34] = (this._heatingDensityExp   ?? 1.0);
+        this.uniformF32[35] = (this._heatingTCut         ?? 0);
+        this.uniformF32[36] = (this._ambipolarEta        ?? 0);
+        this.uniformF32[37] = (this._biermannCoeff       ?? 0);
+        this.uniformF32[38] = (this._neutralFrac         ?? 0);
+        this.uniformF32[39] = (this._ionizationT0        ?? 1.0);
+        this.uniformF32[40] = (this._viscosityNu         ?? 0);
+        this.uniformF32[41] = (this._viscosityBulk       ?? 0);
+        this.uniformF32[42] = (this._viscosityAnisoFrac  ?? 0);
+        this.uniformF32[43] = (this._viscosityShock      ?? 0);
+        this.uniformU32[44] = (this._sourceSubstepsMax   ?? 8) >>> 0;
+        this.uniformU32[45] = (this._geometryMode        ?? 0) >>> 0;
+        this.uniformF32[46] = (this._geometryRMin        ?? 0);
+        this.uniformF32[47] = (this._gravitySoftening    ?? 0);
+        this.uniformF32[48] = (this._gravityPoissonOmega ?? 1.0);
+        this.uniformF32[49] = (this._spongeWidth         ?? 0);
+        this.uniformF32[50] = (this._spongeStrength      ?? 0);
+        this.uniformF32[51] = (this._coolingTableMix     ?? 0);
+        for (let i = 52; i < 64; i++) this.uniformF32[i] = 0;
         this.device.queue.writeBuffer(this.uniform, 0, this.uniformHost);
     }
 

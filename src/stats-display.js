@@ -27,6 +27,7 @@ import { readbackBatch, ReadbackPool } from './gpu/readback.js';
 import { GHOST_WIDTH, DENSITY_FLOOR, DT_MIN } from './config.js';
 
 const SPARK_CAP = 240;
+const DUAL_ENERGY_FRACTION = 1e-3;
 
 /** Helper: create a DOM element with optional class + text. */
 function el(tag, cls, text) {
@@ -49,6 +50,15 @@ function statRow(label, opts) {
 /** Group label (matches geon's `.group-label`). */
 function groupLabel(text) {
     return el('h2', 'group-label', text);
+}
+
+function pressureFromDualEnergy({ E, eAux, ke, mb, gammaM1, pFloor }) {
+    const ethFloor = pFloor / Math.max(gammaM1, 1e-6);
+    const ethTotal = E - ke - mb;
+    const totalOk = Number.isFinite(ethTotal)
+        && ethTotal > Math.max(ethFloor, DUAL_ENERGY_FRACTION * Math.max(Math.abs(E), ethFloor));
+    const eth = totalOk ? ethTotal : Math.max(eAux, ethFloor);
+    return Math.max(gammaM1 * eth, pFloor);
 }
 
 /** Build a sparkline canvas + ring buffer. */
@@ -203,7 +213,10 @@ export class StatsDisplay {
         const tGpu  = statRow('GPU step');
         const tHall = statRow('Hall substeps');
         const tCond = statRow('Cond substeps');
-        this.root.append(tStep.row, tCfl.row, tGpu.row, tHall.row, tCond.row);
+        const tVisc = statRow('Visc substeps');
+        const tNonideal = statRow('Nonideal substeps');
+        this.root.append(tStep.row, tCfl.row, tGpu.row, tHall.row, tCond.row,
+                         tVisc.row, tNonideal.row);
 
         this._refs = {
             eTot: eTot.value, eKin: eKin.value, eMag: eMag.value,
@@ -213,6 +226,7 @@ export class StatsDisplay {
             divB: divB.value, rrate: rrate.value,
             tStep: tStep.value, tCfl: tCfl.value, tGpu: tGpu.value,
             tHall: tHall.value, tCond: tCond.value,
+            tVisc: tVisc.value, tNonideal: tNonideal.value,
         };
     }
 
@@ -351,8 +365,8 @@ export class StatsDisplay {
                 const vx = mx / rho, vy = my / rho, vz = mz / rho;
                 const ke = 0.5 * rho * (vx * vx + vy * vy + vz * vz);
                 const mb = 0.5 * (Bx * Bx + By * By + Bz * Bz);
-                const pRaw = gammaM1 * (E - ke - mb);
-                const p  = Math.max(pRaw, pFloor);
+                const eAux = U1[idx * 4 + 2];
+                const p = pressureFromDualEnergy({ E, eAux, ke, mb, gammaM1, pFloor });
                 if (p <= 1.001 * pFloor) pFloorCount += 1;
 
                 Ekin += ke * cellArea;
@@ -459,6 +473,8 @@ export class StatsDisplay {
         this._refs.tCfl.textContent  = dt.toExponential(3);
         this._refs.tHall.textContent = String(this.sim._lastHallSubsteps ?? 1);
         this._refs.tCond.textContent = String(this.sim._lastCondSubsteps ?? 1);
+        this._refs.tVisc.textContent = String(this.sim._lastViscSubsteps ?? 1);
+        this._refs.tNonideal.textContent = String(this.sim._lastNonidealSubsteps ?? 1);
         // GPU step time. When timestamp-query isn't supported, we never
         // populate `gpuMs`; fall back to em-dash via the cached refs.
         if (gpuMs != null && Number.isFinite(gpuMs)) {

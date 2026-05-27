@@ -64,6 +64,7 @@ export const VIEW_JZ       = 4;
 export const VIEW_T        = 5;  // T = p / ρ
 export const VIEW_QMAG     = 6;  // |q| heat flux magnitude (anisotropic Spitzer)
 export const VIEW_PHI      = 7;  // gravitational potential φ
+export const VIEW_ENTROPY  = 8;  // entropy proxy K = p / ρ^γ
 
 // Normalization window for the default density view. Sod expects ρ ∈ [0.125,
 // 1.0] initially; we give a small margin in both directions.
@@ -83,25 +84,29 @@ export const EDGE_S = 1;  // bottom
 export const EDGE_E = 2;  // right
 export const EDGE_W = 3;  // left
 
-// Uniform-buffer layout (Extended physics — slots 16-31 added for Hall,
-// cooling, conduction, gravity, EMF mode, physics flags). See `Uniforms`
+// Uniform-buffer layout (Extended physics — slots 16-63 added for Hall,
+// cooling, conduction, gravity, non-ideal MHD, transport, EMF mode, physics flags). See `Uniforms`
 // struct in shared-helpers.wgsl for the canonical layout.
 //   Slots 0-15  (original 64 B): dx, gamma, view_min, view_max, eta,
 //                eta_anom_alpha, _pad×2, grid_n, grid_n_total, ghost_w,
 //                pressure_floor, cfl, view_mode, eta_anom_jcrit, noise_n.
-//   Slots 16-31 (new 64 B): hall_di, hall_substeps_max, cooling_lambda0,
+//   Slots 16-31 (Session 14/15 64 B): hall_di, hall_substeps_max, cooling_lambda0,
 //                cooling_T_floor, cooling_T_ref, conduction_kappa,
 //                conduction_iso_frac, conduction_sat_frac, gravity_gx,
 //                gravity_gy, gravity_G, gravity_poisson_iters,
 //                physics_flags, emf_mode, cooling_curve_mode,
 //                hall_electron_pressure_frac.
-// 32 × 4B = 128B.
+//   Slots 32-63 (Session 17 128 B): cooling/heating shape, ambipolar and
+//                Biermann terms, viscosity, shared source substep cap,
+//                cylindrical geometry, softened/relaxed Poisson, sponge
+//                layer, and reserved headroom.
+// 64 × 4B = 256B.
 //
 // Sweep direction is in two static SweepDir uniform buffers (16 B each)
 // bound by reconstruct-ppm + riemann-hlld. LIC render-pace state
 // (phase, intensity, drift_x, drift_y) is in a separate 16 B
 // LicUniforms buffer rewritten per render frame.
-export const UNIFORM_BUFFER_SIZE = 128;
+export const UNIFORM_BUFFER_SIZE = 256;
 
 // ── Extended physics flags (slot 28: physics_flags bitfield) ───────────
 // Each feature is OFF by default — extended physics is opt-in so the
@@ -113,6 +118,12 @@ export const FLAG_CONDUCTION   = 1 << 3;  // anisotropic thermal conduction
 export const FLAG_HALL         = 1 << 4;  // Hall MHD correction to face B
 export const FLAG_POSITIVITY   = 1 << 5;  // stronger positivity guard
 export const FLAG_EMF_UPWIND   = 1 << 6;  // GS upwind EMF (vs BS arithmetic mean)
+export const FLAG_AMBIPOLAR    = 1 << 7;  // ion-neutral ambipolar magnetic diffusion
+export const FLAG_BIERMANN     = 1 << 8;  // Biermann battery from ∇ρ × ∇p_e
+export const FLAG_VISCOSITY    = 1 << 9;  // physical/shear/bulk viscosity
+export const FLAG_GEOMETRY     = 1 << 10; // axisymmetric cylindrical source terms
+export const FLAG_SPONGE       = 1 << 11; // boundary sponge layer
+export const FLAG_HEATING      = 1 << 12; // volumetric heating balancing radiative losses
 
 // Baseline flags used by the canonical verification presets. Positivity and
 // upwind CT are numerical guards for the ideal/resistive MHD core; cooling,
@@ -122,7 +133,13 @@ export const EXTENDED_SOURCE_FLAGS = FLAG_COOLING
                                    | FLAG_GRAVITY_EXT
                                    | FLAG_GRAVITY_SELF
                                    | FLAG_CONDUCTION
-                                   | FLAG_HALL;
+                                   | FLAG_HALL
+                                   | FLAG_AMBIPOLAR
+                                   | FLAG_BIERMANN
+                                   | FLAG_VISCOSITY
+                                   | FLAG_GEOMETRY
+                                   | FLAG_SPONGE
+                                   | FLAG_HEATING;
 export const EXTENDED_PHYSICS_FLAGS = BASE_PHYSICS_FLAGS | EXTENDED_SOURCE_FLAGS;
 
 // EMF mode enum (slot 29: emf_mode).
@@ -130,10 +147,19 @@ export const EMF_MODE_BS_MEAN  = 0;  // Balsara-Spicer arithmetic mean (legacy f
 export const EMF_MODE_GS_UPWIND = 1; // Gardiner-Stone 2005 upwind default
 
 // Optically-thin cooling curve selector (slot 30). BREMS preserves the old
-// single √T exact integrator; TABLE uses the Session-16 piecewise power-law
-// curve for a line-cooling peak plus high-T bremsstrahlung tail.
+// single √T exact integrator; TABLE uses the Session-16 compact power-law
+// curve. CIE uses a broader collisional-ionization-equilibrium-inspired
+// solar-metallicity table with metallicity scaling and heating support.
+// TABULATED samples the uploaded microphysics storage table, letting the
+// physics layer swap curves without shader edits.
 export const COOLING_CURVE_BREMS = 0;
 export const COOLING_CURVE_TABLE = 1;
+export const COOLING_CURVE_CIE   = 2;
+export const COOLING_CURVE_TABULATED = 3;
+
+// Geometry source selector (slot 45).
+export const GEOMETRY_CARTESIAN   = 0;
+export const GEOMETRY_CYLINDRICAL = 1; // x is cylindrical radius r, y is z
 
 // bc_uniforms storage-buffer layout:
 //   u32 mode[4]  — N, S, E, W

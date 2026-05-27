@@ -35,6 +35,7 @@
 //   4 By_face  (ro)
 //   5 dt_buf   (uniform)
 //   6 dE       (rw) — one scalar energy delta per cell
+//   7 microphysics table (ro storage)
 
 struct DtUniform {
     dt: f32, _pad0: f32, _pad1: f32, _pad2: f32,
@@ -47,6 +48,31 @@ struct DtUniform {
 @group(0) @binding(4) var<storage, read>       By_face:    array<f32>;
 @group(0) @binding(5) var<uniform>             dt_buf:     DtUniform;
 @group(0) @binding(6) var<storage, read_write> dE_cond:    array<f32>;
+@group(0) @binding(7) var<storage, read>       micro:      array<vec4<f32>>;
+
+const MICRO_TRANSPORT_START: u32 = 48u;
+const MICRO_TRANSPORT_COUNT: u32 = 16u;
+const INV_LN10_COND: f32 = 0.4342944819032518;
+
+fn micro_log_interp_cond(start: u32, count: u32, theta: f32) -> f32 {
+    let log_theta = log(max(theta, 1.0e-30)) * INV_LN10_COND;
+    var idx = start;
+    for (var i: u32 = 0u; i < 15u; i = i + 1u) {
+        if (i + 1u >= count) { break; }
+        let next = micro[start + i + 1u];
+        if (log_theta < next.x) {
+            idx = start + i;
+            break;
+        }
+        idx = start + i + 1u;
+    }
+    let row = micro[idx];
+    return row.y + row.z * (log_theta - row.x);
+}
+
+fn transport_scale(theta: f32) -> f32 {
+    return pow(10.0, micro_log_interp_cond(MICRO_TRANSPORT_START, MICRO_TRANSPORT_COUNT, theta));
+}
 
 // Cell-centered temperature T = p / ρ in code units.
 fn cell_T(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
@@ -58,9 +84,7 @@ fn cell_T(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
                     + Bx_face[bx_face_idx(ix + 1u, iy, n_total)]);
     let by_c = 0.5 * (By_face[by_face_idx(ix, iy,      n_total)]
                     + By_face[by_face_idx(ix, iy + 1u, n_total)]);
-    let ke = 0.5 * (u0.y*u0.y + u0.z*u0.z + u0.w*u0.w) / rho;
-    let mb = 0.5 * (bx_c*bx_c + by_c*by_c + u1.y*u1.y);
-    let p  = max((gamma - 1.0) * (u1.x - ke - mb), p_floor);
+    let p  = pressure_from_dual_energy(u0, u1, bx_c, by_c, gamma, p_floor);
     return p / rho;
 }
 
@@ -87,7 +111,9 @@ fn heat_flux_sat_factor(qx: f32, qy: f32, rho_face: f32, T_face: f32, gamma: f32
 // Compute the x-component of q at the LEFT face of cell (ix, iy) —
 // i.e., at the face shared with cell (ix-1, iy).
 fn q_x_face(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
-    let kappa = U_uniforms.conduction_kappa;
+    let T_c = cell_T(ix, iy, n_total, p_floor, gamma);
+    let theta_c = T_c / max(U_uniforms.cooling_T_ref, 1.0e-30);
+    let kappa = U_uniforms.conduction_kappa * transport_scale(theta_c);
     if (kappa <= 0.0) { return 0.0; }
     let f_iso = U_uniforms.conduction_iso_frac;
     let dx    = U_uniforms.dx;
@@ -127,7 +153,9 @@ fn q_x_face(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
 
 // Symmetric for the BOTTOM face — q_y.
 fn q_y_face(ix: u32, iy: u32, n_total: u32, p_floor: f32, gamma: f32) -> f32 {
-    let kappa = U_uniforms.conduction_kappa;
+    let T_c = cell_T(ix, iy, n_total, p_floor, gamma);
+    let theta_c = T_c / max(U_uniforms.cooling_T_ref, 1.0e-30);
+    let kappa = U_uniforms.conduction_kappa * transport_scale(theta_c);
     if (kappa <= 0.0) { return 0.0; }
     let f_iso = U_uniforms.conduction_iso_frac;
     let dx    = U_uniforms.dx;
@@ -208,6 +236,14 @@ fn apply_delta(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iy = gid.y + ghost;
     let c  = cell_idx_total(ix, iy, n_total);
 
+    let u0 = U0[c];
     let u1 = U1[c];
-    U1[c] = vec4<f32>(u1.x + dE_cond[c], u1.y, u1.z, u1.w);
+    let E = u1.x + dE_cond[c];
+    let rho = max(u0.x, DENSITY_FLOOR);
+    let bx_c = cell_bx(ix, iy, n_total);
+    let by_c = cell_by(ix, iy, n_total);
+    let ke = 0.5 * (u0.y*u0.y + u0.z*u0.z + u0.w*u0.w) / rho;
+    let mb = 0.5 * (bx_c*bx_c + by_c*by_c + u1.y*u1.y);
+    let p = max((U_uniforms.gamma - 1.0) * (E - ke - mb), U_uniforms.pressure_floor);
+    U1[c] = pack_u1_aux(E, u1.y, rho, p, U_uniforms.gamma, U_uniforms.pressure_floor);
 }

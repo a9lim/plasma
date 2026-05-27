@@ -10,6 +10,7 @@
 //   5 (VIEW_T)    — temperature T = p / ρ
 //   6 (VIEW_QMAG) — anisotropic Spitzer heat-flux magnitude |q|
 //   7 (VIEW_PHI)  — gravitational potential φ (Poisson solve output)
+//   8 (VIEW_ENTROPY) — dual-energy entropy proxy K = p / ρ^γ
 //
 // |q| is computed at cell center from a local cell-centered ∇T and the
 // local b̂. The conduction shader uses face-centered fluxes for the
@@ -48,20 +49,18 @@ fn by_at(ix: u32, iy: u32, n_total: u32) -> f32 {
 }
 
 // Cell-centered T = p / ρ at (ix, iy). Reuses the same KE / magnetic
-// subtraction as the pressure view but divides by ρ at the end.
+// subtraction as primitive recovery but divides by ρ at the end. The
+// dual-energy fallback in pressure_from_dual_energy is intentionally used
+// here so visualized temperature matches the state the Riemann solver sees.
 fn cell_temp(ix: u32, iy: u32, n_total: u32) -> f32 {
     let idx = cell_idx_total(ix, iy, n_total);
     let U0 = U0_in[idx];
     let U1 = U1_in[idx];
     let rho = max(U0.x, 1.0e-6);
-    let vx = U0.y / rho;
-    let vy = U0.z / rho;
-    let vz = U0.w / rho;
-    let ke = 0.5 * rho * (vx*vx + vy*vy + vz*vz);
     let bx_c = bx_at(ix, iy, n_total);
     let by_c = by_at(ix, iy, n_total);
-    let mb = 0.5 * (bx_c*bx_c + by_c*by_c + U1.y*U1.y);
-    let p = max((U_uniforms.gamma - 1.0) * (U1.x - ke - mb), U_uniforms.pressure_floor);
+    let p = pressure_from_dual_energy(U0, U1, bx_c, by_c,
+                                      U_uniforms.gamma, U_uniforms.pressure_floor);
     return p / rho;
 }
 
@@ -72,6 +71,12 @@ fn heat_flux_sat_factor_view(qx: f32, qy: f32, rho: f32, T: f32) -> f32 {
     let q_sat = max(phi_sat * max(rho, DENSITY_FLOOR) * cs * cs * cs, 1.0e-30);
     let q_mag = sqrt(max(qx*qx + qy*qy, 0.0));
     return 1.0 / sqrt(1.0 + (q_mag / q_sat) * (q_mag / q_sat));
+}
+
+fn transport_scale_view(theta: f32) -> f32 {
+    // Same default transport closure used by compute-dt. The render
+    // diagnostic intentionally avoids another table binding.
+    return pow(max(theta, 1.0e-30), 2.5);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -97,12 +102,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (mode == 0u) {
         v = U0.x;                                                      // ρ
     } else if (mode == 1u) {
-        let vx = U0.y / rho;
-        let vy = U0.z / rho;
-        let vz = U0.w / rho;
-        let ke = 0.5 * rho * (vx*vx + vy*vy + vz*vz);
-        let mb = 0.5 * (bx_c*bx_c + by_c*by_c + U1.y*U1.y);
-        v = max((U_uniforms.gamma - 1.0) * (U1.x - ke - mb), 1.0e-6); // p
+        v = pressure_from_dual_energy(U0, U1, bx_c, by_c,
+                                      U_uniforms.gamma, U_uniforms.pressure_floor); // p
     } else if (mode == 2u) {
         let vx = U0.y / rho;
         let vy = U0.z / rho;
@@ -140,7 +141,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bhat_x = bx_c * inv_bmag;
         let bhat_y = by_c * inv_bmag;
         let b_dot_gradT = bhat_x * dTx + bhat_y * dTy;
-        let kappa_par = U_uniforms.conduction_kappa;
+        let theta_c = cell_temp(ix, iy, n_total) / max(U_uniforms.cooling_T_ref, 1.0e-30);
+        let kappa_par = U_uniforms.conduction_kappa * transport_scale_view(theta_c);
         let kappa_per = kappa_par * U_uniforms.conduction_iso_frac;
         // q_par along b̂; q_perp the component of ∇T orthogonal to b̂.
         let qpar_x = kappa_par * bhat_x * b_dot_gradT;
@@ -153,11 +155,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         qx = qx * sat;
         qy = qy * sat;
         v = sqrt(qx*qx + qy*qy);
-    } else {
+    } else if (mode == 7u) {
         // φ — Poisson potential. Reads the canonical phi buffer; with
         // the default even iters count, this is the final Jacobi
         // iterate from the most recent _encodeExtendedPhysics call.
         v = phi[idx_c];
+    } else {
+        let p = pressure_from_dual_energy(U0, U1, bx_c, by_c,
+                                          U_uniforms.gamma, U_uniforms.pressure_floor);
+        v = entropy_proxy(rho, p, U_uniforms.gamma, U_uniforms.pressure_floor);
     }
     field[idx_c] = v;
 }

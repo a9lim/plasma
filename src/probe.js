@@ -38,6 +38,7 @@ import { GHOST_WIDTH } from './config.js';
 
 const PROBE_HZ = 10;          // 100 ms readback interval
 const SPARK_CAP = 240;        // 24 seconds at 10 Hz
+const DUAL_ENERGY_FRACTION = 1e-3;
 
 const FIELDS = [
     { id: 'rho',  label: 'ρ' },
@@ -48,6 +49,7 @@ const FIELDS = [
     { id: 'by',   label: 'B_y' },
     { id: 'bz',   label: 'B_z' },
     { id: 'p',    label: 'p' },
+    { id: 'entropy', label: 'K' },
     { id: 'beta', label: 'β' },
     { id: 'jz',   label: 'J_z' },
     { id: 'vort', label: 'ω' },
@@ -58,6 +60,15 @@ function el(tag, cls, text) {
     if (cls) e.className = cls;
     if (text !== undefined) e.textContent = text;
     return e;
+}
+
+function pressureFromDualEnergy({ E, eAux, ke, mb, gammaM1, pFloor }) {
+    const ethFloor = pFloor / Math.max(gammaM1, 1e-6);
+    const ethTotal = E - ke - mb;
+    const totalOk = Number.isFinite(ethTotal)
+        && ethTotal > Math.max(ethFloor, DUAL_ENERGY_FRACTION * Math.max(Math.abs(E), ethFloor));
+    const eth = totalOk ? ethTotal : Math.max(eAux, ethFloor);
+    return Math.max(gammaM1 * eth, pFloor);
 }
 
 export class Probe {
@@ -353,7 +364,17 @@ export class Probe {
 
         const ke = 0.5 * rho * (vx * vx + vy * vy + vz * vz);
         const mb = 0.5 * (Bx * Bx + By * By + Bz * Bz);
-        const p  = Math.max((this.sim.gamma - 1) * (c.U1[0] - ke - mb), 1e-12);
+        const gammaM1 = this.sim.gamma - 1;
+        const pFloor = this.sim.pressureFloor ?? 1e-6;
+        const p = pressureFromDualEnergy({
+            E: c.U1[0],
+            eAux: c.U1[2],
+            ke,
+            mb,
+            gammaM1,
+            pFloor,
+        });
+        const entropy = p / Math.pow(rho, this.sim.gamma);
         const beta = 2 * p / Math.max(2 * mb, 1e-12);
 
         // J_z and vorticity require neighbours.
@@ -407,6 +428,7 @@ export class Probe {
         this._refs.by.textContent   = fmtFx(By);
         this._refs.bz.textContent   = fmtFx(Bz);
         this._refs.p.textContent    = fmtFx(p);
+        this._refs.entropy.textContent = fmt(entropy);
         this._refs.beta.textContent = fmt(beta);
         this._refs.jz.textContent   = fmtFx(jz);
         this._refs.vort.textContent = fmtFx(vort);
@@ -417,7 +439,7 @@ export class Probe {
         this._refs.pos.textContent = `(${x.toFixed(3)}, ${y.toFixed(3)})`;
 
         // Push selected field into sparkline.
-        const fieldVal = ({ rho, vx, vy, vz, bx: Bx, by: By, bz: Bz, p, beta, jz, vort })[this._sparkField];
+        const fieldVal = ({ rho, vx, vy, vz, bx: Bx, by: By, bz: Bz, p, entropy, beta, jz, vort })[this._sparkField];
         pushSparkSample(this._spark, fieldVal);
         this._drawSpark();
     }

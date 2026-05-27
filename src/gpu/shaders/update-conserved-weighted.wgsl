@@ -192,6 +192,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Bz: zero if non-finite.
     let bz = select(0.0, u1_raw.y, u1_raw.y == u1_raw.y);
 
+    let eth_aux = max(u1_raw.z, U_uniforms.pressure_floor / max(U_uniforms.gamma - 1.0, 1.0e-6));
+    let p_aux = max((U_uniforms.gamma - 1.0) * eth_aux, U_uniforms.pressure_floor);
+
     U0_out[idx_c] = vec4<f32>(rho, mx, my, mz);
-    U1_out[idx_c] = vec4<f32>(E, bz, 0.0, 0.0);
+    U1_out[idx_c] = vec4<f32>(E, bz, eth_aux,
+                              entropy_proxy(rho, p_aux, U_uniforms.gamma, U_uniforms.pressure_floor));
 }

@@ -56,8 +56,10 @@ import {
     VIEW_JZ, ETA_DEFAULT, BC_PERIODIC, CFL, PRESSURE_FLOOR,
     LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, DT_MAX,
     FLAG_GRAVITY_SELF, FLAG_HALL, FLAG_CONDUCTION,
+    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY,
     BASE_PHYSICS_FLAGS, EXTENDED_SOURCE_FLAGS,
-    EMF_MODE_GS_UPWIND, COOLING_CURVE_TABLE,
+    EMF_MODE_GS_UPWIND, COOLING_CURVE_TABULATED,
+    GEOMETRY_CARTESIAN,
 } from './config.js';
 
 const WG = WORKGROUP;
@@ -69,7 +71,7 @@ const DEFAULT_PHYSICS_STATE = Object.freeze({
     coolingLambda0: 0.01,
     coolingTFloor: 1.0e-4,
     coolingTRef: 1.0,
-    coolingCurveMode: COOLING_CURVE_TABLE,
+    coolingCurveMode: COOLING_CURVE_TABULATED,
     conductionKappa: 1.0e-3,
     conductionIsoFrac: 0.1,
     conductionSatFrac: 0.0,
@@ -78,6 +80,26 @@ const DEFAULT_PHYSICS_STATE = Object.freeze({
     gravityG: 1.0e-3,
     gravityPoissonIters: 30,
     hallElectronPressureFrac: 0.0,
+    coolingMetallicity: 1.0,
+    heatingGamma0: 0.0,
+    heatingDensityExp: 1.0,
+    heatingTCut: 0.0,
+    ambipolarEta: 0.0,
+    biermannCoeff: 0.0,
+    neutralFrac: 0.0,
+    ionizationT0: 1.0,
+    viscosityNu: 0.0,
+    viscosityBulk: 0.0,
+    viscosityAnisoFrac: 0.0,
+    viscosityShock: 0.0,
+    sourceSubstepsMax: 8,
+    geometryMode: GEOMETRY_CARTESIAN,
+    geometryRMin: 0.0,
+    gravitySoftening: 0.0,
+    gravityPoissonOmega: 1.0,
+    spongeWidth: 0.0,
+    spongeStrength: 0.0,
+    coolingTableMix: 0.0,
 });
 
 export class Sim {
@@ -129,6 +151,8 @@ export class Sim {
         this._lastHallSubsteps = 1;
         this._lastCondSpeedMax = 0;
         this._lastCondSubsteps = 1;
+        this._lastViscSubsteps = 1;
+        this._lastNonidealSubsteps = 1;
         this._lastSuperStepS   = 1;
         this._dtReadbackBusy   = false;
         this._dtReadbackPool   = null;  // lazy-init in init()
@@ -235,6 +259,26 @@ export class Sim {
         if (physics.hallElectronPressureFrac !== undefined) {
             this.hallElectronPressureFrac = Math.min(1, Math.max(0, +physics.hallElectronPressureFrac || 0));
         }
+        if (physics.coolingMetallicity !== undefined) this.coolingMetallicity = Math.max(0, +physics.coolingMetallicity || 0);
+        if (physics.heatingGamma0 !== undefined)      this.heatingGamma0 = Math.max(0, +physics.heatingGamma0 || 0);
+        if (physics.heatingDensityExp !== undefined)  this.heatingDensityExp = Math.max(0, +physics.heatingDensityExp || 0);
+        if (physics.heatingTCut !== undefined)        this.heatingTCut = Math.max(0, +physics.heatingTCut || 0);
+        if (physics.ambipolarEta !== undefined)       this.ambipolarEta = Math.max(0, +physics.ambipolarEta || 0);
+        if (physics.biermannCoeff !== undefined)      this.biermannCoeff = +physics.biermannCoeff || 0;
+        if (physics.neutralFrac !== undefined)        this.neutralFrac = Math.min(1, Math.max(0, +physics.neutralFrac || 0));
+        if (physics.ionizationT0 !== undefined)       this.ionizationT0 = Math.max(1e-30, +physics.ionizationT0 || 1);
+        if (physics.viscosityNu !== undefined)        this.viscosityNu = Math.max(0, +physics.viscosityNu || 0);
+        if (physics.viscosityBulk !== undefined)      this.viscosityBulk = Math.max(0, +physics.viscosityBulk || 0);
+        if (physics.viscosityAnisoFrac !== undefined) this.viscosityAnisoFrac = Math.min(1, Math.max(0, +physics.viscosityAnisoFrac || 0));
+        if (physics.viscosityShock !== undefined)     this.viscosityShock = Math.max(0, +physics.viscosityShock || 0);
+        if (physics.sourceSubstepsMax !== undefined)  this.sourceSubstepsMax = Math.max(1, physics.sourceSubstepsMax | 0);
+        if (physics.geometryMode !== undefined)       this.geometryMode = Math.max(0, physics.geometryMode | 0);
+        if (physics.geometryRMin !== undefined)       this.geometryRMin = Math.max(0, +physics.geometryRMin || 0);
+        if (physics.gravitySoftening !== undefined)   this.gravitySoftening = Math.max(0, +physics.gravitySoftening || 0);
+        if (physics.gravityPoissonOmega !== undefined) this.gravityPoissonOmega = Math.min(1.95, Math.max(0.05, +physics.gravityPoissonOmega || 1));
+        if (physics.spongeWidth !== undefined)        this.spongeWidth = Math.max(0, +physics.spongeWidth || 0);
+        if (physics.spongeStrength !== undefined)     this.spongeStrength = Math.max(0, +physics.spongeStrength || 0);
+        if (physics.coolingTableMix !== undefined)    this.coolingTableMix = Math.max(0, +physics.coolingTableMix || 0);
     }
 
     loadPreset(preset) {
@@ -269,6 +313,8 @@ export class Sim {
         this._lastHallSubsteps = 1;
         this._lastCondSpeedMax = 0;
         this._lastCondSubsteps = 1;
+        this._lastViscSubsteps = 1;
+        this._lastNonidealSubsteps = 1;
         this._pendingTimeSteps = 0;
         this._pushUniforms();
         this.buffers.pushBC(this.bcConfig);
@@ -373,6 +419,7 @@ export class Sim {
             case 5: this.viewMin = 0.0;  this.viewMax = 1.0;  break; // T (p/ρ)
             case 6: this.viewMin = 0.0;  this.viewMax = 1.0e-3; break; // |q| (κ_∥·dT/dx scale)
             case 7: this.viewMin = -5e-3; this.viewMax = 5e-3; break; // φ (signed)
+            case 8: this.viewMin = 0.0; this.viewMax = 1.0; break; // entropy proxy
             default: break;
         }
         this._pushUniforms();
@@ -402,6 +449,25 @@ export class Sim {
     setGravityG(v)               { this.gravityG = Math.max(0, +v || 0); this._pushUniforms(); }
     setGravityVec(gx, gy)        { this.gravityGx = +gx || 0; this.gravityGy = +gy || 0; this._pushUniforms(); }
     setGravityPoissonIters(n)    { this.gravityPoissonIters = Math.max(0, n | 0); this._pushUniforms(); }
+    setCoolingMetallicity(v)     { this.coolingMetallicity = Math.max(0, +v || 0); this._pushUniforms(); }
+    setHeatingGamma0(v)          { this.heatingGamma0 = Math.max(0, +v || 0); this._pushUniforms(); }
+    setHeatingDensityExp(v)      { this.heatingDensityExp = Math.max(0, +v || 0); this._pushUniforms(); }
+    setHeatingTCut(v)            { this.heatingTCut = Math.max(0, +v || 0); this._pushUniforms(); }
+    setAmbipolarEta(v)           { this.ambipolarEta = Math.max(0, +v || 0); this._pushUniforms(); }
+    setBiermannCoeff(v)          { this.biermannCoeff = +v || 0; this._pushUniforms(); }
+    setNeutralFrac(v)            { this.neutralFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
+    setIonizationT0(v)           { this.ionizationT0 = Math.max(1e-30, +v || 1); this._pushUniforms(); }
+    setViscosityNu(v)            { this.viscosityNu = Math.max(0, +v || 0); this._pushUniforms(); }
+    setViscosityBulk(v)          { this.viscosityBulk = Math.max(0, +v || 0); this._pushUniforms(); }
+    setViscosityAnisoFrac(v)     { this.viscosityAnisoFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
+    setViscosityShock(v)         { this.viscosityShock = Math.max(0, +v || 0); this._pushUniforms(); }
+    setSourceSubstepsMax(n)      { this.sourceSubstepsMax = Math.max(1, n | 0); this._pushUniforms(); }
+    setGeometryMode(mode)        { this.geometryMode = Math.max(0, mode | 0); this._pushUniforms(); }
+    setGeometryRMin(v)           { this.geometryRMin = Math.max(0, +v || 0); this._pushUniforms(); }
+    setGravitySoftening(v)       { this.gravitySoftening = Math.max(0, +v || 0); this._pushUniforms(); }
+    setGravityPoissonOmega(v)    { this.gravityPoissonOmega = Math.min(1.95, Math.max(0.05, +v || 1)); this._pushUniforms(); }
+    setSpongeWidth(v)            { this.spongeWidth = Math.max(0, +v || 0); this._pushUniforms(); }
+    setSpongeStrength(v)         { this.spongeStrength = Math.max(0, +v || 0); this._pushUniforms(); }
 
     setRunning(r)       { this.running = !!r; }
     setSpeedScale(s)    { this.speedScale = s; }
@@ -494,6 +560,26 @@ export class Sim {
                 gravityG: this.gravityG,
                 gravityPoissonIters: this.gravityPoissonIters,
                 hallElectronPressureFrac: this.hallElectronPressureFrac,
+                coolingMetallicity: this.coolingMetallicity,
+                heatingGamma0: this.heatingGamma0,
+                heatingDensityExp: this.heatingDensityExp,
+                heatingTCut: this.heatingTCut,
+                ambipolarEta: this.ambipolarEta,
+                biermannCoeff: this.biermannCoeff,
+                neutralFrac: this.neutralFrac,
+                ionizationT0: this.ionizationT0,
+                viscosityNu: this.viscosityNu,
+                viscosityBulk: this.viscosityBulk,
+                viscosityAnisoFrac: this.viscosityAnisoFrac,
+                viscosityShock: this.viscosityShock,
+                sourceSubstepsMax: this.sourceSubstepsMax,
+                geometryMode: this.geometryMode,
+                geometryRMin: this.geometryRMin,
+                gravitySoftening: this.gravitySoftening,
+                gravityPoissonOmega: this.gravityPoissonOmega,
+                spongeWidth: this.spongeWidth,
+                spongeStrength: this.spongeStrength,
+                coolingTableMix: this.coolingTableMix,
             },
         });
     }
@@ -553,6 +639,26 @@ export class Sim {
             gravityG:            this.gravityG,
             gravityPoissonIters: this.gravityPoissonIters,
             hallElectronPressureFrac: this.hallElectronPressureFrac,
+            coolingMetallicity: this.coolingMetallicity,
+            heatingGamma0: this.heatingGamma0,
+            heatingDensityExp: this.heatingDensityExp,
+            heatingTCut: this.heatingTCut,
+            ambipolarEta: this.ambipolarEta,
+            biermannCoeff: this.biermannCoeff,
+            neutralFrac: this.neutralFrac,
+            ionizationT0: this.ionizationT0,
+            viscosityNu: this.viscosityNu,
+            viscosityBulk: this.viscosityBulk,
+            viscosityAnisoFrac: this.viscosityAnisoFrac,
+            viscosityShock: this.viscosityShock,
+            sourceSubstepsMax: this.sourceSubstepsMax,
+            geometryMode: this.geometryMode,
+            geometryRMin: this.geometryRMin,
+            gravitySoftening: this.gravitySoftening,
+            gravityPoissonOmega: this.gravityPoissonOmega,
+            spongeWidth: this.spongeWidth,
+            spongeStrength: this.spongeStrength,
+            coolingTableMix: this.coolingTableMix,
             physicsFlags:        this.physicsFlags,
             emfMode:             this.emfMode,
         });
@@ -1360,6 +1466,7 @@ export class Sim {
                 { binding: 3, resource: { buffer: Bx } },
                 { binding: 4, resource: { buffer: By } },
                 { binding: 5, resource: { buffer: b.dt } },
+                { binding: 6, resource: { buffer: b.microphysics } },
             ],
         });
     }
@@ -1380,7 +1487,7 @@ export class Sim {
         });
     }
 
-    _gravityBG(U0, U1, phi) {
+    _gravityBG(U0, U1, phi, Bx, By) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.applyGravity.bg',
@@ -1391,6 +1498,8 @@ export class Sim {
                 { binding: 2, resource: { buffer: U1 } },
                 { binding: 3, resource: { buffer: phi } },
                 { binding: 4, resource: { buffer: b.dt } },
+                { binding: 5, resource: { buffer: Bx } },
+                { binding: 6, resource: { buffer: By } },
             ],
         });
     }
@@ -1412,6 +1521,7 @@ export class Sim {
                 // single macro Δt. Mirror of the Hall sub-cycle pattern.
                 { binding: 5, resource: { buffer: b.cond_dt } },
                 { binding: 6, resource: { buffer: b.conduction_dE } },
+                { binding: 7, resource: { buffer: b.microphysics } },
             ],
         });
     }
@@ -1437,6 +1547,77 @@ export class Sim {
         });
     }
 
+    _nonidealBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyNonideal.bg',
+            layout: this.pipelines.layouts.nonideal,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.nonideal_dt } },
+                { binding: 6, resource: { buffer: b.nonideal_E } },
+            ],
+        });
+    }
+
+    _ohmBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyOhm.bg',
+            layout: this.pipelines.layouts.ohm,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.nonideal_dt } },
+                { binding: 6, resource: { buffer: b.nonideal_E } },
+                { binding: 7, resource: { buffer: b.hall_E } },
+                { binding: 8, resource: { buffer: b.hall_mb0 } },
+                { binding: 9, resource: { buffer: b.microphysics } },
+            ],
+        });
+    }
+
+    _viscosityBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyViscosity.bg',
+            layout: this.pipelines.layouts.viscosity,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.visc_dt } },
+                { binding: 6, resource: { buffer: b.viscosity_dU } },
+                { binding: 7, resource: { buffer: b.microphysics } },
+            ],
+        });
+    }
+
+    _geometryBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyGeometry.bg',
+            layout: this.pipelines.layouts.geometry,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.dt } },
+            ],
+        });
+    }
+
     _encodeApplyBcsDst(encoder, side, label) {
         const pass = encoder.beginComputePass({ label });
         const gTotalP1 = Math.ceil((this.n_total + 1) / WG);
@@ -1454,7 +1635,11 @@ export class Sim {
      * enabled this returns false without encoding. Numerical-only flags
      * (positivity, upwind EMF) are not treated as source physics here.
      */
-    _encodeExtendedPhysics(encoder, side, hallSubsteps = 1, condSubsteps = 1) {
+    _encodeExtendedPhysics(encoder, side,
+                           hallSubsteps = 1,
+                           condSubsteps = 1,
+                           viscSubsteps = 1,
+                           nonidealSubsteps = 1) {
         if ((this.physicsFlags & EXTENDED_SOURCE_FLAGS) === 0) return false;
         const b = this.buffers;
         const { pipelines } = this;
@@ -1500,7 +1685,7 @@ export class Sim {
         const pass = encoder.beginComputePass({ label: 'plasma.extendedPhysics' });
         // Gravity source — momentum + energy.
         pass.setPipeline(pipelines.pipelines.applyGravity);
-        pass.setBindGroup(0, this._gravityBG(handles.U0, handles.U1, gravityPhi));
+        pass.setBindGroup(0, this._gravityBG(handles.U0, handles.U1, gravityPhi, handles.Bx, handles.By));
         pass.dispatchWorkgroups(gInterior, gInterior, 1);
         // Cooling — local energy sink.
         pass.setPipeline(pipelines.pipelines.applyCooling);
@@ -1520,25 +1705,39 @@ export class Sim {
             pass.setPipeline(pipelines.pipelines.applyConductionDelta);
             pass.dispatchWorkgroups(gInterior, gInterior, 1);
         }
-        // Hall correction — frozen corner E, CT update, then total-energy
-        // repair. Session 15: sub-cycled with N_hall iterations using
-        // dt_sub from b.hall_dt (host-seeded before submit). The three
-        // dispatches per iteration share one bind group (hallBG) since
-        // hall_dt is bound at construction time. Iteration boundary is
-        // sequential within one compute pass — each iteration's
-        // compute_emf reads the previous iteration's apply_update output
-        // through the U0/U1/face-B storage, no cross-invocation reads
-        // within a single dispatch.
-        const hallBG = this._hallBG(handles.U0, handles.Bx, handles.By, handles.U1);
-        for (let h = 0; h < Math.max(1, hallSubsteps | 0); h++) {
-            pass.setPipeline(pipelines.pipelines.computeHallEmf);
-            pass.setBindGroup(0, hallBG);
-            pass.dispatchWorkgroups(gN1, gN1, 1);
-            pass.setPipeline(pipelines.pipelines.applyHall);
-            pass.dispatchWorkgroups(gN1, gN1, 1);
-            pass.setPipeline(pipelines.pipelines.repairHallEnergy);
+        // Viscosity — frozen velocity-gradient delta, then momentum/energy
+        // application. Sub-cycled from host-sized transport coefficient
+        // bounds rather than compute-dt to stay under the storage-binding cap.
+        const viscBG = this._viscosityBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        for (let v = 0; v < Math.max(1, viscSubsteps | 0); v++) {
+            pass.setPipeline(pipelines.pipelines.computeViscosityDelta);
+            pass.setBindGroup(0, viscBG);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+            pass.setPipeline(pipelines.pipelines.applyViscosityDelta);
             pass.dispatchWorkgroups(gInterior, gInterior, 1);
         }
+        // Unified generalized Ohm: Hall + ambipolar + Biermann are evaluated
+        // from one frozen state. Hall is applied and energy-repaired first;
+        // dissipative/non-barotropic terms are then applied without repair.
+        const ohmBG = this._ohmBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        const ohmSubsteps = Math.max(1, hallSubsteps | 0, nonidealSubsteps | 0);
+        for (let o = 0; o < ohmSubsteps; o++) {
+            pass.setPipeline(pipelines.pipelines.computeOhmEmf);
+            pass.setBindGroup(0, ohmBG);
+            pass.dispatchWorkgroups(gN1, gN1, 1);
+            pass.setPipeline(pipelines.pipelines.applyOhmHall);
+            pass.dispatchWorkgroups(gN1, gN1, 1);
+            pass.setPipeline(pipelines.pipelines.repairOhmHallEnergy);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+            pass.setPipeline(pipelines.pipelines.applyOhmDissipative);
+            pass.dispatchWorkgroups(gN1, gN1, 1);
+        }
+        // Cylindrical geometry + sponge layer. Runs late so source physics
+        // sees Cartesian conserved state, then the boundary environment can
+        // absorb the final source-updated momentum.
+        pass.setPipeline(pipelines.pipelines.applyGeometry);
+        pass.setBindGroup(0, this._geometryBG(handles.U0, handles.U1, handles.Bx, handles.By));
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
         // Any source can change pressure support; clamp once against the final B.
         pass.setPipeline(pipelines.pipelines.energyFloor);
         pass.setBindGroup(0, this._energyFloorBG(handles.U0, handles.U1, handles.Bx, handles.By));
@@ -1618,9 +1817,8 @@ export class Sim {
      * avoids the 10-binding cap reshuffling that proper RKL2 folding
      * would require.
      *
-     * Cap: the user-supplied `hallSubstepsMax` is reused as a shared
-     * sub-step ceiling for both Hall and conduction (since both expose
-     * similar runaway risks). Could split if needed.
+     * Cap: the shared source sub-step ceiling controls explicit transport
+     * loops; Hall keeps its own whistler-specific cap.
      */
     _conductionSizing(dtMacro) {
         if ((this.physicsFlags & FLAG_CONDUCTION) === 0) {
@@ -1631,8 +1829,55 @@ export class Sim {
         }
         const safety = 0.5;
         const ideal = dtMacro * this._lastCondSpeedMax / safety;
-        const maxN = Math.max(1, this.hallSubstepsMax | 0);
+        const maxN = this._sourceSubstepCap();
         const n = Math.min(maxN, Math.max(1, Math.ceil(ideal)));
+        return { nSubsteps: n, dtSub: dtMacro / n };
+    }
+
+    _sourceSubstepCap() {
+        return Math.max(1, (this.sourceSubstepsMax ?? this.hallSubstepsMax ?? 8) | 0);
+    }
+
+    _viscositySizing(dtMacro) {
+        if ((this.physicsFlags & FLAG_VISCOSITY) === 0) {
+            return { nSubsteps: 1, dtSub: dtMacro };
+        }
+        const nuEff = Math.max(this.viscosityNu || 0,
+                               this.viscosityBulk || 0,
+                               this.viscosityShock || 0);
+        if (nuEff <= 0 || dtMacro <= 0) return { nSubsteps: 1, dtSub: dtMacro };
+        const safety = 0.45;
+        const parabolicRate = 4.0 * nuEff / Math.max(this.dx * this.dx, 1e-30);
+        const ideal = dtMacro * parabolicRate / safety;
+        const n = Math.min(this._sourceSubstepCap(), Math.max(1, Math.ceil(ideal)));
+        return { nSubsteps: n, dtSub: dtMacro / n };
+    }
+
+    _nonidealSizing(dtMacro) {
+        const ambiOn = (this.physicsFlags & FLAG_AMBIPOLAR) !== 0
+                    && this.ambipolarEta > 0
+                    && this.neutralFrac > 0;
+        const biermannOn = (this.physicsFlags & FLAG_BIERMANN) !== 0
+                        && this.biermannCoeff !== 0
+                        && this.hallElectronPressureFrac > 0;
+        if (!ambiOn && !biermannOn) return { nSubsteps: 1, dtSub: dtMacro };
+
+        const ambiRate = ambiOn
+            ? 4.0 * this.ambipolarEta * Math.max(this.neutralFrac, 0)
+                / Math.max(this.dx * this.dx, 1e-30)
+            : 0.0;
+        // Biermann is a source rather than diffusion; use a conservative
+        // gradient-scale proxy so large coefficients get smaller explicit
+        // substeps without adding another storage reduction to compute-dt.
+        const batteryRate = biermannOn
+            ? Math.abs(this.biermannCoeff) / Math.max(this.dx, 1e-30)
+            : 0.0;
+        const rate = ambiRate + batteryRate;
+        if (rate <= 0 || dtMacro <= 0) return { nSubsteps: 1, dtSub: dtMacro };
+
+        const safety = 0.45;
+        const ideal = dtMacro * rate / safety;
+        const n = Math.min(this._sourceSubstepCap(), Math.max(1, Math.ceil(ideal)));
         return { nSubsteps: n, dtSub: dtMacro / n };
     }
 
@@ -1703,9 +1948,32 @@ export class Sim {
         }
         this._lastCondSubsteps = condSizing.nSubsteps;
 
+        const viscSizing = this._viscositySizing(this._lastDtHyp);
+        if ((this.physicsFlags & FLAG_VISCOSITY) !== 0) {
+            const viscDtSeed = new Float32Array([viscSizing.dtSub, 0, 0, 0]);
+            this.device.queue.writeBuffer(this.buffers.visc_dt, 0, viscDtSeed.buffer);
+        }
+        this._lastViscSubsteps = viscSizing.nSubsteps;
+
+        const nonidealSizing = this._nonidealSizing(this._lastDtHyp);
+        const ohmOn = (this.physicsFlags & (FLAG_HALL | FLAG_AMBIPOLAR | FLAG_BIERMANN)) !== 0;
+        const ohmSubsteps = ohmOn
+            ? Math.max(1, hallSizing.nSubsteps, nonidealSizing.nSubsteps)
+            : 1;
+        if (ohmOn) {
+            const nonidealDtSeed = new Float32Array([this._lastDtHyp / ohmSubsteps, 0, 0, 0]);
+            this.device.queue.writeBuffer(this.buffers.nonideal_dt, 0, nonidealDtSeed.buffer);
+        }
+        if ((this.physicsFlags & FLAG_HALL) !== 0 && this.hallDi > 0) {
+            this._lastHallSubsteps = ohmSubsteps;
+        }
+        this._lastNonidealSubsteps = ohmSubsteps;
+
         this._encodeExtendedPhysics(encoder, side,
                                     hallSizing.nSubsteps,
-                                    condSizing.nSubsteps);
+                                    condSizing.nSubsteps,
+                                    viscSizing.nSubsteps,
+                                    nonidealSizing.nSubsteps);
 
         // Pass 4: conservation diagnostics reduction over the just-
         // written destination state (stage 3 dst === U_next at this

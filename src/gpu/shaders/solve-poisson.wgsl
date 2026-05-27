@@ -113,5 +113,13 @@ fn iterate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let phi_u = phi_in[periodic_cell_idx_from_gid(gid.x, gy_u, n_interior, n_total, ghost)];
 
     let dx = U_uniforms.dx;
-    phi_out[c] = 0.25 * (phi_l + phi_r + phi_d + phi_u - dx * dx * rhs);
+    let softened = U_uniforms.gravity_softening > 0.0;
+    let soft2 = select(0.0,
+                       (dx / max(U_uniforms.gravity_softening, 1.0e-30))
+                     * (dx / max(U_uniforms.gravity_softening, 1.0e-30)),
+                       softened);
+    let jacobi = (phi_l + phi_r + phi_d + phi_u - dx * dx * rhs)
+               / max(4.0 + soft2, 1.0e-6);
+    let omega = clamp(U_uniforms.gravity_poisson_omega, 0.05, 1.95);
+    phi_out[c] = mix(phi_in[c], jacobi, omega);
 }

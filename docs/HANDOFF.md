@@ -2,7 +2,9 @@
 
 Sim built across one orchestration session (Claude as orchestrator, 6
 dispatched sub-agents for Phases 1–6). Engine, UI, and LIC
-visualization are in. Polish and parent-repo wiring remain.
+visualization are in. The Phase 7 docs / metadata slice is now in;
+pointer perturbation, OG art, broader live preset validation, and
+parent-repo wiring remain.
 
 This doc is next-instance / next-agent context for picking up where
 we left off. The implementation plan lives at
@@ -29,7 +31,7 @@ point at the corresponding `sessions/session-N.md`.
 | 6     | Animated LIC visualization                 | done     |
 | 7     | Polish (content, perturbation, JSON-LD, OG)| **partial** |
 | 8     | Parent-repo wiring                         | **todo** |
-| 9     | Extended physics (Hall, cooling, conduction, self-gravity, EMF toggle, positivity guard) | **partial** — see [Session 14](sessions/session-14.md), [Session 15](sessions/session-15.md), [Session 16](sessions/session-16.md), and the "Phase 9" section below |
+| 9     | Extended physics (Hall, cooling/heating, conduction, self-gravity, ambipolar/Biermann, viscosity, geometry, sponge, EMF toggle, positivity guard) | **partial** — see [Session 14](sessions/session-14.md), [Session 15](sessions/session-15.md), [Session 16](sessions/session-16.md), [Session 17](sessions/session-17.md), [Session 18](sessions/session-18.md), and the "Phase 9" section below |
 
 **Verification status**: OT live-verified at N=256 and N=1024 across
 the full η range up to 1.0 (Session 13 — the RKL2 substep-count fixes
@@ -37,7 +39,10 @@ make high-η OT smoothly diffusive instead of speckled). Harris ran
 clean through 400+ steps as of Session 12. Sod / Brio-Wu not yet
 retested after Sessions 2-13 — should be safe (Sod is pure hydro, no
 RKL2 path; Brio-Wu is η=0, no RKL2 path) but worth a smoke test.
-N=512 also not directly verified.
+N=512 also not directly verified. Session 18's large source-physics
+pass was syntax/import checked and browser-smoked at 256² with a
+nonblank rendered canvas, but that does not replace the per-preset
+validation matrix above.
 
 **Session 15 update**: the post-Session 14 caveat is gone. Canonical
 verification presets (Sod, Brio-Wu, OT, Harris, Alfvén CPAW, acoustic)
@@ -47,6 +52,20 @@ stack ships behind the new `orszag-tang-extended` preset. To exercise
 the breadth pass on a known IC, select that preset; to re-run the
 Session 13 baseline, select any of the canonical presets — no manual
 flag-zeroing needed.
+
+**Session 17 update**: the extended stack now has a second realism layer:
+CIE-inspired metallicity-scaled cooling plus optional heating, ambipolar
+diffusion, Biermann battery, explicit shear/bulk/shock viscosity,
+source-specific substep caps, weighted/softened Poisson, a cylindrical
+axisymmetric source layer, and a boundary sponge. Canonical presets still
+stay on `BASE_PHYSICS_FLAGS`; `orszag-tang-extended` opts into
+representative nonzero values except geometry/sponge, which remain manual.
+
+**Session 18 update**: the source stack now has a table-backed
+microphysics buffer, dual-energy pressure recovery, unified Hall +
+ambipolar + Biermann evaluation, dual-aware diagnostics, and a driven
+wind/cloud preset for open-boundary experiments. Canonical presets still
+stay on `BASE_PHYSICS_FLAGS`.
 
 ## Phase 7 — Polish
 
@@ -146,58 +165,40 @@ New shader `src/gpu/shaders/perturb.wgsl` + integration:
 * Mobile: hook through `shared-touch.js` for touch → pointer.
 * Transpiler-compatible (no fancy WGSL features needed).
 
-### 4. Voice content — about.md and edu-content
+### 4. Educational content — about.md and edu-content ✅
 
-Both need to land. Invoke the `/writing` skill — it has the prose
-voice rubric for a9lim's site copy.
+Landed after Session 18:
 
-* **`plasma/about.md`** — ~400 words, a9lim's prose voice. Mirror
-  geon's structure:
-  - What is plasma? (one paragraph framing — what MHD is, what the
-    sim shows)
-  - Physics (resistive 2.5D ideal MHD; mention HLLD / PPM / RK3 / CT
-    in passing)
-  - Presets (one paragraph each on OT, Harris, Brio-Wu, Sod)
-  - Numerical method (one paragraph)
-  - Accessibility (keyboard nav, contrast modes, ARIA — see geon's
-    about.md)
-  - Learning Outcomes (5–7 bullets: Alfvén waves, magnetic
-    reconnection, frozen-in-flux, current sheets, pressure balance,
-    plasma β)
-  - Prerequisites (linear algebra, partial differentiation, ideally
-    exposure to fluid dynamics or E&M)
-  - References (Stone 2008, Miyoshi-Kusano 2005, Colella-Woodward
-    1984, Gardiner-Stone 2005)
-
-* **`<details class="edu-content">`** in `index.html` — 500+ words
-  technical-reference register (NOT a9's prose voice — per parent
-  AGENTS.md, edu-content stays in technical doc register). Full MHD
-  equations, HLLD wave structure, RK3 weights, CT divergence
-  preservation argument, References with DOI, See-also links to
-  sibling sims.
-
-### 5. SEO — JSON-LD blocks
-
-Following parent AGENTS.md conventions. **CRITICAL**: every Wikidata
-QID and DOI must be verified against the live source before
-committing.
-
-* **WebApplication + LearningResource** with `teaches` (5 plasma
-  concepts), `about` array with Wikidata entities (verify each):
-  - Magnetohydrodynamics (Q133143 — verify)
-  - Plasma (physics) (Q10251 — verify)
-  - Magnetic reconnection (Q579070 — verify)
-  - Alfvén wave (Q495186 — verify)
-  - Orszag-Tang vortex (verify or omit if no entity exists)
-* `isBasedOn`: Miyoshi-Kusano DOI, Stone+ Athena++ DOI,
-  Colella-Woodward DOI (verify via `https://api.crossref.org/works/<doi>`).
-* `educationalAlignment`: 3+ standards (AP Physics C: E&M, NGSS
-  HS-PS3, professional IAS/AAS plasma curriculum) with `targetUrl`
+* **`plasma/about.md`** now has a 400+ word technical overview with
+  model scope, presets, numerical method, accessibility, learning
+  outcomes, prerequisites, and DOI-backed references.
+* **`<details class="edu-content">`** in `index.html` now has 500+
+  words of crawlable technical-reference content: equations / model
+  scope, HLLD / PPM / RK3 / CT notes, source-physics caveats,
+  diagnostics, accessibility, DOI-backed references, and sibling
   links.
-* `FAQPage` — 5–7 domain-specific Qs.
-* `HowTo` — 5 steps.
-* `BreadcrumbList`.
-* All entities with `@id` URIs.
+* Note: the parent `AGENTS.md` and the writing skill both exclude sim
+  `about.md` / edu-content from a9-voice rewriting. These docs stay in
+  technical-reference register.
+
+### 5. SEO — JSON-LD blocks ✅
+
+Landed after Session 18:
+
+* `index.html` now ships `WebApplication` + `LearningResource`,
+  `FAQPage`, `BreadcrumbList`, and `HowTo` JSON-LD in one `@graph`.
+* Verified Wikidata IDs used:
+  - magnetohydrodynamics: `Q2549249`
+  - plasma: `Q10251`
+  - magnetic reconnection: `Q287506`
+  - Alfven wave: `Q645813`
+* Verified DOIs used:
+  - Miyoshi-Kusano HLLD: `10.1016/j.jcp.2005.02.017`
+  - Gardiner-Stone CT: `10.1016/j.jcp.2004.11.016`
+  - Athena MHD: `10.1086/588755`
+  - Colella-Woodward PPM: `10.1016/0021-9991(84)90143-8`
+* Educational alignments now point at verified reachable NGSS, AP
+  Physics C: E&M, and AAPT undergraduate laboratory guidance URLs.
 
 ### 6. OG image
 
@@ -220,10 +221,10 @@ end of `loop()`, so once `visibilitychange` flips it the rAF chain dies
 after one more frame. Unhide resets `lastTime` and reschedules. Comment
 in `main.js` documents the contract._
 
-### 8. Sim metadata bump
+### 8. Sim metadata bump ✅
 
-Update `dateModified` in JSON-LD and `lastUpdated` config in
-`initAboutPanel`.
+`dateModified` in JSON-LD and `lastUpdated` in `initAboutPanel` are
+both `2026-05-27` for the Session 18 docs / metadata refresh.
 
 ## Phase 8 — Parent-repo wiring
 
@@ -299,9 +300,10 @@ context) can plug in:
 
 ## Things worth flagging for the next instance
 
-* **Don't skip live verification.** Six static-trace verification
-  passes is good, but the engine has never actually run. Phase 7
-  step 1 matters — do it first.
+* **Don't skip broad live verification.** Session 18 rendered
+  nonblank in-browser after the source-physics pass, but the full
+  preset / resolution / stats / probe validation matrix is still the
+  next meaningful gate.
 
 * **The agent reports embedded in each phase commit message are
   useful context for debugging.** Each Phase agent flagged its
@@ -314,9 +316,9 @@ context) can plug in:
   no textures, no exotic types). The Phase 6 agent's transpiler
   audit table is the working pattern.
 
-* **Voice content needs the `/writing` skill.** `about.md` is in
-  a9's voice per parent AGENTS.md "Prose Voice" section.
-  edu-content stays in technical-reference register.
+* **Sim docs are technical-reference register.** Parent `AGENTS.md`
+  excludes sim `about.md` and `<details class="edu-content">` from the
+  a9-voice writing workflow; keep them factual, direct, and current.
 
 * **Wikidata QIDs and DOIs MUST be verified against the live
   source.** 88% hallucination rate per parent AGENTS.md. Use the
@@ -351,9 +353,13 @@ splits, real Poisson reduction, BC consistency, per-preset opt-in.
 Session 16 made a targeted realism pass: saturated heat flux,
 piecewise exact cooling, an optional electron-pressure Hall term,
 sub-step diagnostics, and higher-order self-gravity force recovery.
-The remaining work is now the heavier physics architecture:
-HDS vs sub-cycling for Hall, RKL2 for large conduction workloads,
-vetted cooling data, and stronger geometry/gravity solvers.
+Session 17 extended that into partial-ionization, transport, heating,
+geometry, and boundary realism. Session 18 added tabulated microphysics,
+dual-energy recovery, a unified generalized-Ohm layer, and a driven
+wind/cloud boundary preset. The remaining work is now the heavier physics
+architecture: HDS vs sub-cycling for Hall/non-ideal terms, RKL2 for large
+conduction/viscosity workloads, externally-vetted microphysics tables, and
+full r-weighted geometry/gravity solvers.
 
 ### 1. Validation presets and view modes ✅ (Session 15)
 
@@ -440,10 +446,13 @@ cooling curve with exact per-segment integration. The table includes a
 low-temperature rise, line-cooling peak, trough, and high-temperature
 bremsstrahlung tail.
 
-This is the right numerical shape, but the baked-in table is still a
-toy curve. The next realism step is a vetted metallicity-dependent
-cooling table uploaded once at init rather than hard-coded WGSL
-constants.
+Session 17 adds `cooling_curve_mode = 2`, a broader CIE-inspired
+metallicity-scaled table, plus a density-law volumetric heating term.
+Session 18 adds `cooling_curve_mode = 3`, sourced from the uploaded
+microphysics storage table rather than hard-coded WGSL constants. The
+default table is still a compact code-unit fit; the next realism step is
+loading a vetted metallicity-dependent cooling/heating data product into
+the same buffer contract.
 
 ### 6. Real ρ̄ reduction for Poisson ✅ (Session 15 — Codex pass)
 
@@ -476,17 +485,31 @@ an optional electron-pressure term, so the corner EMF is now
 Conduction got the same frozen-state treatment (`compute_delta` +
 `apply_delta` with the `conduction_dE` scratch buffer).
 
+Session 18 supersedes the separate Hall/non-ideal dispatch path for the
+main step with `apply-ohm.wgsl`: `compute_emf` evaluates Hall,
+ambipolar, and Biermann from one frozen state, `apply_hall_update` +
+`repair_hall_energy` handles the nondissipative Hall part, and
+`apply_dissipative_update` then applies ambipolar/Biermann at fixed total
+energy so magnetic diffusion heats/cools the gas through the conserved
+energy budget. The older `apply-hall.wgsl` / `apply-nonideal.wgsl`
+modules still compile as legacy/reference kernels.
+
 ### 8. UI surface
 
 Sliders + toggles in the advanced settings dropdown:
 * "Hall d_i" log slider, with snap-to-0
 * "Hall p_e / p" linear slider
 * "Cooling Λ_0" log slider, snap-to-0
-* Cooling-curve mode group (piecewise table / brems)
+* Cooling-curve mode group (uploaded table / CIE / piecewise table / brems)
+* Metallicity, heating Γ, heating density exponent, heating T cutoff
 * "Conduction κ_∥" log slider, snap-to-0
 * "Conduction κ_⊥/κ_∥" linear 0–1
 * "q_sat φ" linear slider for the Cowie-McKee saturation limiter
+* Viscosity ν, bulk viscosity, B-aligned fraction, shock viscosity
+* Ambipolar η_A, neutral fraction, ionization T₀, Biermann C_B
 * "Self-gravity G" log slider, snap-to-0
+* Poisson iterations, gravity softening, Jacobi ω
+* Geometry mode, r-axis guard, sponge width/strength, source substep cap
 * Mode group for EMF mode (BS / GS upwind)
 * Toggle row for positivity guard
 
@@ -537,6 +560,21 @@ What landed:
   remain future work.
 * **Diagnostics:** Stats show the last Hall and conduction sub-cycle
   counts, so stiff regimes are visible instead of hidden in the step.
+
+### 12. Session 18 microphysics / dual-energy pass
+
+What landed:
+
+* **Microphysics:** `src/microphysics.js` builds an uploaded table used
+  by tabulated cooling, neutral fraction, and transport scaling.
+* **Dual energy:** `U1.zw` carry internal energy and entropy proxy; GPU
+  primitive recovery plus CPU stats/probe paths now use the same fallback
+  pressure logic.
+* **Unified Ohm:** `apply-ohm.wgsl` replaces the main-step split between
+  Hall and non-ideal kernels with one frozen generalized-Ohm evaluation.
+* **Open-boundary preset:** `driven-wind-cloud` exercises a driven west
+  inflow, NSCBC outflow, tabulated cooling/heating, conduction, Hall,
+  ambipolar/Biermann, and viscosity in one scenario.
 
 ## References
 

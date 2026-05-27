@@ -224,7 +224,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // E (u1.x) has L_E = 0 ⇒ Y_j.E = U^n.E for all j. Write U^n.E
         // directly from frozen U1_init; ALSO defends against U1_tmp's
         // stale-buffer contamination on substep 1 (Session 9 fix).
-        U1_tmp[c] = vec4<f32>(U1_init[c].x, bz_new, 0.0, 0.0);
+        U1_tmp[c] = vec4<f32>(U1_init[c].x, bz_new, U1_init[c].z, U1_init[c].w);
     }
 
     // ── Bx_face: ∂_t Bx = −∂_y(η J_z) ──────────────────────────────

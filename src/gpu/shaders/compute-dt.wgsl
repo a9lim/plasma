@@ -65,6 +65,14 @@ var<workgroup> tile_max_eta:  atomic<u32>;
 var<workgroup> tile_max_hall: atomic<u32>;
 var<workgroup> tile_max_cond: atomic<u32>;
 
+fn transport_scale_dt(theta: f32) -> f32 {
+    // Mirrors the default uploaded microphysics transport family
+    // (Spitzer/Braginskii T^(5/2)). compute-dt is already at the storage
+    // binding ceiling, so the stability estimate uses the analytic default
+    // rather than binding the table directly.
+    return pow(max(theta, 1.0e-30), 2.5);
+}
+
 // |J_z(ix, iy)| from face B — same recipe as view-field and the
 // resistivity passes. Reads ix±1 / iy±1; caller must guarantee range.
 fn jz_mag_at(ix: u32, iy: u32, n_total: u32, dx_inv: f32) -> f32 {
@@ -147,10 +155,12 @@ fn reduce(
         // hyperbolic CFL, while conduction runs N_cond times with
         // dt_sub = dt_macro / N_cond.
         // 2D explicit heat diffusion bound: dt ≤ dx² / (4χ),
-        // χ = (γ-1)·κ/ρ. As an equivalent speed: 4χ/dx.
+        // χ = (γ-1)·κ(T)/ρ. As an equivalent speed: 4χ/dx.
         if (flag_set(flags, FLAG_CONDUCTION) && U_uniforms.conduction_kappa > 0.0) {
+            let theta = (P.p / rho) / max(U_uniforms.cooling_T_ref, 1.0e-30);
+            let kappa_T = U_uniforms.conduction_kappa * transport_scale_dt(theta);
             let chi = max(U_uniforms.gamma - 1.0, 1.0e-6)
-                    * U_uniforms.conduction_kappa / rho;
+                    * kappa_T / rho;
             let s_cond = 4.0 * chi / max(dx, 1.0e-30);
             let s_cond_safe = select(0.0, s_cond, s_cond >= 0.0 && s_cond == s_cond);
             atomicMax(&tile_max_cond, bitcast<u32>(s_cond_safe));

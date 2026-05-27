@@ -23,6 +23,8 @@
 //   2 U1       (rw) — energy gets ρ·v·g·dt added
 //   3 phi      (ro) — self-gravity potential (zero if FLAG_GRAVITY_SELF off)
 //   4 dt_buf   (uniform)
+//   5 Bx_face  (ro)
+//   6 By_face  (ro)
 
 struct DtUniform {
     dt: f32, _pad0: f32, _pad1: f32, _pad2: f32,
@@ -33,11 +35,23 @@ struct DtUniform {
 @group(0) @binding(2) var<storage, read_write> U1:         array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read>       phi:        array<f32>;
 @group(0) @binding(4) var<uniform>             dt_buf:     DtUniform;
+@group(0) @binding(5) var<storage, read>       Bx_face:    array<f32>;
+@group(0) @binding(6) var<storage, read>       By_face:    array<f32>;
 
 fn phi_at(gx: u32, gy: u32, n_interior: u32, n_total: u32, ghost: u32) -> f32 {
     let ix = ghost + (gx % n_interior);
     let iy = ghost + (gy % n_interior);
     return phi[cell_idx_total(ix, iy, n_total)];
+}
+
+fn cell_bx_grav(ix: u32, iy: u32, n_total: u32) -> f32 {
+    return 0.5 * (Bx_face[bx_face_idx(ix,      iy, n_total)]
+                + Bx_face[bx_face_idx(ix + 1u, iy, n_total)]);
+}
+
+fn cell_by_grav(ix: u32, iy: u32, n_total: u32) -> f32 {
+    return 0.5 * (By_face[by_face_idx(ix, iy,      n_total)]
+                + By_face[by_face_idx(ix, iy + 1u, n_total)]);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -102,6 +116,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vy_mid = vy + 0.5 * gy * dt;
     let dE = rho * (vx_mid * gx + vy_mid * gy) * dt;
 
-    U0[c] = vec4<f32>(u0.x, u0.y + dpx, u0.z + dpy, u0.w);
-    U1[c] = vec4<f32>(u1.x + dE, u1.y, u1.z, u1.w);
+    let u0_new = vec4<f32>(u0.x, u0.y + dpx, u0.z + dpy, u0.w);
+    let E_new = u1.x + dE;
+    let bx = cell_bx_grav(ix, iy, n_total);
+    let by = cell_by_grav(ix, iy, n_total);
+    let p_new = pressure_from_dual_energy(
+        u0_new,
+        vec4<f32>(E_new, u1.y, u1.z, u1.w),
+        bx,
+        by,
+        U_uniforms.gamma,
+        U_uniforms.pressure_floor,
+    );
+
+    U0[c] = u0_new;
+    U1[c] = pack_u1_aux(E_new, u1.y, max(u0_new.x, DENSITY_FLOOR), p_new,
+                         U_uniforms.gamma, U_uniforms.pressure_floor);
 }

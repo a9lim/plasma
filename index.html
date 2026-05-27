@@ -47,26 +47,223 @@
     <script defer src="/shared-about.js"></script>
     <script type="module" src="main.js"></script>
 
-    <!-- Phase 5 ships a placeholder JSON-LD stub; full SEO content lands in Phase 7. -->
     <script type="application/ld+json">
     {
       "@context": "https://schema.org",
-      "@type": ["WebApplication", "LearningResource"],
-      "name": "Plasma",
-      "url": "https://a9l.im/plasma",
-      "description": "Interactive 2D resistive magnetohydrodynamics simulator with HLLD Riemann solver, PPM reconstruction, RK3 SSP time integration, and constrained-transport divergence cleaning.",
-      "applicationCategory": "EducationalApplication",
-      "learningResourceType": "Simulation",
-      "operatingSystem": "Any (Web Browser with WebGPU)",
-      "browserRequirements": "Modern browser with WebGPU support",
-      "license": "https://www.gnu.org/licenses/agpl-3.0.html",
-      "inLanguage": "en",
-      "interactivityType": "active",
-      "author": {
-        "@type": "Person",
-        "name": "a9lim",
-        "url": "https://a9l.im/#about"
-      }
+      "@graph": [
+        {
+          "@type": ["WebApplication", "LearningResource"],
+          "@id": "https://a9l.im/plasma#app",
+          "name": "Plasma",
+          "url": "https://a9l.im/plasma",
+          "description": "Interactive 2D resistive magnetohydrodynamics simulator with HLLD Riemann solver, PPM reconstruction, RK3 SSP time integration, constrained-transport divergence cleaning, tabulated microphysics, and optional nonideal source physics.",
+          "applicationCategory": "EducationalApplication",
+          "learningResourceType": "Simulation",
+          "operatingSystem": "Any modern browser with WebGPU",
+          "browserRequirements": "Requires WebGPU support",
+          "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+          "codeRepository": "https://github.com/a9lim/plasma",
+          "inLanguage": "en",
+          "interactivityType": "active",
+          "datePublished": "2026-05-24",
+          "dateModified": "2026-05-27",
+          "author": {
+            "@type": "Person",
+            "name": "a9lim",
+            "url": "https://a9l.im/#about"
+          },
+          "teaches": [
+            "resistive magnetohydrodynamics",
+            "constrained transport",
+            "magnetic reconnection",
+            "Alfven waves",
+            "anisotropic plasma transport",
+            "plasma beta",
+            "current-sheet formation"
+          ],
+          "about": [
+            {
+              "@type": "Thing",
+              "name": "magnetohydrodynamics",
+              "@id": "https://www.wikidata.org/entity/Q2549249"
+            },
+            {
+              "@type": "Thing",
+              "name": "plasma",
+              "@id": "https://www.wikidata.org/entity/Q10251"
+            },
+            {
+              "@type": "Thing",
+              "name": "magnetic reconnection",
+              "@id": "https://www.wikidata.org/entity/Q287506"
+            },
+            {
+              "@type": "Thing",
+              "name": "Alfven wave",
+              "@id": "https://www.wikidata.org/entity/Q645813"
+            }
+          ],
+          "isBasedOn": [
+            {
+              "@type": "ScholarlyArticle",
+              "name": "A multi-state HLL approximate Riemann solver for ideal magnetohydrodynamics",
+              "identifier": "doi:10.1016/j.jcp.2005.02.017",
+              "url": "https://doi.org/10.1016/j.jcp.2005.02.017"
+            },
+            {
+              "@type": "ScholarlyArticle",
+              "name": "An unsplit Godunov method for ideal MHD via constrained transport",
+              "identifier": "doi:10.1016/j.jcp.2004.11.016",
+              "url": "https://doi.org/10.1016/j.jcp.2004.11.016"
+            },
+            {
+              "@type": "ScholarlyArticle",
+              "name": "Athena: A New Code for Astrophysical MHD",
+              "identifier": "doi:10.1086/588755",
+              "url": "https://doi.org/10.1086/588755"
+            },
+            {
+              "@type": "ScholarlyArticle",
+              "name": "The Piecewise Parabolic Method (PPM) for gas-dynamical simulations",
+              "identifier": "doi:10.1016/0021-9991(84)90143-8",
+              "url": "https://doi.org/10.1016/0021-9991(84)90143-8"
+            }
+          ],
+          "educationalAlignment": [
+            {
+              "@type": "AlignmentObject",
+              "educationalFramework": "NGSS",
+              "targetName": "HS-PS3-5 Energy",
+              "targetUrl": "https://www.nextgenscience.org/pe/hs-ps3-5-energy"
+            },
+            {
+              "@type": "AlignmentObject",
+              "educationalFramework": "AP Physics C: Electricity and Magnetism",
+              "targetName": "Magnetic fields and electromagnetic induction",
+              "targetUrl": "https://apstudents.collegeboard.org/courses/ap-physics-c-electricity-and-magnetism"
+            },
+            {
+              "@type": "AlignmentObject",
+              "educationalFramework": "AAPT undergraduate laboratory guidance",
+              "targetName": "Computational modeling and measurement in advanced physics labs",
+              "targetUrl": "https://www.aapt.org/Resources/upload/LabGuidlinesDocument_EBendorsed_nov10.pdf"
+            }
+          ],
+          "accessibilityFeature": [
+            "keyboardNavigation",
+            "highContrastDisplay",
+            "ARIA",
+            "alternativeText"
+          ],
+          "accessibilityHazard": [
+            "noFlashingHazard",
+            "noSoundHazard"
+          ],
+          "relatedLink": [
+            "https://a9l.im/geon",
+            "https://a9l.im/shoals",
+            "https://a9l.im/cyano",
+            "https://a9l.im/gerry"
+          ]
+        },
+        {
+          "@type": "FAQPage",
+          "@id": "https://a9l.im/plasma#faq",
+          "mainEntity": [
+            {
+              "@type": "Question",
+              "name": "What equations does the simulator solve?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "It solves a 2.5D resistive magnetohydrodynamics system with optional source terms for cooling, heating, conduction, Hall physics, ambipolar diffusion, Biermann battery generation, viscosity, gravity, geometry, and boundary sponge damping."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Why does the magnetic field stay divergence-free?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "The magnetic field is stored on faces and updated by constrained transport. The curl update advances face fluxes from corner electric fields, so the discrete divergence cancels by telescoping differences."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "What is the default diagnostic?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "The default view is out-of-plane current density J_z, which makes current sheets and reconnection sites visible. Other views include density, pressure, temperature, velocity magnitude, magnetic-field magnitude, heat flux, gravitational potential, and an entropy proxy."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Which presets are best for validation?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Sod, Brio-Wu, Orszag-Tang, Harris, Alfven CPAW, and acoustic-wave presets keep the source physics off except for numerical guard terms. Extended presets opt into the richer microphysics and nonideal source stack."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Is this a production plasma code?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "No. It is an educational browser simulator. The numerics borrow from production MHD methods, but some closures use compact code-unit tables, source terms are split, and gravity is a periodic Jacobi solve."
+              }
+            }
+          ]
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://a9l.im/plasma#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://a9l.im/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Plasma",
+              "item": "https://a9l.im/plasma"
+            }
+          ]
+        },
+        {
+          "@type": "HowTo",
+          "@id": "https://a9l.im/plasma#howto",
+          "name": "Use the Plasma simulator",
+          "description": "Run, inspect, and compare WebGPU magnetohydrodynamics presets.",
+          "step": [
+            {
+              "@type": "HowToStep",
+              "name": "Choose a preset",
+              "text": "Start with Orszag-Tang for interacting shocks and current sheets, Harris for reconnection, or Driven wind + cloud for open-boundary source physics."
+            },
+            {
+              "@type": "HowToStep",
+              "name": "Switch diagnostics",
+              "text": "Use the view selector to compare current density, pressure, temperature, magnetic-field strength, heat flux, potential, and entropy proxy."
+            },
+            {
+              "@type": "HowToStep",
+              "name": "Adjust physics controls",
+              "text": "Use settings to change resistivity, resolution, boundary modes, cooling, conduction, nonideal terms, viscosity, gravity, geometry, and source substep caps."
+            },
+            {
+              "@type": "HowToStep",
+              "name": "Probe a cell",
+              "text": "Open the Probe tab and click the canvas to inspect local primitive variables, beta, current density, vorticity, and entropy over time."
+            },
+            {
+              "@type": "HowToStep",
+              "name": "Pause or step",
+              "text": "Use the toolbar to pause, single-step, reset the preset, or save and reload parameter state."
+            }
+          ]
+        }
+      ]
     }
     </script>
 </head>
@@ -120,6 +317,7 @@
                         <select id="ctrl-preset" class="sim-select" aria-label="Preset">
                             <option value="orszag-tang" selected>Orszag-Tang vortex</option>
                             <option value="orszag-tang-extended">Orszag-Tang + extended physics</option>
+                            <option value="driven-wind-cloud">Driven wind + cloud</option>
                             <option value="harris">Harris current sheet</option>
                             <option value="brio-wu">Brio-Wu shock tube</option>
                             <option value="sod">Sod shock tube</option>
@@ -141,8 +339,9 @@
                             <option value="5">T (temperature)</option>
                             <option value="6">|q| (heat flux)</option>
                             <option value="7">φ (grav. potential)</option>
+                            <option value="8">K (entropy proxy)</option>
                         </select>
-                        <p class="panel-hint">β, vorticity and Schlieren view modes ship with the LIC pass in Phase 6.</p>
+                        <p class="panel-hint">LIC field texture stays active across scalar diagnostics.</p>
                     </div>
 
                     <div class="panel-section">
@@ -267,10 +466,42 @@
     <details class="edu-content">
       <summary>About this simulation</summary>
       <article>
-        <h2>What is Plasma?</h2>
-        <p>A WebGPU-native 2D resistive magnetohydrodynamics (MHD) simulator. The grid-Eulerian finite-volume scheme uses HLLD Riemann solvers, PPM reconstruction, RK3 SSP time integration, and constrained transport to keep ∇·B at machine roundoff. Default preset shows the Orszag-Tang vortex; switch to Harris current sheet to watch magnetic reconnection develop.</p>
-        <h3>References</h3>
-        <p>Full educational content ships in Phase 7.</p>
+        <h2>What the model solves</h2>
+        <p>Plasma is a two-dimensional, WebGPU-native magnetohydrodynamics simulator. The evolved state is the conservative MHD state: mass density, three momentum components, total energy, two face-centered in-plane magnetic-field components, and an out-of-plane magnetic field. The display is two-dimensional, but the velocity and magnetic field are 2.5D, so out-of-plane shear and guide-field dynamics can still participate in the energy budget.</p>
+        <p>The base equations are ideal MHD with resistive and source-term extensions. In conservative form, the system couples fluid advection, thermal pressure, magnetic pressure, and magnetic tension. Optional source layers add radiative cooling and heating, anisotropic conduction, Hall electromotive force, ambipolar diffusion, Biermann battery generation, viscosity, self-gravity, cylindrical geometry terms, and sponge damping near selected boundaries. The canonical verification presets keep these source terms off except for guard flags, while the extended and driven-boundary presets opt into them explicitly.</p>
+
+        <h2>Numerical method</h2>
+        <p>The hyperbolic step is finite-volume MHD. Primitive states are reconstructed with piecewise parabolic reconstruction, then limited in characteristic variables. Intercell fluxes come from the HLLD approximate Riemann solver, with HLLC and HLL fallbacks for degenerate wave fans. Time integration uses the three-stage SSP RK3 scheme, with one macro timestep reused across all RK stages.</p>
+        <p>The magnetic field uses constrained transport. The in-plane magnetic components live on cell faces, and the update applies the curl of a corner-centered electric field. This is the discrete reason the scheme preserves div B: the face-difference divergence of a curl cancels by matching edge contributions with opposite signs. The EMF has two modes: the older Balsara-Spicer arithmetic average and the Gardiner-Stone upwind form, with the upwind form used by default.</p>
+        <p>Resistivity is applied as curl(eta J) on the same staggered grid, so it shares the divergence-preserving structure of constrained transport. Stiff source terms use exact integration, subcycling, or explicit stability reductions depending on the term. The current implementation still uses operator splitting after the main hyperbolic and resistive step; Strang splitting and larger implicit or super-time-stepped source solvers are still future work.</p>
+
+        <h2>Presets and diagnostics</h2>
+        <p>Orszag-Tang starts from a smooth periodic vortex and quickly produces shocks, magnetic islands, and current sheets. Harris current sheet is pressure-balanced and lets reconnection develop around a perturbed sheet. Brio-Wu and Sod isolate one-dimensional shock-tube behavior. The Hall whistler, conduction front, cooling instability, and Jeans presets isolate individual source terms. Driven wind + cloud uses a fixed west inflow and open boundaries to exercise the newer boundary and microphysics stack.</p>
+        <p>The default scalar view is out-of-plane current density J_z because it makes reconnection and sheet formation visible. Other views show density, pressure, velocity magnitude, magnetic-field strength, temperature, heat flux, gravitational potential, and the dual-energy entropy proxy K = p / rho^gamma. Animated line integral convolution stays active over scalar views, so the magnetic-field topology remains visible while inspecting thermodynamic or transport diagnostics.</p>
+
+        <h2>Learning outcomes</h2>
+        <ul>
+          <li>Recognize how shocks and compression reshape magnetic-field topology in MHD.</li>
+          <li>Use J_z to identify current sheets and reconnection sites.</li>
+          <li>Explain how constrained transport keeps the discrete divergence of B controlled.</li>
+          <li>Compare hydrodynamic and magnetohydrodynamic wave fans through Sod and Brio-Wu.</li>
+          <li>Connect heat flux, entropy proxy, temperature, and pressure diagnostics to source-term behavior.</li>
+          <li>Explore how Hall, ambipolar, Biermann, conduction, viscosity, cooling, and gravity terms change the same baseline MHD flow.</li>
+        </ul>
+
+        <h2>Accessibility</h2>
+        <p>The simulator can be paused, stepped, reset, and driven from keyboard-reachable controls. The UI uses ARIA labels for the canvas, toolbar, sidebar, and probe controls; the site theme toggle provides light and dark contrast modes. The simulation is animated and visually dense, but it has no sound and no flashing-light dependency. If motion is uncomfortable, pause the simulation and use single-step mode.</p>
+
+        <h2>References</h2>
+        <ul>
+          <li>Miyoshi and Kusano, "A multi-state HLL approximate Riemann solver for ideal magnetohydrodynamics", Journal of Computational Physics, 2005. DOI: <a href="https://doi.org/10.1016/j.jcp.2005.02.017">10.1016/j.jcp.2005.02.017</a></li>
+          <li>Gardiner and Stone, "An unsplit Godunov method for ideal MHD via constrained transport", Journal of Computational Physics, 2005. DOI: <a href="https://doi.org/10.1016/j.jcp.2004.11.016">10.1016/j.jcp.2004.11.016</a></li>
+          <li>Stone, Gardiner, Teuben, Hawley, and Simon, "Athena: A New Code for Astrophysical MHD", The Astrophysical Journal Supplement Series, 2008. DOI: <a href="https://doi.org/10.1086/588755">10.1086/588755</a></li>
+          <li>Colella and Woodward, "The Piecewise Parabolic Method (PPM) for gas-dynamical simulations", Journal of Computational Physics, 1984. DOI: <a href="https://doi.org/10.1016/0021-9991(84)90143-8">10.1016/0021-9991(84)90143-8</a></li>
+        </ul>
+
+        <h2>See also</h2>
+        <p>For related simulations on the same site, see <a href="/geon">geon</a> for relativistic field dynamics, <a href="/shoals">shoals</a> for stochastic finance and risk, <a href="/cyano">cyano</a> for biological patterning, and <a href="/gerry">gerry</a> for district geometry.</p>
       </article>
     </details>
 

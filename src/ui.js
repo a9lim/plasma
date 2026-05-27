@@ -18,10 +18,13 @@
 import {
     BC_PERIODIC, BC_OUTFLOW, BC_REFLECTING, BC_DRIVEN,
     VIEW_DENSITY, VIEW_PRESSURE, VIEW_VMAG, VIEW_BMAG, VIEW_JZ,
-    VIEW_T, VIEW_QMAG, VIEW_PHI,
+    VIEW_T, VIEW_QMAG, VIEW_PHI, VIEW_ENTROPY,
     FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
+    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_HEATING,
+    FLAG_SPONGE, FLAG_GEOMETRY,
     FLAG_POSITIVITY, EMF_MODE_BS_MEAN, EMF_MODE_GS_UPWIND,
-    COOLING_CURVE_BREMS, COOLING_CURVE_TABLE,
+    COOLING_CURVE_BREMS, COOLING_CURVE_TABLE, COOLING_CURVE_CIE, COOLING_CURVE_TABULATED,
+    GEOMETRY_CARTESIAN, GEOMETRY_CYLINDRICAL,
 } from './config.js';
 import { StatsDisplay } from './stats-display.js';
 import { Probe } from './probe.js';
@@ -157,10 +160,25 @@ export function setupUI(simShell) {
                 FLAG_COOLING, { lo: -4 }),
             { type: 'mode', label: 'Cooling curve', dataAttr: 'cooling-curve',
               buttons: [
+                  { value: String(COOLING_CURVE_TABULATED), label: 'tab',   active: sim.coolingCurveMode === COOLING_CURVE_TABULATED },
+                  { value: String(COOLING_CURVE_CIE),   label: 'CIE',   active: sim.coolingCurveMode === COOLING_CURVE_CIE },
                   { value: String(COOLING_CURVE_TABLE), label: 'table', active: sim.coolingCurveMode === COOLING_CURVE_TABLE },
                   { value: String(COOLING_CURVE_BREMS), label: 'brems', active: sim.coolingCurveMode === COOLING_CURVE_BREMS },
               ],
               onChange: v => sim.setCoolingCurveMode(parseInt(v, 10)) },
+            { type: 'slider', label: 'Metallicity Z', min: 0, max: 3, step: 0.1,
+              value: sim.coolingMetallicity, format: v => v.toFixed(1) + '×',
+              onChange: v => sim.setCoolingMetallicity(v) },
+            epSlider('Heating Γ (log10)',
+                () => sim.heatingGamma0, v => sim.setHeatingGamma0(v),
+                FLAG_HEATING, { lo: -6, hi: 0 }),
+            { type: 'slider', label: 'Heating ρ exponent', min: 0, max: 2, step: 0.1,
+              value: sim.heatingDensityExp, format: v => v.toFixed(1),
+              onChange: v => sim.setHeatingDensityExp(v) },
+            { type: 'slider', label: 'Heating T cutoff', min: -4.5, max: 2, step: 0.25,
+              value: sim.heatingTCut > 0 ? Math.log10(sim.heatingTCut) : -4.5,
+              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
+              onChange: v => sim.setHeatingTCut(v <= -4.45 ? 0 : Math.pow(10, v)) },
             epSlider('Conduction κ∥ (log10)',
                 () => sim.conductionKappa, v => sim.setConductionKappa(v),
                 FLAG_CONDUCTION, { lo: -6 }),
@@ -170,9 +188,69 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'q_sat φ', min: 0, max: 1, step: 0.05,
               value: sim.conductionSatFrac, format: v => (v <= 0 ? 'off' : v.toFixed(2)),
               onChange: v => sim.setConductionSatFrac(v) },
+            epSlider('Viscosity ν (log10)',
+                () => sim.viscosityNu, v => sim.setViscosityNu(v),
+                FLAG_VISCOSITY, { lo: -7, hi: -1 }),
+            { type: 'slider', label: 'Bulk viscosity', min: -7.5, max: -1, step: 0.25,
+              value: sim.viscosityBulk > 0 ? Math.log10(sim.viscosityBulk) : -7.5,
+              format: v => (v <= -7.45 ? 'off' : '1e' + v.toFixed(2)),
+              onChange: v => sim.setViscosityBulk(v <= -7.45 ? 0 : Math.pow(10, v)) },
+            { type: 'slider', label: 'ν B-aligned frac', min: 0, max: 1, step: 0.05,
+              value: sim.viscosityAnisoFrac, format: v => v.toFixed(2),
+              onChange: v => sim.setViscosityAnisoFrac(v) },
+            { type: 'slider', label: 'Shock viscosity', min: -7.5, max: -1, step: 0.25,
+              value: sim.viscosityShock > 0 ? Math.log10(sim.viscosityShock) : -7.5,
+              format: v => (v <= -7.45 ? 'off' : '1e' + v.toFixed(2)),
+              onChange: v => sim.setViscosityShock(v <= -7.45 ? 0 : Math.pow(10, v)) },
+            epSlider('Ambipolar η_A (log10)',
+                () => sim.ambipolarEta, v => sim.setAmbipolarEta(v),
+                FLAG_AMBIPOLAR, { lo: -7, hi: -1 }),
+            { type: 'slider', label: 'Neutral fraction', min: 0, max: 1, step: 0.05,
+              value: sim.neutralFrac, format: v => v.toFixed(2),
+              onChange: v => sim.setNeutralFrac(v) },
+            { type: 'slider', label: 'Ionization T₀', min: -4, max: 2, step: 0.25,
+              value: Math.log10(sim.ionizationT0), format: v => '1e' + v.toFixed(2),
+              onChange: v => sim.setIonizationT0(Math.pow(10, v)) },
+            epSlider('Biermann C_B (log10)',
+                () => Math.abs(sim.biermannCoeff), v => sim.setBiermannCoeff(v),
+                FLAG_BIERMANN, { lo: -8, hi: -1 }),
             epSlider('Self-gravity G (log10)',
                 () => sim.gravityG, v => sim.setGravityG(v),
                 FLAG_GRAVITY_SELF, { lo: -4, hi: 2 }),
+            { type: 'slider', label: 'Poisson iters', min: 0, max: 128, step: 1,
+              value: sim.gravityPoissonIters, format: v => String(v | 0),
+              onChange: v => sim.setGravityPoissonIters(v | 0) },
+            { type: 'slider', label: 'Gravity softening', min: 0, max: 0.2, step: 0.005,
+              value: sim.gravitySoftening, format: v => (v <= 0 ? 'off' : v.toFixed(3)),
+              onChange: v => sim.setGravitySoftening(v) },
+            { type: 'slider', label: 'Jacobi ω', min: 0.2, max: 1.8, step: 0.05,
+              value: sim.gravityPoissonOmega, format: v => v.toFixed(2),
+              onChange: v => sim.setGravityPoissonOmega(v) },
+            { type: 'mode', label: 'Geometry', dataAttr: 'geometry-mode',
+              buttons: [
+                  { value: String(GEOMETRY_CARTESIAN),   label: 'cart', active: sim.geometryMode === GEOMETRY_CARTESIAN },
+                  { value: String(GEOMETRY_CYLINDRICAL), label: 'cyl',  active: sim.geometryMode === GEOMETRY_CYLINDRICAL },
+              ],
+              onChange: v => {
+                  const mode = parseInt(v, 10);
+                  sim.setGeometryMode(mode);
+                  sim.setPhysicsFlag(FLAG_GEOMETRY, mode === GEOMETRY_CYLINDRICAL);
+              } },
+            { type: 'slider', label: 'r-axis guard', min: 0, max: 0.25, step: 0.005,
+              value: sim.geometryRMin, format: v => v.toFixed(3),
+              onChange: v => sim.setGeometryRMin(v) },
+            { type: 'slider', label: 'Sponge width', min: 0, max: 32, step: 1,
+              value: sim.spongeWidth, format: v => (v <= 0 ? 'off' : v.toFixed(0) + ' cells'),
+              onChange: v => {
+                  sim.setSpongeWidth(v);
+                  sim.setPhysicsFlag(FLAG_SPONGE, v > 0 && sim.spongeStrength > 0);
+              } },
+            epSlider('Sponge strength (log10)',
+                () => sim.spongeStrength, v => sim.setSpongeStrength(v),
+                FLAG_SPONGE, { lo: -3, hi: 1 }),
+            { type: 'slider', label: 'Source substeps cap', min: 1, max: 64, step: 1,
+              value: sim.sourceSubstepsMax, format: v => String(v | 0),
+              onChange: v => sim.setSourceSubstepsMax(v | 0) },
             { type: 'mode', label: 'EMF', dataAttr: 'emf-mode',
               buttons: [
                   { value: String(EMF_MODE_BS_MEAN),   label: 'BS mean',  active: sim.emfMode === EMF_MODE_BS_MEAN },
@@ -196,7 +274,7 @@ export function setupUI(simShell) {
     if (typeof initAboutPanel === 'function') {
         const aboutHandle = initAboutPanel({
             title: 'Plasma',
-            lastUpdated: '2026-05-26',
+            lastUpdated: '2026-05-27',
             description: 'WebGPU-native 2D resistive MHD plasma simulator. Click to place the probe; use Settings to switch preset, view mode, resistivity, and boundary conditions.',
             controls: [
                 { label: 'Probe cell',  value: 'Click canvas' },
@@ -443,7 +521,7 @@ function _buildShortcuts(simShell, sim, stats, probe) {
     const cycleView = () => {
         const order = [
             VIEW_JZ, VIEW_BMAG, VIEW_DENSITY, VIEW_VMAG, VIEW_PRESSURE,
-            VIEW_T, VIEW_QMAG, VIEW_PHI,
+            VIEW_T, VIEW_QMAG, VIEW_PHI, VIEW_ENTROPY,
         ];
         const idx = order.indexOf(sim.viewMode);
         const next = order[(idx + 1) % order.length];
