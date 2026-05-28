@@ -889,11 +889,17 @@ Compute path: `shared-tokens.js`, `shared-base.css`, `shared-utils.js`.
 
 UI: `shared-toolbar.js`, `shared-forms.js`, `shared-dropdown.js`,
 `shared-settings.js`, `shared-about.js`, `shared-tabs.js`,
-`shared-icons.js`, `shared-shortcuts.js`, `shared-info.js`,
-`shared-tooltip.js`, `shared-sparkline.js`, `shared-touch.js`,
-`shared-haptics.js`.
+`shared-icons.js`, `shared-shortcuts.js`, `shared-sparkline.js`,
+`shared-touch.js`, `shared-haptics.js`.
+
+`shared-touch.js` is loaded only so `_toolbar.initSidebar` can wire
+swipe-to-dismiss on the sidebar's `.sheet-handle`; plasma calls no
+`initSwipeDismiss` directly.
 
 `shared-camera.js` is intentionally NOT used — fixed orthographic 2D.
+`shared-info.js` / `shared-tooltip.js` are NOT used — the probe is a
+custom GPU-readback panel, not a tooltip, and there is no info/reference
+overlay.
 
 For CPU fallback: `shared-wgsl-transpile.js` (compile-time conversion
 of compute shaders to JS).
