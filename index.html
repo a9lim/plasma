@@ -31,6 +31,9 @@
     <link rel="alternate" hreflang="en" href="https://a9l.im/plasma">
     <link rel="alternate" hreflang="x-default" href="https://a9l.im/plasma">
     <link rel="manifest" href="/manifest.json">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Plasma">
 
     <link rel="stylesheet" href="/fonts/fonts.css">
     <!-- shared-tokens.js MUST run synchronously before CSS parses so its
@@ -51,6 +54,7 @@
     <script defer src="/shared-sparkline.js"></script>
     <script defer src="/shared-shortcuts.js"></script>
     <script defer src="/shared-about.js"></script>
+    <link rel="modulepreload" href="main.js">
     <script type="module" src="main.js"></script>
 
     <script type="application/ld+json">
@@ -69,6 +73,8 @@
           "browserRequirements": "Requires WebGPU support",
           "license": "https://www.gnu.org/licenses/agpl-3.0.html",
           "codeRepository": "https://github.com/a9lim/plasma",
+          "sameAs": "https://github.com/a9lim/plasma",
+          "keywords": "MHD simulator, magnetohydrodynamics, plasma physics, HLLD Riemann solver, PPM reconstruction, constrained transport, magnetic reconnection, Alfven waves, resistive MHD, current sheet, WebGPU, educational",
           "inLanguage": "en",
           "interactivityType": "active",
           "datePublished": "2026-05-24",
@@ -76,7 +82,8 @@
           "author": {
             "@type": "Person",
             "name": "a9lim",
-            "url": "https://a9l.im/#about"
+            "@id": "https://a9l.im/#person",
+            "url": "https://a9l.im/"
           },
           "teaches": [
             "resistive magnetohydrodynamics",
@@ -91,22 +98,22 @@
             {
               "@type": "Thing",
               "name": "magnetohydrodynamics",
-              "@id": "https://www.wikidata.org/entity/Q2549249"
+              "@id": "https://www.wikidata.org/wiki/Q2549249"
             },
             {
               "@type": "Thing",
               "name": "plasma",
-              "@id": "https://www.wikidata.org/entity/Q10251"
+              "@id": "https://www.wikidata.org/wiki/Q10251"
             },
             {
               "@type": "Thing",
               "name": "magnetic reconnection",
-              "@id": "https://www.wikidata.org/entity/Q287506"
+              "@id": "https://www.wikidata.org/wiki/Q287506"
             },
             {
               "@type": "Thing",
               "name": "Alfven wave",
-              "@id": "https://www.wikidata.org/entity/Q645813"
+              "@id": "https://www.wikidata.org/wiki/Q645813"
             }
           ],
           "isBasedOn": [
@@ -169,7 +176,10 @@
             "https://a9l.im/geon",
             "https://a9l.im/shoals",
             "https://a9l.im/cyano",
-            "https://a9l.im/gerry"
+            "https://a9l.im/gerry",
+            "https://a9l.im/scripture",
+            "https://a9l.im/miasma",
+            "https://a9l.im/pile"
           ]
         },
         {
@@ -488,6 +498,9 @@
         <h2>Presets and diagnostics</h2>
         <p>Orszag-Tang starts from a smooth periodic vortex and quickly produces shocks, magnetic islands, and current sheets. Harris current sheet is pressure-balanced and lets reconnection develop around a perturbed sheet. Brio-Wu and Sod isolate one-dimensional shock-tube behavior. The Hall whistler, conduction front, cooling instability, and Jeans presets isolate individual source terms. Driven wind + cloud uses a fixed west inflow and open boundaries to exercise the newer boundary and microphysics stack.</p>
         <p>The default scalar view is out-of-plane current density J_z because it makes reconnection and sheet formation visible. Other views show density, pressure, velocity magnitude, magnetic-field strength, temperature, heat flux, gravitational potential, and the dual-energy entropy proxy K = p / rho^gamma. Animated line integral convolution stays active over scalar views, so the magnetic-field topology remains visible while inspecting thermodynamic or transport diagnostics.</p>
+
+        <h2>Prerequisites</h2>
+        <p>The simulation runs without any background, but the diagnostics land best with vector calculus (gradient, divergence, and curl), an introductory grasp of fluid dynamics and conservation laws, and electromagnetism through Maxwell's equations and the Lorentz force. Familiarity with hyperbolic conservation laws, Riemann problems, and finite-volume discretization helps in reading the numerical-method notes, but is not required to explore the presets. A modern desktop browser with WebGPU enabled (recent Chrome, Edge, or Safari 26+) is needed to run the GPU compute pipeline.</p>
 
         <h2>Learning outcomes</h2>
         <ul>
