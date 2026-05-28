@@ -1,10 +1,13 @@
 # HANDOFF.md — plasma
 
-Sim built across one orchestration session (Claude as orchestrator, 6
-dispatched sub-agents for Phases 1–6). Engine, UI, and LIC
-visualization are in. Phase 7 docs / metadata + pointer perturbation
-are now in. OG art, broader live preset validation, and parent-repo
-wiring remain.
+**v1.0 shipped.** Sim built across one orchestration session (Claude
+as orchestrator, 6 dispatched sub-agents for Phases 1–6) plus
+follow-up sessions for Phases 7-8 polish and the Session 14-22
+extended-physics arc. Engine, UI, LIC visualization, docs/metadata,
+pointer perturbation, OG art, and parent-repo wiring are all in.
+Phase 9 extended physics is partial (structural sharp edges closed;
+remaining items are heavier physics architecture, not patching) —
+see the Phase 9 section below.
 
 The Probe tab was rewritten in Session 22 alongside the pointer
 perturbation: no more click-to-place / shift-drag / sparkline /
@@ -35,8 +38,8 @@ point at the corresponding `sessions/session-N.md`.
 | 4     | Resistivity + per-edge BCs                 | done     |
 | 5     | UI scaffolding (sidebar, topbar, tabs)     | done     |
 | 6     | Animated LIC visualization                 | done     |
-| 7     | Polish (content, perturbation, JSON-LD, OG)| **partial** |
-| 8     | Parent-repo wiring                         | **todo** |
+| 7     | Polish (content, perturbation, JSON-LD, OG)| done     |
+| 8     | Parent-repo wiring                         | done     |
 | 9     | Extended physics (Hall, cooling/heating, conduction, self-gravity, Cartesian multigrid, ambipolar/Biermann, electron-inertia smoothing, radiation, viscosity, geometry, sponge, EMF toggle, positivity guard) | **partial** — see [Session 14](sessions/session-14.md), [Session 15](sessions/session-15.md), [Session 16](sessions/session-16.md), [Session 17](sessions/session-17.md), [Session 18](sessions/session-18.md), [Session 19](sessions/session-19.md), [Session 20](sessions/session-20.md), [Session 21](sessions/session-21.md), and the "Phase 9" section below |
 
 **Verification status**: OT live-verified at N=256 and N=1024 across
@@ -136,11 +139,13 @@ writing (any order):
    sequence number?) or stop pushing it.
    _Resolved by Session 3 #2 — slot 12 reclaimed as `cfl: f32`._
 
-3. **`stage_params` clarity.** The three stage uniform buffers are
+3. ✅ **`stage_params` clarity.** The three stage uniform buffers are
    written once at init and immutable thereafter, but the code
-   structure makes it look like they're rewritten every step. Add a
-   clear comment or consolidate into a single buffer with offset
-   views.
+   structure made it look like they're rewritten every step.
+   _Resolved by Phase 7 wrap-up — `buffers.js` now carries an explicit
+   "written ONCE here at init and never touched again" comment block
+   that also names the no-per-step-writeBuffer contract and points at
+   `_build.mjs RK3_STAGE_WEIGHTS` for the transpiler-side mirror._
 
 4. **CFL / pressure-floor sliders are non-functional.** Phase 5's
    slider for CFL and pressure floor updates `sim.cfl` and
@@ -245,16 +250,21 @@ Landed after Session 18:
 * Educational alignments now point at verified reachable NGSS, AP
   Physics C: E&M, and AAPT undergraduate laboratory guidance URLs.
 
-### 6. OG image
+### 6. OG image ✅
 
-* Create `og/plasma.html` mirroring `og/geon.html`'s structure.
-  Hardcoded colors (no shared-tokens dep). NERV register — stylized
-  current sheet or OT vortex.
-* Add to `og/generate.js` CARDS array.
-* Run `node og/generate.js` to produce `plasma/og-image.webp`
-  (1200×630 WebP quality 90).
-* Update meta tags in `plasma/index.html` to reference the new
-  image.
+Landed in Phase 7 wrap-up:
+
+* `og/plasma.html` mirrors the `og/pile.html` boilerplate (hardcoded
+  colors, no shared-tokens dep). The flair is a Harris reconnection
+  topology — a horizontal red current sheet with three magnetic
+  islands (O-points), two X-points between them, and curving open
+  field lines arching anti-parallel above/below the sheet against a
+  dot-grid NERV background.
+* Added to `og/generate.js` CARDS array.
+* `node og/generate.js` produces `plasma/og-image.webp` (1200×630,
+  quality 90, ~21 KB).
+* `plasma/index.html` now carries the standard `og:image` +
+  `og:image:width|height|type|alt` + `twitter:image` meta block.
 
 ### 7. visibilitychange wiring (verify) ✅
 
@@ -271,53 +281,62 @@ in `main.js` documents the contract._
 `dateModified` in JSON-LD and `lastUpdated` in `initAboutPanel` are
 both `2026-05-27` for the Session 18 docs / metadata refresh.
 
-## Phase 8 — Parent-repo wiring
+## Phase 8 — Parent-repo wiring ✅
 
-Estimated: 0.5 day. All in `/Users/a9lim/Work/a9lim.github.io/`.
+All landed in the Phase 8 wrap-up. Files touched in
+`/Users/a9lim/Work/a9lim.github.io/`:
 
-Files to modify:
+1. ✅ **`.gitmodules`** — plasma submodule entry was already present
+   from the initial `git submodule add`. The parent submodule
+   pointer still needs to be advanced once the plasma submodule has
+   its v1.0 tip pushed; that's a one-line git operation, not a file
+   edit.
 
-1. **`.gitmodules`** — submodule entry already exists from initial
-   `git submodule add`, but the parent commit is still at the
-   submodule's initial empty state. After Phase 7 lands and the
-   submodule is pushed, commit on the parent updating the submodule
-   pointer: "Add plasma submodule with v1 implementation".
+2. ✅ **`src/projects.js`** — `plasma` entry added between Pile and
+   Raiko: `kind: 'sim'`, all four i18n fields, `_ICON.projPlasma`.
 
-2. **`src/projects.js`** — add `plasma` entry to `PROJECTS` with
-   `kind: 'sim'`, all i18n fields, `_ICON.projPlasma`. Use the
-   existing `geon` entry as the shape reference.
+3. ✅ **`_worker.js`** — `SIMS_SSR` carries a plasma card; the `/sims`
+   `ItemList` JSON-LD now includes position 8 (Plasma).
 
-3. **`_worker.js`** — add card to `SIMS_SSR` (HTML string, lines
-   ~285–306). Mirror the description from `src/projects.js`.
+4. ✅ **`_routes.json`** — `/plasma/*` is in the `exclude` array.
 
-4. **`_routes.json`** — add `/plasma/*` to `exclude` array.
+5. ✅ **`_headers`** — `/plasma/*` carries `Cross-Origin-Embedder-Policy:
+   credentialless` (mirrors geon, needed for WebGPU compute timing on
+   some browsers). Cache rules for `/plasma/*.js`, `/plasma/*.css`, and
+   `/plasma/*.wgsl` are in. Early Hints are intentionally omitted —
+   COEP: credentialless invalidates 103 preloads (fetched pre-policy),
+   same as geon; the comment in `_headers` documents this.
 
-5. **`_headers`** — add `/plasma/*` block with Early Hints preloads
-   (`shared-tokens.js`, `shared-base.css`, `/plasma/styles.css`,
-   `/plasma/main.js`), cache rules for `/plasma/*.js` and
-   `/plasma/*.css`, **and `Cross-Origin-Embedder-Policy:
-   credentialless`** (same as geon — needed for WebGPU compute timing
-   on some browsers).
+6. ✅ **`_build.mjs`** — plasma is in `IMAGE_MAP`, `IMAGE_CAPTIONS`,
+   `aboutFiles`, and `staticRoutes`. `homeData.stats.sims` bumped from
+   7 to 8. (Plasma's WGSL transpile was already wired in
+   `WGSL_SHADER_DIRS` from earlier work.)
 
-6. **`_build.js`** — add to `IMAGE_MAP`, `IMAGE_CAPTIONS`,
-   `aboutFiles`, and main-sitemap URLs.
+7. ✅ **`index.html` (parent)** — plasma in the homepage `<li>` Sims
+   list, the `Course` JSON-LD `@graph` (position 8), the Speculation
+   Rules prefetch `href_matches` array, and the Course `description`
+   string (now "eight … and magnetohydrodynamics").
 
-7. **`index.html` (parent)** — add to homepage SSR fallback `<li>`
-   list and to the JSON-LD `Course` schema `@graph` array.
+8. ✅ **`llms.txt`** — one-line description added; `updated` bumped to
+   2026-05-27.
 
-8. **`llms.txt`** — add one-line description for plasma.
+9. ✅ **`manifest.json`** — `Plasma` shortcut entry added.
 
-9. **`manifest.json`** — add to `shortcuts` array.
+10. ✅ **`og/generate.js`** — `plasma.html` added to `CARDS`; produces
+    `plasma/og-image.webp` on the next `node og/generate.js`.
 
-10. **`og/generate.js`** — add `plasma` to `CARDS` (handled in Phase
-    7 step 6).
+11. ✅ **`shared-icons.js`** — `projPlasma` SVG added (two crossing
+    S-curves around an O-point — reconnection topology in the NERV
+    register).
 
-11. **`shared-icons.js`** — add a `projPlasma` icon (SVG path;
-    geometric, NERV register).
+12. ✅ **`i18n.js`** — `home.sims.plasma` added in both English and
+    Japanese registers so the homepage Sims list translates cleanly
+    (wasn't in the original 11-item punch list but lives on the same
+    wiring slope).
 
-After all 11: run `node _build.js` from the parent to regenerate
-sitemap, feeds, llms-full.txt, home-data.json. Then `./dev.sh` smoke
-test; then push parent.
+After all 12: `node _build.mjs` from the parent regenerates sitemap,
+feeds, llms-full.txt, and home-data.json (also re-runs the WGSL
+transpiler). Smoke test via `./dev.sh`; then push parent.
 
 `dev.sh` requires no changes (auto-symlinks all top-level
 directories). `robots.txt` requires no changes (general `Allow: /`

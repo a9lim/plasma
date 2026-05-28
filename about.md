@@ -34,6 +34,23 @@ is built to keep those compromises explicit. Canonical verification presets
 default to just the base MHD numerics and guard terms, while extended presets
 opt into the source physics.
 
+## Hidden presets
+
+The preset dropdown intentionally surfaces only the ten presets that are
+useful as exploratory starting points. Nine more are kept in
+`src/presets.js` for the validation harness and for hand-driven testing:
+
+* `alfven-cpaw` and `acoustic-wave-hydro` are linear convergence rigs.
+* `radiative-relaxation` and `kinetic-current-smoothing` isolate the
+  grey radiation and hyper-resistive Ohm closures.
+* `isolated-gravity-pulse` exercises the isolated Poisson boundary.
+* The five `cylindrical-*` presets verify the r-weighted finite-volume
+  update, cylindrical CT induction, conduction, and Poisson operators.
+
+They're reachable from the JS console via
+`sim.setPreset('cylindrical-static-equilibrium')` etc., and they drive
+the `tests/physics-validation.{html,py}` matrix.
+
 ## Learning Outcomes
 
 * Connect magnetic pressure, thermal pressure, and plasma beta in an MHD flow.

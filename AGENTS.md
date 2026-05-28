@@ -13,10 +13,9 @@ contract section below.
 Implementation plan (source of truth for design decisions):
 `~/.claude/plans/geon-currently-uses-cpu-abstract-cat.md`.
 
-**Status**: Phases 1–6 complete (engine + UI + LIC). Phase 7 docs /
-metadata slice is in (`about.md`, edu-content, JSON-LD, about-panel
-date); pointer perturbation, OG art, broader live preset validation,
-and Phase 8 parent-repo wiring are the remaining loose ends. Phase 9
+**Status**: v1.0 shipped. Phases 1–8 complete (engine + UI + LIC +
+docs/metadata + pointer perturbation + OG art + parent-repo wiring).
+Phase 9
 extended-physics layer (Hall, cooling/heating, anisotropic conduction,
 self-gravity, ambipolar, Biermann, kinetic-scale current smoothing,
 viscosity, cylindrical geometry, sponge, grey radiation) was built
@@ -63,8 +62,9 @@ plasma/
     ├── microphysics.js     ← uploaded cooling/heating/transport/opacity table (Sessions 18/20/21)
     ├── physical-scales.js  ← dimensioned ↔ code-unit calibration helpers (Session 19)
     ├── colormaps.js        ← viridis LUT (7-stop polynomial fit, sampled at 256 stops)
-    ├── ui.js               ← shared-* module wiring (Phase 5)
-    ├── stats-display.js    ← Stats tab: energy / β / |B|max / ∇·B norm / reconnection rate + conservation panel (7 quantities × drift % × sparklines)
+    ├── ui.js               ← shared-* module wiring (Phase 5; Session 22 coherence trim moved extended physics out of the gear dropdown)
+    ├── physics-panel.js    ← Physics sidebar tab: 8 extended-physics sections (Session 22)
+    ├── stats-display.js    ← Stats tab: energy / β / maxima / ∇·B / reconnection / conservation drift — Session 22 trim removed Health + Clock; NaN auto-pause kept as safety
     ├── probe.js            ← Probe tab: cell sampling + mini time-series
     └── gpu/
         ├── device.js       ← adapter + device init
@@ -381,10 +381,35 @@ Pressure balance: `p + ½|B|² = p_∞ + ½ B_0²` constant across y.
 
 ## UI
 
-`src/ui.js` (entry `setupUI(simShell)`), `src/stats-display.js`,
-`src/probe.js`, and `src/gpu/readback.js`. Called from `main.js`
-after `sim.init()`. Mounts the topbar, three-tab sidebar
-(Settings / Stats / Probe), and the stats/probe readback paths.
+`src/ui.js` (entry `setupUI(simShell)`), `src/physics-panel.js`,
+`src/stats-display.js`, `src/probe.js`, and `src/gpu/readback.js`.
+Called from `main.js` after `sim.init()`. Mounts the topbar, four-tab
+sidebar (Settings / Physics / Stats / Probe), and the stats/probe
+readback paths.
+
+The Settings tab carries the universal user-facing controls (preset,
+view mode, η + grid Reynolds floor, resolution, per-edge BCs + driven
+inflow state). The Physics tab carries the extended source layer
+(Hall / Cooling & Heating / Conduction / Radiation / Viscosity /
+Non-ideal Ohm / Gravity / Geometry & sponge) — built by
+`buildPhysicsPanel(root, sim)` using the same `.panel-section` +
+`.group-label` idioms as the Settings tab. The Stats tab carries
+energy / β / maxima / ∇·B / reconnection (Harris only) / conservation
+drift; per the Session 22 coherence pass it no longer surfaces the
+NaN-cell / floor-cell / dt-min counters (Health) or the per-step
+substep counts and GPU step time (Clock) — those were debug surface
+during the Session 14–21 hardening pass. The NaN auto-pause is
+preserved as a safety mechanism. The Probe tab is unchanged.
+
+The settings gear dropdown is trimmed to the universal numerics +
+render knobs (CFL / γ / p-floor / η-anom α + J_crit / source-substep
+cap / EMF mode / positivity guard / LIC intensity + drift). Keyboard
+shortcuts: 1=Settings, 2=Physics, 3=Stats, 4=Probe.
+
+The preset dropdown surfaces 10 starting points; nine validation /
+cylindrical presets stay in `src/presets.js` for the validation
+matrix and are reachable via `sim.setPreset('...')` — see
+`about.md` for the full list.
 
 ### Readback pattern (`src/gpu/readback.js`)
 

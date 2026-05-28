@@ -19,17 +19,11 @@ import {
     BC_PERIODIC, BC_OUTFLOW, BC_REFLECTING, BC_DRIVEN,
     VIEW_DENSITY, VIEW_PRESSURE, VIEW_VMAG, VIEW_BMAG, VIEW_JZ,
     VIEW_T, VIEW_QMAG, VIEW_PHI, VIEW_ENTROPY,
-    FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
-    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_HEATING,
-    FLAG_SPONGE, FLAG_GEOMETRY, FLAG_RADIATION, FLAG_ELECTRON_INERTIA,
     FLAG_POSITIVITY, EMF_MODE_BS_MEAN, EMF_MODE_GS_UPWIND,
-    COOLING_CURVE_BREMS, COOLING_CURVE_TABLE, COOLING_CURVE_CIE, COOLING_CURVE_TABULATED,
-    GEOMETRY_CARTESIAN, GEOMETRY_CYLINDRICAL,
-    GRAVITY_BOUNDARY_PERIODIC, GRAVITY_BOUNDARY_ISOLATED,
-    GRAVITY_SOLVER_MULTIGRID, GRAVITY_SOLVER_JACOBI,
 } from './config.js';
 import { StatsDisplay } from './stats-display.js';
 import { Probe } from './probe.js';
+import { buildPhysicsPanel } from './physics-panel.js';
 
 const SAVE_KEY = 'plasma.state.v1';
 const THEME_KEY = 'plasma-theme';
@@ -81,13 +75,15 @@ export function setupUI(simShell) {
     }
 
     // ── Stats + Probe (must be built before wireSettings refs them) ──
-    const statsRoot = document.getElementById('tab-stats');
-    const probeRoot = document.getElementById('tab-probe');
+    const statsRoot   = document.getElementById('tab-stats');
+    const probeRoot   = document.getElementById('tab-probe');
+    const physicsRoot = document.getElementById('tab-physics');
 
     const stats = new StatsDisplay({ device: sim.device, buffers: sim.buffers, sim }, statsRoot);
     const probe = new Probe({ device: sim.device, buffers: sim.buffers, sim, canvas: simShell.canvas },
                             probeRoot);
     probe.start();
+    if (physicsRoot) buildPhysicsPanel(physicsRoot, sim);
 
     const uiCtx = {
         simShell, sim, stats, probe,
@@ -110,37 +106,14 @@ export function setupUI(simShell) {
         stats.tick();
     };
 
-    // ── Advanced settings dropdown ────────────────────────────
+    // ── Settings gear dropdown — numerics + render only ─────────
+    // The extended-physics scalars (Hall, cooling, conduction, ...)
+    // moved to the dedicated Physics sidebar tab during the Session 22
+    // coherence pass; the gear now carries just the universal solver
+    // knobs, the EMF / positivity switches that don't fit a section,
+    // the η-anomaly pair (lives next to η morally but the η slider's
+    // already its own sidebar section), and the LIC render controls.
     if (settingsBtn && typeof _settings !== 'undefined') {
-        // Snap-to-0 log slider helper for the extended-physics scalars.
-        // The shaders early-return when their corresponding scalar is 0
-        // OR their flag bit is clear, so we drive both: the value sets
-        // the scalar, and "off" at the bottom of the range additionally
-        // clears the flag. Raising a slider out of "off" re-arms the
-        // corresponding source-physics flag so the preset's choice of
-        // FLAG_* doesn't trap the user.
-        const epSlider = (label, getScalar, setScalar, flag, opts = {}) => {
-            const { lo = -6, hi = 0, step = 0.25 } = opts;
-            const cur = getScalar();
-            const offBoundary = lo - 0.05;
-            const valueAt = cur > 0 ? Math.log10(cur) : (lo - 0.5);
-            return {
-                type: 'slider', label,
-                min: lo - 0.5, max: hi, step,
-                value: valueAt,
-                format: v => (v <= offBoundary ? 'off' : '1e' + v.toFixed(2)),
-                onChange: v => {
-                    if (v <= offBoundary) {
-                        setScalar(0);
-                        sim.setPhysicsFlag(flag, false);
-                    } else {
-                        setScalar(Math.pow(10, v));
-                        sim.setPhysicsFlag(flag, true);
-                    }
-                },
-            };
-        };
-
         _settings.create(settingsBtn, [
             { type: 'slider', label: 'CFL', min: 0.1, max: 0.8, step: 0.05,
               value: sim.cfl, format: v => v.toFixed(2),
@@ -151,11 +124,9 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'p-floor (log10)', min: -8, max: -3, step: 0.5,
               value: Math.log10(sim.pressureFloor), format: v => '1e' + v.toFixed(1),
               onChange: v => sim.setPressureFloor(Math.pow(10, v)) },
-            // Anomalous resistivity — α = 0 disables the boost (sim runs
-            // with constant η_0). α > 0 activates Birn-2001-style
+            // Anomalous resistivity — α = 0 disables the boost (sim
+            // runs with constant η_0). α > 0 activates Birn-2001-style
             // |J|>J_crit enhanced resistivity for fast reconnection.
-            // Slider is log10 in [−6, 0] = [1e-6, 1.0] plus an explicit
-            // "off" snap at the bottom.
             { type: 'slider', label: 'η-anom α (log10)', min: -6, max: 0, step: 0.25,
               value: (sim.etaAnomAlpha > 0 ? Math.log10(sim.etaAnomAlpha) : -6.5),
               format: v => (v <= -6.05 ? 'off' : '1e' + v.toFixed(2)),
@@ -163,160 +134,15 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'η-anom J_crit', min: 1, max: 100, step: 1,
               value: sim.etaAnomJcrit, format: v => v.toFixed(0),
               onChange: v => sim.setEtaAnomJcrit(v) },
-
-            // ── Extended physics (Session 15) ───────────────────
-            // Each scalar slider is log10 with a snap-to-0/"off" at the
-            // bottom that also clears the corresponding FLAG_* bit. EMF
-            // mode is a separate two-button group; positivity guard is
-            // a toggle (no scalar).
-            epSlider('Hall d_i (log10)',
-                () => sim.hallDi, v => sim.setHallDi(v),
-                FLAG_HALL, { lo: -4 }),
-            { type: 'slider', label: 'Hall p_e / p', min: 0, max: 1, step: 0.05,
-              value: sim.hallElectronPressureFrac, format: v => v.toFixed(2),
-              onChange: v => sim.setHallElectronPressureFrac(v) },
-            epSlider('Cooling Λ₀ (log10)',
-                () => sim.coolingLambda0, v => sim.setCoolingLambda0(v),
-                FLAG_COOLING, { lo: -4 }),
-            { type: 'mode', label: 'Cooling curve', dataAttr: 'cooling-curve',
-              buttons: [
-                  { value: String(COOLING_CURVE_TABULATED), label: 'tab',   active: sim.coolingCurveMode === COOLING_CURVE_TABULATED },
-                  { value: String(COOLING_CURVE_CIE),   label: 'CIE',   active: sim.coolingCurveMode === COOLING_CURVE_CIE },
-                  { value: String(COOLING_CURVE_TABLE), label: 'table', active: sim.coolingCurveMode === COOLING_CURVE_TABLE },
-                  { value: String(COOLING_CURVE_BREMS), label: 'brems', active: sim.coolingCurveMode === COOLING_CURVE_BREMS },
-              ],
-              onChange: v => sim.setCoolingCurveMode(parseInt(v, 10)) },
-            { type: 'slider', label: 'Metallicity Z', min: 0, max: 3, step: 0.1,
-              value: sim.coolingMetallicity, format: v => v.toFixed(1) + '×',
-              onChange: v => sim.setCoolingMetallicity(v) },
-            epSlider('Heating Γ (log10)',
-                () => sim.heatingGamma0, v => sim.setHeatingGamma0(v),
-                FLAG_HEATING, { lo: -6, hi: 0 }),
-            { type: 'slider', label: 'Heating ρ exponent', min: 0, max: 2, step: 0.1,
-              value: sim.heatingDensityExp, format: v => v.toFixed(1),
-              onChange: v => sim.setHeatingDensityExp(v) },
-            { type: 'slider', label: 'Heating T cutoff', min: -4.5, max: 2, step: 0.25,
-              value: sim.heatingTCut > 0 ? Math.log10(sim.heatingTCut) : -4.5,
-              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
-              onChange: v => sim.setHeatingTCut(v <= -4.45 ? 0 : Math.pow(10, v)) },
-            epSlider('Conduction κ∥ (log10)',
-                () => sim.conductionKappa, v => sim.setConductionKappa(v),
-                FLAG_CONDUCTION, { lo: -6 }),
-            { type: 'slider', label: 'κ⊥ / κ∥', min: 0, max: 1, step: 0.05,
-              value: sim.conductionIsoFrac, format: v => v.toFixed(2),
-              onChange: v => sim.setConductionIsoFrac(v) },
-            { type: 'slider', label: 'q_sat φ', min: 0, max: 1, step: 0.05,
-              value: sim.conductionSatFrac, format: v => (v <= 0 ? 'off' : v.toFixed(2)),
-              onChange: v => sim.setConductionSatFrac(v) },
-            epSlider('Radiation c (log10)',
-                () => sim.radiationC, v => sim.setRadiationC(v),
-                FLAG_RADIATION, { lo: -2, hi: 2 }),
-            { type: 'slider', label: 'Radiation κ_abs', min: -4.5, max: 2, step: 0.25,
-              value: sim.radiationKappaAbs > 0 ? Math.log10(sim.radiationKappaAbs) : -4.5,
-              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
-              onChange: v => sim.setRadiationKappaAbs(v <= -4.45 ? 0 : Math.pow(10, v)) },
-            { type: 'slider', label: 'Radiation κ_scat', min: -4.5, max: 2, step: 0.25,
-              value: sim.radiationKappaScat > 0 ? Math.log10(sim.radiationKappaScat) : -4.5,
-              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
-              onChange: v => sim.setRadiationKappaScat(v <= -4.45 ? 0 : Math.pow(10, v)) },
-            { type: 'slider', label: 'Radiation a_r', min: -4, max: 1, step: 0.25,
-              value: Math.log10(Math.max(sim.radiationConst, 1e-30)),
-              format: v => '1e' + v.toFixed(2),
-              onChange: v => sim.setRadiationConst(Math.pow(10, v)) },
-            epSlider('Viscosity ν (log10)',
-                () => sim.viscosityNu, v => sim.setViscosityNu(v),
-                FLAG_VISCOSITY, { lo: -7, hi: -1 }),
-            { type: 'slider', label: 'Bulk viscosity', min: -7.5, max: -1, step: 0.25,
-              value: sim.viscosityBulk > 0 ? Math.log10(sim.viscosityBulk) : -7.5,
-              format: v => (v <= -7.45 ? 'off' : '1e' + v.toFixed(2)),
-              onChange: v => sim.setViscosityBulk(v <= -7.45 ? 0 : Math.pow(10, v)) },
-            { type: 'slider', label: 'ν B-aligned frac', min: 0, max: 1, step: 0.05,
-              value: sim.viscosityAnisoFrac, format: v => v.toFixed(2),
-              onChange: v => sim.setViscosityAnisoFrac(v) },
-            { type: 'slider', label: 'Shock viscosity', min: -7.5, max: -1, step: 0.25,
-              value: sim.viscosityShock > 0 ? Math.log10(sim.viscosityShock) : -7.5,
-              format: v => (v <= -7.45 ? 'off' : '1e' + v.toFixed(2)),
-              onChange: v => sim.setViscosityShock(v <= -7.45 ? 0 : Math.pow(10, v)) },
-            epSlider('Ambipolar η_A (log10)',
-                () => sim.ambipolarEta, v => sim.setAmbipolarEta(v),
-                FLAG_AMBIPOLAR, { lo: -7, hi: -1 }),
-            { type: 'slider', label: 'Neutral fraction', min: 0, max: 1, step: 0.05,
-              value: sim.neutralFrac, format: v => v.toFixed(2),
-              onChange: v => sim.setNeutralFrac(v) },
-            { type: 'slider', label: 'Ionization T₀', min: -4, max: 2, step: 0.25,
-              value: Math.log10(sim.ionizationT0), format: v => '1e' + v.toFixed(2),
-              onChange: v => sim.setIonizationT0(Math.pow(10, v)) },
-            epSlider('Biermann C_B (log10)',
-                () => Math.abs(sim.biermannCoeff), v => sim.setBiermannCoeff(v),
-                FLAG_BIERMANN, { lo: -8, hi: -1 }),
-            epSlider('Electron d_e (log10)',
-                () => sim.electronInertiaLength, v => sim.setElectronInertiaLength(v),
-                FLAG_ELECTRON_INERTIA, { lo: -5, hi: -1 }),
-            { type: 'slider', label: 'Electron damping', min: -4.5, max: 0, step: 0.25,
-              value: sim.electronInertiaDamping > 0 ? Math.log10(sim.electronInertiaDamping) : -4.5,
-              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
-              onChange: v => {
-                  sim.setElectronInertiaDamping(v <= -4.45 ? 0 : Math.pow(10, v));
-                  sim.setPhysicsFlag(FLAG_ELECTRON_INERTIA,
-                      sim.electronInertiaLength > 0 && v > -4.45);
-              } },
-            epSlider('Self-gravity G (log10)',
-                () => sim.gravityG, v => sim.setGravityG(v),
-                FLAG_GRAVITY_SELF, { lo: -4, hi: 2 }),
-            { type: 'slider', label: 'Poisson iters', min: 0, max: 128, step: 1,
-              value: sim.gravityPoissonIters, format: v => String(v | 0),
-              onChange: v => sim.setGravityPoissonIters(v | 0) },
-            { type: 'slider', label: 'Gravity softening', min: 0, max: 0.2, step: 0.005,
-              value: sim.gravitySoftening, format: v => (v <= 0 ? 'off' : v.toFixed(3)),
-              onChange: v => sim.setGravitySoftening(v) },
-            { type: 'slider', label: 'Jacobi ω', min: 0.2, max: 1.8, step: 0.05,
-              value: sim.gravityPoissonOmega, format: v => v.toFixed(2),
-              onChange: v => sim.setGravityPoissonOmega(v) },
-            { type: 'mode', label: 'Gravity boundary', dataAttr: 'gravity-boundary',
-              buttons: [
-                  { value: String(GRAVITY_BOUNDARY_PERIODIC), label: 'periodic',
-                    active: sim.gravityBoundaryMode === GRAVITY_BOUNDARY_PERIODIC },
-                  { value: String(GRAVITY_BOUNDARY_ISOLATED), label: 'isolated',
-                    active: sim.gravityBoundaryMode === GRAVITY_BOUNDARY_ISOLATED },
-              ],
-              onChange: v => sim.setGravityBoundaryMode(v | 0) },
-            { type: 'mode', label: 'Gravity solver', dataAttr: 'gravity-solver',
-              buttons: [
-                  { value: String(GRAVITY_SOLVER_MULTIGRID), label: 'multi',
-                    active: sim.gravitySolverMode === GRAVITY_SOLVER_MULTIGRID },
-                  { value: String(GRAVITY_SOLVER_JACOBI), label: 'jacobi',
-                    active: sim.gravitySolverMode === GRAVITY_SOLVER_JACOBI },
-              ],
-              onChange: v => sim.setGravitySolverMode(v | 0) },
-            { type: 'mode', label: 'Geometry', dataAttr: 'geometry-mode',
-              buttons: [
-                  { value: String(GEOMETRY_CARTESIAN),   label: 'cart', active: sim.geometryMode === GEOMETRY_CARTESIAN },
-                  { value: String(GEOMETRY_CYLINDRICAL), label: 'cyl',  active: sim.geometryMode === GEOMETRY_CYLINDRICAL },
-              ],
-              onChange: v => {
-                  const mode = parseInt(v, 10);
-                  sim.setGeometryMode(mode);
-                  sim.setPhysicsFlag(FLAG_GEOMETRY, mode === GEOMETRY_CYLINDRICAL);
-              } },
-            { type: 'slider', label: 'r-axis guard', min: 0, max: 0.25, step: 0.005,
-              value: sim.geometryRMin, format: v => v.toFixed(3),
-              onChange: v => sim.setGeometryRMin(v) },
-            { type: 'slider', label: 'Sponge width', min: 0, max: 32, step: 1,
-              value: sim.spongeWidth, format: v => (v <= 0 ? 'off' : v.toFixed(0) + ' cells'),
-              onChange: v => {
-                  sim.setSpongeWidth(v);
-                  sim.setPhysicsFlag(FLAG_SPONGE, v > 0 && sim.spongeStrength > 0);
-              } },
-            epSlider('Sponge strength (log10)',
-                () => sim.spongeStrength, v => sim.setSpongeStrength(v),
-                FLAG_SPONGE, { lo: -3, hi: 1 }),
             { type: 'slider', label: 'Source substeps cap', min: 1, max: 64, step: 1,
               value: sim.sourceSubstepsMax, format: v => String(v | 0),
               onChange: v => sim.setSourceSubstepsMax(v | 0) },
             { type: 'mode', label: 'EMF', dataAttr: 'emf-mode',
               buttons: [
-                  { value: String(EMF_MODE_BS_MEAN),   label: 'BS mean',  active: sim.emfMode === EMF_MODE_BS_MEAN },
-                  { value: String(EMF_MODE_GS_UPWIND), label: 'GS upwind', active: sim.emfMode === EMF_MODE_GS_UPWIND },
+                  { value: String(EMF_MODE_BS_MEAN),   label: 'BS mean',
+                    active: sim.emfMode === EMF_MODE_BS_MEAN },
+                  { value: String(EMF_MODE_GS_UPWIND), label: 'GS upwind',
+                    active: sim.emfMode === EMF_MODE_GS_UPWIND },
               ],
               onChange: v => sim.setEmfMode(parseInt(v, 10)) },
             { type: 'toggle', label: 'Positivity guard',
@@ -329,15 +155,15 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'LIC drift', min: 0, max: 4, step: 0.1,
               value: sim.licDriftX, format: v => v.toFixed(1) + ' px/s',
               onChange: v => sim.setLicDrift(v, sim.licDriftY) },
-        ], { width: 320 });
+        ], { width: 280 });
     }
 
     // ── About panel ───────────────────────────────────────────
     if (typeof initAboutPanel === 'function') {
         const aboutHandle = initAboutPanel({
             title: 'Plasma',
-            lastUpdated: '2026-05-28',
-            description: 'WebGPU-native 2D resistive MHD plasma simulator. Hover the canvas to sample the local state; left-drag pushes the plasma, right-drag twists the field. Use Settings to switch preset, view mode, resistivity, and boundary conditions.',
+            lastUpdated: '2026-05-27',
+            description: 'WebGPU-native 2D resistive MHD plasma simulator. Hover the canvas to sample the local state; left-drag pushes the plasma, right-drag twists the field. Settings holds preset / view / η / resolution / boundaries; Physics holds the extended source layer (Hall, cooling, conduction, radiation, viscosity, non-ideal Ohm, gravity, geometry); Stats and Probe surface the live diagnostics.',
             controls: [
                 { label: 'Sample cell',  value: 'Hover canvas' },
                 { label: 'Push plasma',  value: 'Left-click drag' },
@@ -751,7 +577,8 @@ function _buildShortcuts(simShell, sim, stats, probe) {
         { key: 's',      label: 'Save state',             group: 'State',      action: saveState },
         { key: 'l',      label: 'Load state',             group: 'State',      action: loadState },
         { key: '1',      label: 'Settings tab',           group: 'Sidebar',    action: () => switchTab('settings') },
-        { key: '2',      label: 'Stats tab',              group: 'Sidebar',    action: () => switchTab('stats') },
-        { key: '3',      label: 'Probe tab',              group: 'Sidebar',    action: () => switchTab('probe') },
+        { key: '2',      label: 'Physics tab',            group: 'Sidebar',    action: () => switchTab('physics') },
+        { key: '3',      label: 'Stats tab',              group: 'Sidebar',    action: () => switchTab('stats') },
+        { key: '4',      label: 'Probe tab',              group: 'Sidebar',    action: () => switchTab('probe') },
     ];
 }

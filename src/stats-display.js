@@ -1,10 +1,11 @@
 /**
- * @fileoverview Stats tab — energy / β / ∇·B / reconnection-rate display.
+ * @fileoverview Stats tab — energy / β / maxima / ∇·B / reconnection /
+ * conservation drift display.
  *
  * The heavy aggregates are reduced on the GPU by
- * conservation-{reduce,finalize}.wgsl. This panel reads back only dt,
- * the scalar diagnostics packet, and optional timestamps at a low cadence
- * instead of copying U/B field buffers to JS.
+ * conservation-{reduce,finalize}.wgsl. This panel reads back only dt and
+ * the scalar diagnostics packet at a low cadence instead of copying U/B
+ * field buffers to JS.
  *
  * The conservation-drift baseline is captured at the first successful
  * readback and reset whenever the user changes preset/resolution.
@@ -12,13 +13,19 @@
  * No `innerHTML` is used; the DOM is created via createElement and
  * mutated via `textContent` per the repo rule.
  *
- * Sparklines: one per primary aggregate (total energy, β-mean, ∇·B).
- * Capacity 240 samples ≈ 20 seconds at 12 Hz. Rendered every readback
- * tick onto a 160×32 DPR-aware canvas.
+ * Sparklines: one per primary aggregate (total energy, β-mean, ∇·B,
+ * conservation rows). Capacity 240 samples ≈ 20 s at 12 Hz. Rendered
+ * every readback tick onto a 160×32 DPR-aware canvas.
+ *
+ * Auto-pause-on-NaN: the conservation reduction also reports a
+ * non-finite cell count. When that goes above zero, the panel pauses
+ * the sim so a stale field view doesn't masquerade as a finished run.
+ * Counts and dt-min/floor diagnostics are deliberately not displayed —
+ * they were debug surface during the Session 14–21 hardening pass and
+ * the auto-pause is the user-meaningful signal that survived.
  */
 
 import { readbackBatch, ReadbackPool } from './gpu/readback.js';
-import { DT_MIN } from './config.js';
 
 const SPARK_CAP = 240;
 
@@ -130,22 +137,6 @@ export class StatsDisplay {
         const maxJ  = statRow('|J_z|_max');
         this.root.append(maxB.row, maxV.row, maxJ.row);
 
-        // Health counters — the diagnostic page caught these first; keeping
-        // them in the main UI makes numerical death visible before the field
-        // view turns into a misleading color patch.
-        this.root.append(groupLabel('Health'));
-        const nanCells = statRow('Nonfinite cells');
-        const rhoFloor = statRow('ρ floor cells');
-        const pFloor   = statRow('p floor cells');
-        const dtMin    = statRow('dt min');
-        this.root.append(nanCells.row, rhoFloor.row, pFloor.row, dtMin.row);
-        this._healthRefs = {
-            nanCells: nanCells.value,
-            rhoFloor: rhoFloor.value,
-            pFloor: pFloor.value,
-            dtMin: dtMin.value,
-        };
-
         // ∇·B section
         this.root.append(groupLabel('Divergence'));
         const divB = statRow('‖∇·B‖₂');
@@ -195,27 +186,12 @@ export class StatsDisplay {
         this._reconWrap.hidden = true;
         this.root.append(this._reconWrap);
 
-        // Time + step (always visible footer)
-        this.root.append(groupLabel('Clock'));
-        const tStep = statRow('Step');
-        const tCfl  = statRow('CFL');
-        const tGpu  = statRow('GPU step');
-        const tHall = statRow('Hall substeps');
-        const tCond = statRow('Cond substeps');
-        const tVisc = statRow('Visc substeps');
-        const tNonideal = statRow('Nonideal substeps');
-        this.root.append(tStep.row, tCfl.row, tGpu.row, tHall.row, tCond.row,
-                         tVisc.row, tNonideal.row);
-
         this._refs = {
             eTot: eTot.value, eKin: eKin.value, eMag: eMag.value,
             eInt: eInt.value, eDrift: eDrift.value,
             bMean: bMean.value, bMin: bMin.value, bMax: bMax.value,
             maxB: maxB.value, maxV: maxV.value, maxJ: maxJ.value,
             divB: divB.value, rrate: rrate.value,
-            tStep: tStep.value, tCfl: tCfl.value, tGpu: tGpu.value,
-            tHall: tHall.value, tCond: tCond.value,
-            tVisc: tVisc.value, tNonideal: tNonideal.value,
         };
     }
 
@@ -251,13 +227,6 @@ export class StatsDisplay {
             { buf: b.dt,   byteOffset: 0, byteSize: F32 },
             { buf: b.cons_out, byteOffset: 0, byteSize: 24 * F32 },
         ];
-        // Timestamp resolve buffer (2 × u64 = 16 B) when the device
-        // supports `timestamp-query`. Batched alongside the other reads so
-        // we keep one round-trip per cadence tick.
-        const tsIdx = (this.sim._tsResolve) ? specs.length : -1;
-        if (tsIdx >= 0) {
-            specs.push({ buf: this.sim._tsResolve, byteOffset: 0, byteSize: 16 });
-        }
 
         let bufs;
         try {
@@ -270,29 +239,10 @@ export class StatsDisplay {
         const dtArr = new Float32Array(bufs[0]);
         const statsArr = new Float32Array(bufs[1]);
 
-        // Decode the two 64-bit timestamps (ns since some device epoch) into
-        // a step time in ms. We read as two BigUint64s — the high bits of
-        // BigInt cap at 53-bit safe but the absolute timestamp values can
-        // exceed that; we subtract first as BigInt and only convert to
-        // Number after the diff fits.
-        let gpuMs = null;
-        if (tsIdx >= 0) {
-            try {
-                const ts = new BigUint64Array(bufs[tsIdx]);
-                const diffNs = ts[1] - ts[0];
-                gpuMs = Number(diffNs) / 1_000_000;
-                if (Number.isFinite(gpuMs) && gpuMs >= 0) {
-                    this.sim._tsLastMs = gpuMs;
-                }
-            } catch (e) {
-                // BigUint64Array might not be available; drop silently.
-            }
-        }
-
-        this._compute(dtArr[0], gpuMs, statsArr);
+        this._compute(dtArr[0], statsArr);
     }
 
-    _compute(dt, gpuMs, consArr) {
+    _compute(dt, consArr) {
         const dx = this.sim.dx;
         const cellArea = dx * dx;
         const nCells = Math.max(0, Math.round(consArr[20] || 0));
@@ -308,9 +258,10 @@ export class StatsDisplay {
         const vMagMax = consArr[13];
         const jzMax = consArr[14];
         const divBNorm = Math.sqrt(Math.max(consArr[15] * cellArea, 0));
+        // NaN-cell count drives the safety auto-pause below — it's a
+        // safety signal, not a UI readout. The diagnostic Stats panel
+        // intentionally doesn't display it.
         const nanCount = Math.round(consArr[16] || 0);
-        const rhoFloorCount = Math.round(consArr[17] || 0);
-        const pFloorCount = Math.round(consArr[18] || 0);
 
         if (!this._baseline) this._baseline = { Etot };
         const drift = this._baseline.Etot !== 0
@@ -351,27 +302,9 @@ export class StatsDisplay {
 
         this._refs.divB.textContent = fmt(divBNorm);
         this._refs.rrate.textContent = (rrate >= 0 ? '+' : '') + rrate.toExponential(3);
-        this._healthRefs.nanCells.textContent = String(nanCount);
-        this._healthRefs.rhoFloor.textContent = String(rhoFloorCount);
-        this._healthRefs.pFloor.textContent = String(pFloorCount);
-        this._healthRefs.dtMin.textContent = dt <= 1.001 * DT_MIN ? 'yes' : 'no';
         if (nanCount > 0 && this.sim.running) {
             this.sim.setRunning(false);
             console.warn(`[plasma.stats] paused after detecting ${nanCount} nonfinite cells`);
-        }
-
-        this._refs.tStep.textContent = String(this.sim.stepCount);
-        this._refs.tCfl.textContent  = dt.toExponential(3);
-        this._refs.tHall.textContent = String(this.sim._lastHallSubsteps ?? 1);
-        this._refs.tCond.textContent = String(this.sim._lastCondSubsteps ?? 1);
-        this._refs.tVisc.textContent = String(this.sim._lastViscSubsteps ?? 1);
-        this._refs.tNonideal.textContent = String(this.sim._lastNonidealSubsteps ?? 1);
-        // GPU step time. When timestamp-query isn't supported, we never
-        // populate `gpuMs`; fall back to em-dash via the cached refs.
-        if (gpuMs != null && Number.isFinite(gpuMs)) {
-            this._refs.tGpu.textContent = gpuMs.toFixed(2) + ' ms';
-        } else if (this.sim._tsLastMs > 0) {
-            this._refs.tGpu.textContent = this.sim._tsLastMs.toFixed(2) + ' ms';
         }
 
         // Update sparklines.

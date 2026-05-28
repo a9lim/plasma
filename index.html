@@ -15,9 +15,15 @@
     <meta property="og:url" content="https://a9l.im/plasma">
     <meta property="og:site_name" content="a9l.im">
     <meta property="og:locale" content="en_US">
+    <meta property="og:image" content="https://a9l.im/plasma/og-image.webp">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:type" content="image/webp">
+    <meta property="og:image:alt" content="Plasma — 2D resistive magnetohydrodynamics simulator">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="Plasma — 2D Resistive MHD Simulator">
     <meta name="twitter:description" content="WebGPU-native interactive 2D resistive MHD plasma simulator.">
+    <meta name="twitter:image" content="https://a9l.im/plasma/og-image.webp">
     <meta name="twitter:site" content="@_a9lim">
     <meta name="twitter:creator" content="@_a9lim">
     <link rel="icon" href="/favicon.ico">
@@ -302,6 +308,7 @@
         <div class="stats-header">
             <div class="sidebar-tabs" role="tablist" aria-label="Sidebar tabs">
                 <button class="tab-btn active" data-tab="settings" role="tab" aria-selected="true">Settings</button>
+                <button class="tab-btn" data-tab="physics"  role="tab" aria-selected="false">Physics</button>
                 <button class="tab-btn" data-tab="stats"    role="tab" aria-selected="false">Stats</button>
                 <button class="tab-btn" data-tab="probe"    role="tab" aria-selected="false">Probe</button>
             </div>
@@ -440,6 +447,10 @@
                             </div>
                         </div>
                     </div>
+                </section>
+
+                <!-- ── Physics (extended source layer; built by physics-panel.js) ── -->
+                <section class="tab-panel" id="tab-physics" role="tabpanel" data-tab="physics">
                 </section>
 
                 <!-- ── Stats ── -->

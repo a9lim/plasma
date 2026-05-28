@@ -426,6 +426,14 @@ export class PlasmaBuffers {
         });
 
         // ── Stage-params uniform buffers (one per RK3 stage) ───────
+        // RK3 SSP (Gottlieb-Shu 1998) Butcher-style coefficients,
+        // written ONCE here at init and never touched again. The hot
+        // path in sim.js just rebinds whichever of stage_{1,2,3} the
+        // current stage needs — there is no per-step writeBuffer call.
+        // Splitting into three immutable buffers (rather than one buffer
+        // with offset views) lets each bind group cache aim at a single
+        // GPU resource and matches the transpiler's static-uniform
+        // specialization pattern (see _build.mjs RK3_STAGE_WEIGHTS).
         const stageMk = (label) => device.createBuffer({
             label, size: STAGE_PARAMS_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -437,6 +445,7 @@ export class PlasmaBuffers {
             const arr = new Float32Array([a0, a1, dtw, 0]);
             device.queue.writeBuffer(buf, 0, arr.buffer);
         };
+        // SSP coefficients: U_{n+1} = a0 · U_n + a1 · U_prev + dtw · dt · L(U_prev)
         writeStage(this.stage_1, 1.0,     0.0,     1.0);
         writeStage(this.stage_2, 3.0/4.0, 1.0/4.0, 1.0/4.0);
         writeStage(this.stage_3, 1.0/3.0, 2.0/3.0, 2.0/3.0);
