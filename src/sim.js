@@ -51,18 +51,23 @@ import { PlasmaRenderer } from './gpu/render.js';
 import { ReadbackPool, readbackSlice } from './gpu/readback.js';
 import { makeOrszagTangPreset, PRESETS } from './presets.js';
 import { VIRIDIS } from './colormaps.js';
+import { MICRO_TRANSPORT_MAX_SCALE } from './microphysics.js';
 import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, GAMMA_DEFAULT, WORKGROUP,
     VIEW_JZ, ETA_DEFAULT, BC_PERIODIC, CFL, PRESSURE_FLOOR,
     LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, DT_MAX,
-    FLAG_GRAVITY_SELF, FLAG_HALL, FLAG_CONDUCTION,
-    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY,
+    FLAG_COOLING, FLAG_GRAVITY_EXT, FLAG_GRAVITY_SELF, FLAG_HALL, FLAG_CONDUCTION,
+    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_GEOMETRY,
+    FLAG_SPONGE, FLAG_HEATING, FLAG_RADIATION, FLAG_ELECTRON_INERTIA,
     BASE_PHYSICS_FLAGS, EXTENDED_SOURCE_FLAGS,
     EMF_MODE_GS_UPWIND, COOLING_CURVE_TABULATED,
-    GEOMETRY_CARTESIAN,
+    GEOMETRY_CARTESIAN, GEOMETRY_CYLINDRICAL,
+    GRAVITY_BOUNDARY_PERIODIC,
+    GRAVITY_SOLVER_MULTIGRID, GRAVITY_SOLVER_JACOBI,
 } from './config.js';
 
 const WG = WORKGROUP;
+const SOURCE_SUBSTEPS_HARD_MAX = 128;
 const DEFAULT_PHYSICS_STATE = Object.freeze({
     physicsFlags: BASE_PHYSICS_FLAGS,
     emfMode: EMF_MODE_GS_UPWIND,
@@ -79,6 +84,8 @@ const DEFAULT_PHYSICS_STATE = Object.freeze({
     gravityGy: 0.0,
     gravityG: 1.0e-3,
     gravityPoissonIters: 30,
+    gravityBoundaryMode: GRAVITY_BOUNDARY_PERIODIC,
+    gravitySolverMode: GRAVITY_SOLVER_MULTIGRID,
     hallElectronPressureFrac: 0.0,
     coolingMetallicity: 1.0,
     heatingGamma0: 0.0,
@@ -100,7 +107,22 @@ const DEFAULT_PHYSICS_STATE = Object.freeze({
     spongeWidth: 0.0,
     spongeStrength: 0.0,
     coolingTableMix: 0.0,
+    radiationC: 0.0,
+    radiationKappaAbs: 0.0,
+    radiationKappaScat: 0.0,
+    radiationConst: 1.0,
+    radiationFloor: 1.0e-12,
+    electronInertiaLength: 0.0,
+    electronInertiaDamping: 0.0,
 });
+
+function defaultBCConfig() {
+    return {
+        modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+        modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        driven: { rho: 1, vx: 0, vy: 0, vz: 0, bx: 0, by: 0, bz: 0, p: 1 },
+    };
+}
 
 export class Sim {
     constructor(device, context, format, opts = {}) {
@@ -147,12 +169,13 @@ export class Sim {
         this._lastDtHyp        = 1.0e-4;
         this._lastDtParabolic  = 1.0e30;
         this._lastEtaMax       = 0;
-        this._lastHallSpeedMax = 0;
+        this._lastHallRateMax = 0;
         this._lastHallSubsteps = 1;
-        this._lastCondSpeedMax = 0;
+        this._lastCondRateMax = 0;
         this._lastCondSubsteps = 1;
         this._lastViscSubsteps = 1;
         this._lastNonidealSubsteps = 1;
+        this._lastRadiationSubsteps = 1;
         this._lastSuperStepS   = 1;
         this._dtReadbackBusy   = false;
         this._dtReadbackPool   = null;  // lazy-init in init()
@@ -183,11 +206,7 @@ export class Sim {
         this.renderer  = null;
 
         // Default BC state: all periodic, neutral driven state.
-        this.bcConfig = {
-            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
-            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
-            driven: { rho: 1, vx: 0, vy: 0, vz: 0, bx: 0, by: 0, bz: 0, p: 1 },
-        };
+        this.bcConfig = defaultBCConfig();
     }
 
     async init() {
@@ -256,6 +275,8 @@ export class Sim {
         if (physics.gravityGy !== undefined)           this.gravityGy = +physics.gravityGy || 0;
         if (physics.gravityG !== undefined)            this.gravityG = Math.max(0, +physics.gravityG || 0);
         if (physics.gravityPoissonIters !== undefined) this.gravityPoissonIters = Math.max(0, physics.gravityPoissonIters | 0);
+        if (physics.gravityBoundaryMode !== undefined) this.gravityBoundaryMode = Math.max(0, physics.gravityBoundaryMode | 0);
+        if (physics.gravitySolverMode !== undefined)   this.gravitySolverMode = physics.gravitySolverMode | 0;
         if (physics.hallElectronPressureFrac !== undefined) {
             this.hallElectronPressureFrac = Math.min(1, Math.max(0, +physics.hallElectronPressureFrac || 0));
         }
@@ -279,6 +300,13 @@ export class Sim {
         if (physics.spongeWidth !== undefined)        this.spongeWidth = Math.max(0, +physics.spongeWidth || 0);
         if (physics.spongeStrength !== undefined)     this.spongeStrength = Math.max(0, +physics.spongeStrength || 0);
         if (physics.coolingTableMix !== undefined)    this.coolingTableMix = Math.max(0, +physics.coolingTableMix || 0);
+        if (physics.radiationC !== undefined)          this.radiationC = Math.max(0, +physics.radiationC || 0);
+        if (physics.radiationKappaAbs !== undefined)   this.radiationKappaAbs = Math.max(0, +physics.radiationKappaAbs || 0);
+        if (physics.radiationKappaScat !== undefined)  this.radiationKappaScat = Math.max(0, +physics.radiationKappaScat || 0);
+        if (physics.radiationConst !== undefined)      this.radiationConst = Math.max(0, +physics.radiationConst || 0);
+        if (physics.radiationFloor !== undefined)      this.radiationFloor = Math.max(0, +physics.radiationFloor || 0);
+        if (physics.electronInertiaLength !== undefined)  this.electronInertiaLength = Math.max(0, +physics.electronInertiaLength || 0);
+        if (physics.electronInertiaDamping !== undefined) this.electronInertiaDamping = Math.max(0, +physics.electronInertiaDamping || 0);
     }
 
     loadPreset(preset) {
@@ -297,9 +325,7 @@ export class Sim {
         // For presets without a floor (etaFloorCoeff = 0) this is a no-op
         // and preset.eta (often 0 = ideal MHD) passes through unchanged.
         this.eta = Math.max(preset.eta ?? this.eta, this.getEtaMin());
-        if (preset.bc) {
-            this.bcConfig = { ...this.bcConfig, ...preset.bc };
-        }
+        this.bcConfig = { ...defaultBCConfig(), ...(preset.bc || {}) };
         this._applyPhysicsConfig(preset.physics);
         if (preset.id) this.presetName = preset.id;
         this.buffers.uploadInitialState(preset.data);
@@ -309,12 +335,13 @@ export class Sim {
         this._lastDtHyp       = 1.0e-4;
         this._lastDtParabolic = 1.0e30;
         this._lastEtaMax      = 0;
-        this._lastHallSpeedMax = 0;
+        this._lastHallRateMax = 0;
         this._lastHallSubsteps = 1;
-        this._lastCondSpeedMax = 0;
+        this._lastCondRateMax = 0;
         this._lastCondSubsteps = 1;
         this._lastViscSubsteps = 1;
         this._lastNonidealSubsteps = 1;
+        this._lastRadiationSubsteps = 1;
         this._pendingTimeSteps = 0;
         this._pushUniforms();
         this.buffers.pushBC(this.bcConfig);
@@ -351,11 +378,19 @@ export class Sim {
      * Update the driven inflow primitive state. Partial — only provided
      * fields are overwritten.
      */
-    setDrivenState(state) {
-        this.bcConfig = {
-            ...this.bcConfig,
-            driven: { ...this.bcConfig.driven, ...state },
-        };
+    setDrivenState(state, edge = null) {
+        const edgeKey = edge ? ({ N: 'drivenN', S: 'drivenS', E: 'drivenE', W: 'drivenW' })[edge] : null;
+        if (edgeKey) {
+            this.bcConfig = {
+                ...this.bcConfig,
+                [edgeKey]: { ...(this.bcConfig[edgeKey] || this.bcConfig.driven), ...state },
+            };
+        } else {
+            this.bcConfig = {
+                ...this.bcConfig,
+                driven: { ...this.bcConfig.driven, ...state },
+            };
+        }
         this.buffers.pushBC(this.bcConfig);
     }
 
@@ -449,6 +484,8 @@ export class Sim {
     setGravityG(v)               { this.gravityG = Math.max(0, +v || 0); this._pushUniforms(); }
     setGravityVec(gx, gy)        { this.gravityGx = +gx || 0; this.gravityGy = +gy || 0; this._pushUniforms(); }
     setGravityPoissonIters(n)    { this.gravityPoissonIters = Math.max(0, n | 0); this._pushUniforms(); }
+    setGravityBoundaryMode(mode) { this.gravityBoundaryMode = Math.max(0, mode | 0); this._pushUniforms(); }
+    setGravitySolverMode(mode)   { this.gravitySolverMode = mode === GRAVITY_SOLVER_JACOBI ? GRAVITY_SOLVER_JACOBI : GRAVITY_SOLVER_MULTIGRID; }
     setCoolingMetallicity(v)     { this.coolingMetallicity = Math.max(0, +v || 0); this._pushUniforms(); }
     setHeatingGamma0(v)          { this.heatingGamma0 = Math.max(0, +v || 0); this._pushUniforms(); }
     setHeatingDensityExp(v)      { this.heatingDensityExp = Math.max(0, +v || 0); this._pushUniforms(); }
@@ -468,6 +505,13 @@ export class Sim {
     setGravityPoissonOmega(v)    { this.gravityPoissonOmega = Math.min(1.95, Math.max(0.05, +v || 1)); this._pushUniforms(); }
     setSpongeWidth(v)            { this.spongeWidth = Math.max(0, +v || 0); this._pushUniforms(); }
     setSpongeStrength(v)         { this.spongeStrength = Math.max(0, +v || 0); this._pushUniforms(); }
+    setRadiationC(v)             { this.radiationC = Math.max(0, +v || 0); this._pushUniforms(); }
+    setRadiationKappaAbs(v)      { this.radiationKappaAbs = Math.max(0, +v || 0); this._pushUniforms(); }
+    setRadiationKappaScat(v)     { this.radiationKappaScat = Math.max(0, +v || 0); this._pushUniforms(); }
+    setRadiationConst(v)         { this.radiationConst = Math.max(0, +v || 0); this._pushUniforms(); }
+    setRadiationFloor(v)         { this.radiationFloor = Math.max(0, +v || 0); this._pushUniforms(); }
+    setElectronInertiaLength(v)  { this.electronInertiaLength = Math.max(0, +v || 0); this._pushUniforms(); }
+    setElectronInertiaDamping(v) { this.electronInertiaDamping = Math.max(0, +v || 0); this._pushUniforms(); }
 
     setRunning(r)       { this.running = !!r; }
     setSpeedScale(s)    { this.speedScale = s; }
@@ -490,9 +534,8 @@ export class Sim {
 
     /**
      * Re-allocate buffers at a new interior resolution and re-load the
-     * current preset. Existing buffers are released by dropping the
-     * `PlasmaBuffers` instance; GC handles GPU resource teardown when
-     * the device is alive.
+     * current preset. Existing GPU buffers are retired after already
+     * submitted work drains so repeated resolution toggles do not rely on GC.
      */
     setResolution(n) {
         if (n === this.n) return;
@@ -500,8 +543,7 @@ export class Sim {
             console.warn(`[plasma] setResolution: unsupported n=${n}`);
             return;
         }
-        // Destroy existing buffers (best-effort — WebGPU has no formal
-        // destroy on storage buffers; the GC will reclaim).
+        const oldBuffers = this.buffers;
         this.n       = n;
         this.n_total = n + 2 * this.ghost;
         this.dx      = this.domainLength / n;
@@ -518,6 +560,11 @@ export class Sim {
         // All GPU buffers changed identity — rebuild the bind-group cache
         // (and via _buildBindGroupCache, the renderer/LIC side caches).
         this._buildBindGroupCache();
+        if (oldBuffers && typeof oldBuffers.destroy === 'function') {
+            this.device.queue.onSubmittedWorkDone()
+                .then(() => oldBuffers.destroy())
+                .catch(() => oldBuffers.destroy());
+        }
     }
 
     /**
@@ -559,6 +606,8 @@ export class Sim {
                 gravityGy: this.gravityGy,
                 gravityG: this.gravityG,
                 gravityPoissonIters: this.gravityPoissonIters,
+                gravityBoundaryMode: this.gravityBoundaryMode,
+                gravitySolverMode: this.gravitySolverMode,
                 hallElectronPressureFrac: this.hallElectronPressureFrac,
                 coolingMetallicity: this.coolingMetallicity,
                 heatingGamma0: this.heatingGamma0,
@@ -580,6 +629,13 @@ export class Sim {
                 spongeWidth: this.spongeWidth,
                 spongeStrength: this.spongeStrength,
                 coolingTableMix: this.coolingTableMix,
+                radiationC: this.radiationC,
+                radiationKappaAbs: this.radiationKappaAbs,
+                radiationKappaScat: this.radiationKappaScat,
+                radiationConst: this.radiationConst,
+                radiationFloor: this.radiationFloor,
+                electronInertiaLength: this.electronInertiaLength,
+                electronInertiaDamping: this.electronInertiaDamping,
             },
         });
     }
@@ -587,8 +643,9 @@ export class Sim {
     /** Restore from `saveState()` output. */
     loadState(s) {
         let obj;
-        try { obj = JSON.parse(s); } catch (e) { console.warn('[plasma] loadState parse:', e); return; }
-        if (!obj || obj.v !== 1) return;
+        try { obj = JSON.parse(s); } catch (e) { console.warn('[plasma] loadState parse:', e); return { ok: false, buffersChanged: false }; }
+        if (!obj || obj.v !== 1) return { ok: false, buffersChanged: false };
+        const oldBuffers = this.buffers;
         if (obj.n && obj.n !== this.n) this.setResolution(obj.n);
         if (obj.preset) this.setPreset(obj.preset);
         if (obj.viewMode !== undefined) this.setViewMode(obj.viewMode);
@@ -609,6 +666,7 @@ export class Sim {
             this._pushUniforms();
         }
         if (obj.licIntensity !== undefined) this.setLicIntensity(obj.licIntensity);
+        return { ok: true, buffersChanged: this.buffers !== oldBuffers };
     }
 
     _pushUniforms() {
@@ -638,6 +696,7 @@ export class Sim {
             gravityGy:           this.gravityGy,
             gravityG:            this.gravityG,
             gravityPoissonIters: this.gravityPoissonIters,
+            gravityBoundaryMode: this.gravityBoundaryMode,
             hallElectronPressureFrac: this.hallElectronPressureFrac,
             coolingMetallicity: this.coolingMetallicity,
             heatingGamma0: this.heatingGamma0,
@@ -659,6 +718,13 @@ export class Sim {
             spongeWidth: this.spongeWidth,
             spongeStrength: this.spongeStrength,
             coolingTableMix: this.coolingTableMix,
+            radiationC: this.radiationC,
+            radiationKappaAbs: this.radiationKappaAbs,
+            radiationKappaScat: this.radiationKappaScat,
+            radiationConst: this.radiationConst,
+            radiationFloor: this.radiationFloor,
+            electronInertiaLength: this.electronInertiaLength,
+            electronInertiaDamping: this.electronInertiaDamping,
             physicsFlags:        this.physicsFlags,
             emfMode:             this.emfMode,
         });
@@ -716,6 +782,48 @@ export class Sim {
         });
     }
 
+    _memoBG(key, build) {
+        if (!this._dynamicBGCache) return build();
+        let bg = this._dynamicBGCache.get(key);
+        if (!bg) {
+            bg = build();
+            this._dynamicBGCache.set(key, bg);
+        }
+        return bg;
+    }
+
+    _bufKey(buffer) {
+        return buffer?.label ?? 'null';
+    }
+
+    _scaleDtBG(srcDt, dstDt) {
+        return this.device.createBindGroup({
+            label: 'plasma.scaleDt.bg',
+            layout: this.pipelines.layouts.scaleDt,
+            entries: [
+                { binding: 0, resource: { buffer: srcDt } },
+                { binding: 1, resource: { buffer: dstDt } },
+            ],
+        });
+    }
+
+    _sourceDtBG() {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.sourceDt.bg',
+            layout: this.pipelines.layouts.sourceDt,
+            entries: [
+                { binding: 0, resource: { buffer: b.dt_half } },
+                { binding: 1, resource: { buffer: b.source_dt_params } },
+                { binding: 2, resource: { buffer: b.hall_dt } },
+                { binding: 3, resource: { buffer: b.cond_dt } },
+                { binding: 4, resource: { buffer: b.visc_dt } },
+                { binding: 5, resource: { buffer: b.nonideal_dt } },
+                { binding: 6, resource: { buffer: b.rad_dt } },
+            ],
+        });
+    }
+
     _applyBcsBG(U0, U1, Bx, By) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -736,13 +844,9 @@ export class Sim {
     // The RKL2 implementation uses 5 buffer roles (dst, init, pprev,
     // prev, tmp) × 3 components (Bx, By, U1), bound per substep through
     // 3 different pipelines (snapshot, apply-resistivity-init,
-    // apply-resistivity-prev). Bind groups are NOT pre-baked per side —
-    // the resistivity super-step runs at the end of stage 3 on the SAME
-    // side's stage-3 dst buffers, and substep-to-substep rotation cycles
-    // through several different bind groups. We build fresh bind groups
-    // per super-step; the cost is small (< 50 µs each × 3 BGs × max 100
-    // substeps ≈ ~15 ms in the worst pathological super-step, single-
-    // digit ms in typical runs).
+    // apply-resistivity-prev). `_buildRkl2BindGroupCache()` pre-bakes
+    // the side × role-rotation × substep bind groups so the hot path only
+    // selects them.
     _applyResSnapBG(srcBx, srcBy, srcU1, dstBx, dstBy, dstU1) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -812,7 +916,8 @@ export class Sim {
     // Conservation diagnostics reduction (Session 8). Reads the
     // POST-step destination buffers — the bind group is built per
     // (stage 3 dst) side, since stage 3's dst is the next step's U_n.
-    // Output: `cons_out` (7 f32 + pad). One bind group per pipeline.
+    // Output: `cons_out` (24-scalar stats/conservation packet). One bind
+    // group per pipeline.
     _conservationTileBG(U0, U1, Bx, By) {
         const b = this.buffers;
         return this.device.createBindGroup({
@@ -977,6 +1082,25 @@ export class Sim {
         });
     }
 
+    // Pointer perturbation. Binds the CURRENT primary handles so the
+    // dispatch mutates U_n / face B directly — the next step() consumes
+    // the perturbed state. Two side variants (a/b) baked at startup.
+    _perturbBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.perturb.bg',
+            layout: this.pipelines.layouts.perturb,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.perturbUniform } },
+            ],
+        });
+    }
+
     /**
      * Pre-bake every bind group used by `step()` and `_encodeComputeDt`.
      * Called from `init()` and `setResolution()` — anywhere `this.buffers`
@@ -1003,6 +1127,7 @@ export class Sim {
      */
     _buildBindGroupCache() {
         const b = this.buffers;
+        this._dynamicBGCache = new Map();
         // Helper: build per-side handles for a hypothetical "_side = which"
         // configuration without mutating buffers._side. Mirrors the swap
         // logic but returns a struct.
@@ -1070,6 +1195,8 @@ export class Sim {
                 a: this._dtBG(sides.a.U0_n, sides.a.U1_n, sides.a.Bx_n, sides.a.By_n),
                 b: this._dtBG(sides.b.U0_n, sides.b.U1_n, sides.b.Bx_n, sides.b.By_n),
             },
+            scaleDtHalf: this._scaleDtBG(b.dt, b.dt_half),
+            sourceDt: this._sourceDtBG(),
             stage1: { a: buildStage(1, sides.a), b: buildStage(1, sides.b) },
             stage2: { a: buildStage(2, sides.a), b: buildStage(2, sides.b) },
             stage3: { a: buildStage(3, sides.a), b: buildStage(3, sides.b) },
@@ -1081,13 +1208,105 @@ export class Sim {
                 b: this._conservationTileBG(sides.b.U0_next, sides.b.U1_next, sides.b.Bx_next, sides.b.By_next),
             },
             consFinalize: this._conservationFinalizeBG(),
+            // Pointer perturbation operates on the CURRENT primary buffers.
+            // Build A/B variants so applyPerturbation can pick by side at
+            // call time without rebuilding bind groups per event.
+            perturb: {
+                a: this._perturbBG(sides.a.U0_n, sides.a.U1_n, sides.a.Bx_n, sides.a.By_n),
+                b: this._perturbBG(sides.b.U0_n, sides.b.U1_n, sides.b.Bx_n, sides.b.By_n),
+            },
         };
+        this._buildRkl2BindGroupCache();
+        this._buildSourceBindGroupCache();
 
         // Renderer / LIC bind groups also depend on the primary handles
         // (view-field reads U_n + face B; lic-advect reads face B). Have
         // the renderer rebuild its A/B cache against the new buffers.
         if (this.renderer)        this.renderer.rebuildSideCache();
         if (this.renderer && this.renderer.lic) this.renderer.lic.rebuildSideCache();
+    }
+
+    _buildSourceBindGroupCache() {
+        const b = this.buffers;
+        const sides = ['a', 'b'];
+        const targets = ['src', 'dst'];
+        this._sourceBGCache = { a: {}, b: {} };
+        for (const side of sides) {
+            for (const target of targets) {
+                const h = this._sourceHandles(side, target);
+                const timed = (dtBuffer) => ({
+                    cooling: this._coolingBG(h.U0, h.U1, h.Bx, h.By, dtBuffer),
+                    gravityPhi: this._gravityBG(h.U0, h.U1, b.phi, h.Bx, h.By, dtBuffer),
+                    gravityPhiNext: this._gravityBG(h.U0, h.U1, b.phi_next, h.Bx, h.By, dtBuffer),
+                    geometry: this._geometryBG(h.U0, h.U1, h.Bx, h.By, dtBuffer),
+                });
+                this._sourceBGCache[side][target] = {
+                    handles: h,
+                    applyBcs: this._applyBcsBG(h.U0, h.U1, h.Bx, h.By),
+                    conduction: this._conductionBG(h.U0, h.U1, h.Bx, h.By),
+                    ohm: this._ohmBG(h.U0, h.U1, h.Bx, h.By),
+                    viscosity: this._viscosityBG(h.U0, h.U1, h.Bx, h.By),
+                    radiation: this._radiationBG(h.U0, h.U1, h.Bx, h.By),
+                    energyFloor: this._energyFloorBG(h.U0, h.U1, h.Bx, h.By),
+                    dt: timed(b.dt),
+                    dtHalf: timed(b.dt_half),
+                };
+            }
+        }
+    }
+
+    _buildRkl2BindGroupCache() {
+        const b = this.buffers;
+        const initSet = { Bx: b.Bx_res_init,  By: b.By_res_init,  U1: b.U1_res_init  };
+        const sets = [
+            { Bx: b.Bx_res_pprev, By: b.By_res_pprev, U1: b.U1_res_pprev },
+            { Bx: b.Bx_res_prev,  By: b.By_res_prev,  U1: b.U1_res_prev  },
+            { Bx: b.Bx_res_tmp,   By: b.By_res_tmp,   U1: b.U1_res_tmp   },
+        ];
+        const sideHandles = {
+            a: { U0: b.U0_b, Bx: b.Bx_b, By: b.By_b, U1: b.U1_b },
+            b: { U0: b.U0_a, Bx: b.Bx_a, By: b.By_a, U1: b.U1_a },
+        };
+
+        this._rkl2BGCache = {};
+        for (const side of ['a', 'b']) {
+            const h = sideHandles[side];
+            const cache = {
+                seed: [initSet, ...sets].map(dest => this._applyResSnapBG(
+                    h.Bx, h.By, h.U1,
+                    dest.Bx, dest.By, dest.U1,
+                )),
+                init: [],
+                prev: [],
+                finalFromSet: sets.map(src => this._applyResSnapBG(
+                    src.Bx, src.By, src.U1,
+                    h.Bx,  h.By,  h.U1,
+                )),
+                energyFloor: this._energyFloorBG(h.U0, h.U1, h.Bx, h.By),
+            };
+
+            let pprev = 0, prev = 1, tmp = 2;
+            for (let j = 1; j <= b.sts_coeffs_max_s; j++) {
+                const stsMetaBuf = b.sts_meta_per_j[j - 1];
+                cache.init[j - 1] = this._applyResInitBG(
+                    stsMetaBuf,
+                    initSet.Bx, initSet.By, initSet.U1,
+                    sets[pprev].Bx, sets[pprev].By, sets[pprev].U1,
+                    sets[tmp].Bx,   sets[tmp].By,   sets[tmp].U1,
+                );
+                cache.prev[j - 1] = this._applyResPrevBG(
+                    stsMetaBuf,
+                    initSet.Bx, initSet.By,
+                    sets[prev].Bx, sets[prev].By, sets[prev].U1,
+                    sets[tmp].Bx,  sets[tmp].By,  sets[tmp].U1,
+                );
+                const oldPprev = pprev;
+                pprev = prev;
+                prev = tmp;
+                tmp = oldPprev;
+            }
+            this._rkl2BGCache[side] = cache;
+        }
     }
 
     _encodeComputeDt(encoder) {
@@ -1102,6 +1321,22 @@ export class Sim {
         pass.setPipeline(pipelines.pipelines.dtReduce);
         pass.dispatchWorkgroups(groupsInterior, groupsInterior, 1);
         pass.setPipeline(pipelines.pipelines.dtFinalize);
+        pass.dispatchWorkgroups(1, 1, 1);
+        pass.end();
+    }
+
+    _encodeScaleDtHalf(encoder) {
+        const pass = encoder.beginComputePass({ label: 'plasma.scaleDtHalf' });
+        pass.setPipeline(this.pipelines.pipelines.scaleDtHalf);
+        pass.setBindGroup(0, this._bgCache.scaleDtHalf);
+        pass.dispatchWorkgroups(1, 1, 1);
+        pass.end();
+    }
+
+    _encodeSourceDt(encoder) {
+        const pass = encoder.beginComputePass({ label: 'plasma.sourceDt' });
+        pass.setPipeline(this.pipelines.pipelines.sourceDt);
+        pass.setBindGroup(0, this._bgCache.sourceDt);
         pass.dispatchWorkgroups(1, 1, 1);
         pass.end();
     }
@@ -1316,6 +1551,7 @@ export class Sim {
         const handles = (side === 'a')
             ? { U0: b.U0_b, Bx: b.Bx_b, By: b.By_b, U1: b.U1_b }
             : { U0: b.U0_a, Bx: b.Bx_a, By: b.By_a, U1: b.U1_a };
+        const rkl2Cache = this._rkl2BGCache?.[side] ?? null;
 
         const initSet = { Bx: b.Bx_res_init,  By: b.By_res_init,  U1: b.U1_res_init  };
         const setA    = { Bx: b.Bx_res_pprev, By: b.By_res_pprev, U1: b.U1_res_pprev };
@@ -1369,11 +1605,14 @@ export class Sim {
         // (Session 9). Seeding tmp from dst keeps its ghost equal to
         // whatever apply-bcs wrote when this side was last source.
         pass.setPipeline(pipelines.pipelines.applyResSnapshot);
-        for (const dest of [initSet, setA, setB, setC]) {
-            const bg = this._applyResSnapBG(
-                handles.Bx, handles.By, handles.U1,
-                dest.Bx,    dest.By,    dest.U1,
-            );
+        const seedDests = [initSet, setA, setB, setC];
+        for (let k = 0; k < seedDests.length; k++) {
+            const dest = seedDests[k];
+            const bg = rkl2Cache?.seed?.[k]
+                ?? this._applyResSnapBG(
+                    handles.Bx, handles.By, handles.U1,
+                    dest.Bx,    dest.By,    dest.U1,
+                );
             pass.setBindGroup(0, bg);
             pass.dispatchWorkgroups(gResis, gResis, 1);
         }
@@ -1388,25 +1627,28 @@ export class Sim {
         // actually run, and every substep would see substep_idx = s.
         // See buffers.js `sts_meta_per_j` comment for the full history.
         let pprev = setA, prev = setB, tmp = setC;
+        let pprevIdx = 0, prevIdx = 1, tmpIdx = 2;
         for (let j = 1; j <= s; j++) {
             const stsMetaBuf = b.sts_meta_per_j[j - 1];
 
-            const bgInit = this._applyResInitBG(
-                stsMetaBuf,
-                initSet.Bx, initSet.By, initSet.U1,
-                pprev.Bx,   pprev.By,   pprev.U1,
-                tmp.Bx,     tmp.By,     tmp.U1,
-            );
+            const bgInit = rkl2Cache?.init?.[j - 1]
+                ?? this._applyResInitBG(
+                    stsMetaBuf,
+                    initSet.Bx, initSet.By, initSet.U1,
+                    pprev.Bx,   pprev.By,   pprev.U1,
+                    tmp.Bx,     tmp.By,     tmp.U1,
+                );
             pass.setPipeline(pipelines.pipelines.applyResInit);
             pass.setBindGroup(0, bgInit);
             pass.dispatchWorkgroups(gResis, gResis, 1);
 
-            const bgPrev = this._applyResPrevBG(
-                stsMetaBuf,
-                initSet.Bx, initSet.By,
-                prev.Bx,    prev.By,    prev.U1,
-                tmp.Bx,     tmp.By,     tmp.U1,
-            );
+            const bgPrev = rkl2Cache?.prev?.[j - 1]
+                ?? this._applyResPrevBG(
+                    stsMetaBuf,
+                    initSet.Bx, initSet.By,
+                    prev.Bx,    prev.By,    prev.U1,
+                    tmp.Bx,     tmp.By,     tmp.U1,
+                );
             pass.setPipeline(pipelines.pipelines.applyResPrev);
             pass.setBindGroup(0, bgPrev);
             pass.dispatchWorkgroups(gResis, gResis, 1);
@@ -1417,14 +1659,19 @@ export class Sim {
             pprev = prev;
             prev  = tmp;
             tmp   = oldPprev;
+            const oldPprevIdx = pprevIdx;
+            pprevIdx = prevIdx;
+            prevIdx  = tmpIdx;
+            tmpIdx   = oldPprevIdx;
         }
 
         // Copy Y_s back into dst. Y_s ended up in `prev` after substep s's
         // rotation (substep s wrote into tmp, then rotation made it prev).
-        const bgFinal = this._applyResSnapBG(
-            prev.Bx, prev.By, prev.U1,
-            handles.Bx, handles.By, handles.U1,
-        );
+        const bgFinal = rkl2Cache?.finalFromSet?.[prevIdx]
+            ?? this._applyResSnapBG(
+                prev.Bx, prev.By, prev.U1,
+                handles.Bx, handles.By, handles.U1,
+            );
         pass.setPipeline(pipelines.pipelines.applyResSnapshot);
         pass.setBindGroup(0, bgFinal);
         pass.dispatchWorkgroups(gResis, gResis, 1);
@@ -1434,7 +1681,8 @@ export class Sim {
         // the next primitive recovery cannot start with negative pressure in
         // a cell where diffusion locally strengthened |B|.
         pass.setPipeline(pipelines.pipelines.energyFloor);
-        pass.setBindGroup(0, this._energyFloorBG(handles.U0, handles.U1, handles.Bx, handles.By));
+        pass.setBindGroup(0, rkl2Cache?.energyFloor
+            ?? this._energyFloorBG(handles.U0, handles.U1, handles.Bx, handles.By));
         pass.dispatchWorkgroups(gInterior, gInterior, 1);
 
         pass.end();
@@ -1452,9 +1700,10 @@ export class Sim {
         }
     }
 
-    // ── Extended physics bind-group factories (breadth pass) ──────
-    // Cheap to rebuild each step; no _bgCache entry yet.
-    _coolingBG(U0, U1, Bx, By) {
+    // ── Extended physics bind-group factories ─────────────────────
+    // `_buildSourceBindGroupCache()` pre-bakes the hot-path source groups;
+    // these factories remain for cache construction and unusual test paths.
+    _coolingBG(U0, U1, Bx, By, dtBuffer = this.buffers.dt) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.applyCooling.bg',
@@ -1465,7 +1714,7 @@ export class Sim {
                 { binding: 2, resource: { buffer: U1 } },
                 { binding: 3, resource: { buffer: Bx } },
                 { binding: 4, resource: { buffer: By } },
-                { binding: 5, resource: { buffer: b.dt } },
+                { binding: 5, resource: { buffer: dtBuffer } },
                 { binding: 6, resource: { buffer: b.microphysics } },
             ],
         });
@@ -1473,7 +1722,8 @@ export class Sim {
 
     _poissonBG(U0, phi_in, phi_out) {
         const b = this.buffers;
-        return this.device.createBindGroup({
+        const key = `poisson:${this._bufKey(U0)}:${this._bufKey(phi_in)}:${this._bufKey(phi_out)}`;
+        return this._memoBG(key, () => this.device.createBindGroup({
             label: 'plasma.solvePoisson.bg',
             layout: this.pipelines.layouts.poisson,
             entries: [
@@ -1484,10 +1734,183 @@ export class Sim {
                 { binding: 4, resource: { buffer: b.rho_mean } },
                 { binding: 5, resource: { buffer: b.rho_mean_partials } },
             ],
-        });
+        }));
     }
 
-    _gravityBG(U0, U1, phi, Bx, By) {
+    _poissonMgBG(level, U0, phiMain, phiIn, phiOut, rhsIn, rhsOut, phiCoarse) {
+        const b = this.buffers;
+        const phiMainBuf = phiMain   ?? b.poisson_mg_dummy_a;
+        const phiInBuf   = phiIn     ?? b.poisson_mg_dummy_ro;
+        const phiOutBuf  = phiOut    ?? b.poisson_mg_dummy_b;
+        const rhsInBuf   = rhsIn     ?? b.poisson_mg_dummy_ro;
+        const rhsOutBuf  = rhsOut    ?? b.poisson_mg_dummy_c;
+        const coarseBuf  = phiCoarse ?? b.poisson_mg_dummy_ro;
+        const key = [
+            'poissonMg', level.n, this._bufKey(U0), this._bufKey(phiMainBuf),
+            this._bufKey(phiInBuf), this._bufKey(phiOutBuf), this._bufKey(rhsInBuf),
+            this._bufKey(rhsOutBuf), this._bufKey(coarseBuf),
+        ].join(':');
+        return this._memoBG(key, () => this.device.createBindGroup({
+            label: `plasma.solvePoissonMg.${level.n}.bg`,
+            layout: this.pipelines.layouts.poissonMg,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: level.uniform } },
+                { binding: 2, resource: { buffer: U0 } },
+                { binding: 3, resource: { buffer: b.rho_mean } },
+                { binding: 4, resource: { buffer: phiMainBuf } },
+                { binding: 5, resource: { buffer: phiInBuf } },
+                { binding: 6, resource: { buffer: phiOutBuf } },
+                { binding: 7, resource: { buffer: rhsInBuf } },
+                { binding: 8, resource: { buffer: rhsOutBuf } },
+                { binding: 9, resource: { buffer: coarseBuf } },
+            ],
+        }));
+    }
+
+    _poissonUsesCylindricalOperator() {
+        return (this.physicsFlags & FLAG_GEOMETRY) !== 0
+            && this.geometryMode === GEOMETRY_CYLINDRICAL;
+    }
+
+    _canUsePoissonMultigrid() {
+        return this.gravitySolverMode !== GRAVITY_SOLVER_JACOBI
+            && !this._poissonUsesCylindricalOperator();
+    }
+
+    _encodePoissonMean(encoder, U0, gInterior) {
+        const pass = encoder.beginComputePass({ label: 'plasma.poisson.mean' });
+        pass.setPipeline(this.pipelines.pipelines.solvePoissonReduceMean);
+        pass.setBindGroup(0, this._poissonBG(U0, this.buffers.phi, this.buffers.phi_next));
+        pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        pass.setPipeline(this.pipelines.pipelines.solvePoissonFinalizeMean);
+        pass.dispatchWorkgroups(1, 1, 1);
+        pass.end();
+    }
+
+    _encodePoissonJacobi(encoder, U0, gInterior, iters) {
+        const b = this.buffers;
+        if (iters <= 0) return b.phi;
+        const pass = encoder.beginComputePass({ label: 'plasma.poisson.jacobi' });
+        pass.setPipeline(this.pipelines.pipelines.solvePoissonIterate);
+        const bgAB = this._poissonBG(U0, b.phi,      b.phi_next);
+        const bgBA = this._poissonBG(U0, b.phi_next, b.phi);
+        for (let it = 0; it < iters; it++) {
+            pass.setBindGroup(0, (it & 1) ? bgBA : bgAB);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        }
+        pass.end();
+        return (iters & 1) ? b.phi_next : b.phi;
+    }
+
+    _encodePoissonMultigrid(encoder, U0, iters) {
+        const b = this.buffers;
+        const levels = b.ensurePoissonMultigridLevels();
+        if (!levels || levels.length < 2 || iters <= 0) return b.phi;
+
+        const pass = encoder.beginComputePass({ label: 'plasma.poisson.multigrid' });
+        const pp = this.pipelines.pipelines;
+        const groups = (n) => Math.ceil(n / WG);
+        const current = levels.map(level => level.phiA);
+        const spare   = levels.map(level => level.phiB);
+        const swapLevel = (li) => {
+            const tmp = current[li];
+            current[li] = spare[li];
+            spare[li] = tmp;
+        };
+
+        pass.setPipeline(pp.solvePoissonMgInit);
+        pass.setBindGroup(0, this._poissonMgBG(
+            levels[0], U0,
+            b.phi,
+            null,
+            levels[0].phiA,
+            null,
+            levels[0].rhs,
+            null,
+        ));
+        pass.dispatchWorkgroups(groups(levels[0].n), groups(levels[0].n), 1);
+
+        const finestIters = Math.max(1, iters | 0);
+        const cycles = Math.max(1, Math.min(8, Math.ceil(finestIters / 16)));
+        const preSweeps = 2;
+        const postSweeps = 2;
+        const coarseSweeps = Math.max(12, Math.min(64, Math.ceil(finestIters / 2)));
+
+        const smoothLevel = (li, sweeps) => {
+            const level = levels[li];
+            pass.setPipeline(pp.solvePoissonMgSmooth);
+            for (let s = 0; s < sweeps; s++) {
+                pass.setBindGroup(0, this._poissonMgBG(
+                    level, U0,
+                    null,
+                    current[li],
+                    spare[li],
+                    level.rhs,
+                    null,
+                    null,
+                ));
+                pass.dispatchWorkgroups(groups(level.n), groups(level.n), 1);
+                swapLevel(li);
+            }
+        };
+
+        const last = levels.length - 1;
+        for (let cycle = 0; cycle < cycles; cycle++) {
+            for (let li = 0; li < last; li++) {
+                smoothLevel(li, preSweeps);
+                const coarse = levels[li + 1];
+                pass.setPipeline(pp.solvePoissonMgRestrict);
+                pass.setBindGroup(0, this._poissonMgBG(
+                    coarse, U0,
+                    null,
+                    current[li],
+                    coarse.phiA,
+                    levels[li].rhs,
+                    coarse.rhs,
+                    null,
+                ));
+                pass.dispatchWorkgroups(groups(coarse.n), groups(coarse.n), 1);
+                current[li + 1] = coarse.phiA;
+                spare[li + 1] = coarse.phiB;
+            }
+
+            smoothLevel(last, coarseSweeps);
+
+            for (let li = last - 1; li >= 0; li--) {
+                const fine = levels[li];
+                pass.setPipeline(pp.solvePoissonMgProlongate);
+                pass.setBindGroup(0, this._poissonMgBG(
+                    fine, U0,
+                    null,
+                    current[li],
+                    spare[li],
+                    fine.rhs,
+                    null,
+                    current[li + 1],
+                ));
+                pass.dispatchWorkgroups(groups(fine.n), groups(fine.n), 1);
+                swapLevel(li);
+                smoothLevel(li, postSweeps);
+            }
+        }
+
+        pass.setPipeline(pp.solvePoissonMgCopyToMain);
+        pass.setBindGroup(0, this._poissonMgBG(
+            levels[0], U0,
+            b.phi,
+            current[0],
+            null,
+            levels[0].rhs,
+            null,
+            null,
+        ));
+        pass.dispatchWorkgroups(groups(levels[0].n), groups(levels[0].n), 1);
+        pass.end();
+        return b.phi;
+    }
+
+    _gravityBG(U0, U1, phi, Bx, By, dtBuffer = this.buffers.dt) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.applyGravity.bg',
@@ -1497,7 +1920,7 @@ export class Sim {
                 { binding: 1, resource: { buffer: U0 } },
                 { binding: 2, resource: { buffer: U1 } },
                 { binding: 3, resource: { buffer: phi } },
-                { binding: 4, resource: { buffer: b.dt } },
+                { binding: 4, resource: { buffer: dtBuffer } },
                 { binding: 5, resource: { buffer: Bx } },
                 { binding: 6, resource: { buffer: By } },
             ],
@@ -1602,7 +2025,7 @@ export class Sim {
         });
     }
 
-    _geometryBG(U0, U1, Bx, By) {
+    _geometryBG(U0, U1, Bx, By, dtBuffer = this.buffers.dt) {
         const b = this.buffers;
         return this.device.createBindGroup({
             label: 'plasma.applyGeometry.bg',
@@ -1613,7 +2036,27 @@ export class Sim {
                 { binding: 2, resource: { buffer: U1 } },
                 { binding: 3, resource: { buffer: Bx } },
                 { binding: 4, resource: { buffer: By } },
-                { binding: 5, resource: { buffer: b.dt } },
+                { binding: 5, resource: { buffer: dtBuffer } },
+            ],
+        });
+    }
+
+    _radiationBG(U0, U1, Bx, By) {
+        const b = this.buffers;
+        return this.device.createBindGroup({
+            label: 'plasma.applyRadiation.bg',
+            layout: this.pipelines.layouts.radiation,
+            entries: [
+                { binding: 0, resource: { buffer: b.uniform } },
+                { binding: 1, resource: { buffer: U0 } },
+                { binding: 2, resource: { buffer: U1 } },
+                { binding: 3, resource: { buffer: Bx } },
+                { binding: 4, resource: { buffer: By } },
+                { binding: 5, resource: { buffer: b.rad_dt } },
+                { binding: 6, resource: { buffer: b.radiation_E } },
+                { binding: 7, resource: { buffer: b.radiation_dE } },
+                { binding: 8, resource: { buffer: b.microphysics } },
+                { binding: 9, resource: { buffer: b.bc_uniforms } },
             ],
         });
     }
@@ -1623,6 +2066,27 @@ export class Sim {
         const gTotalP1 = Math.ceil((this.n_total + 1) / WG);
         pass.setPipeline(this.pipelines.pipelines.applyBcs);
         pass.setBindGroup(0, this._bgCache.stage3[side].applyBcsDst);
+        pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
+        pass.end();
+    }
+
+    _sourceHandles(side, target = 'dst') {
+        const b = this.buffers;
+        if (side === 'a') {
+            return target === 'src'
+                ? { U0: b.U0_a, U1: b.U1_a, Bx: b.Bx_a, By: b.By_a }
+                : { U0: b.U0_b, U1: b.U1_b, Bx: b.Bx_b, By: b.By_b };
+        }
+        return target === 'src'
+            ? { U0: b.U0_b, U1: b.U1_b, Bx: b.Bx_b, By: b.By_b }
+            : { U0: b.U0_a, U1: b.U1_a, Bx: b.Bx_a, By: b.By_a };
+    }
+
+    _encodeApplyBcsHandles(encoder, handles, label, cachedBG = null) {
+        const pass = encoder.beginComputePass({ label });
+        const gTotalP1 = Math.ceil((this.n_total + 1) / WG);
+        pass.setPipeline(this.pipelines.pipelines.applyBcs);
+        pass.setBindGroup(0, cachedBG ?? this._applyBcsBG(handles.U0, handles.U1, handles.Bx, handles.By));
         pass.dispatchWorkgroups(gTotalP1, gTotalP1, 1);
         pass.end();
     }
@@ -1639,111 +2103,199 @@ export class Sim {
                            hallSubsteps = 1,
                            condSubsteps = 1,
                            viscSubsteps = 1,
-                           nonidealSubsteps = 1) {
+                           nonidealSubsteps = 1,
+                           opts = {}) {
         if ((this.physicsFlags & EXTENDED_SOURCE_FLAGS) === 0) return false;
         const b = this.buffers;
         const { pipelines } = this;
 
-        const handles = (side === 'a')
-            ? { U0: b.U0_b, U1: b.U1_b, Bx: b.Bx_b, By: b.By_b }
-            : { U0: b.U0_a, U1: b.U1_a, Bx: b.Bx_a, By: b.By_a };
+        const target = opts.target ?? 'dst';
+        const dtBuffer = opts.dtBuffer ?? b.dt;
+        const labelPrefix = opts.labelPrefix ?? `plasma.extended.${target}`;
+        const handles = this._sourceHandles(side, target);
+        const cache = this._sourceBGCache?.[side]?.[target] ?? null;
+        const timedCache = dtBuffer === b.dt_half
+            ? cache?.dtHalf
+            : (dtBuffer === b.dt ? cache?.dt : null);
 
         const N         = this.n;
         const gInterior = Math.ceil(N / WG);
         const gN1       = Math.ceil((N + 1) / WG);
 
-        this._encodeApplyBcsDst(encoder, side, 'plasma.extended.preApplyBcsDst');
+        const flags = this.physicsFlags;
+        const coolingOn = ((flags & FLAG_COOLING) !== 0 && this.coolingLambda0 > 0)
+                       || ((flags & FLAG_HEATING) !== 0 && this.heatingGamma0 > 0);
+        const selfGravOn = (flags & FLAG_GRAVITY_SELF) !== 0 && this.gravityG > 0;
+        const externalGravOn = (flags & FLAG_GRAVITY_EXT) !== 0
+            && (this.gravityGx !== 0 || this.gravityGy !== 0);
+        const gravityOn = selfGravOn || externalGravOn;
+        const conductionOn = (flags & FLAG_CONDUCTION) !== 0 && this.conductionKappa > 0;
+        const radiationOn = (flags & FLAG_RADIATION) !== 0
+            && this.radiationC > 0
+            && (this.radiationKappaAbs > 0 || this.radiationKappaScat > 0);
+        const viscosityOn = (flags & FLAG_VISCOSITY) !== 0
+            && ((this.viscosityNu || 0) > 0
+             || (this.viscosityBulk || 0) > 0
+             || (this.viscosityShock || 0) > 0);
+        const ohmOn = ((flags & FLAG_HALL) !== 0 && this.hallDi > 0)
+                   || ((flags & FLAG_AMBIPOLAR) !== 0 && this.ambipolarEta > 0)
+                   || ((flags & FLAG_BIERMANN) !== 0 && this.biermannCoeff !== 0)
+                   || ((flags & FLAG_ELECTRON_INERTIA) !== 0
+                       && this.electronInertiaLength > 0
+                       && this.electronInertiaDamping > 0);
+        const geometryOn = ((flags & FLAG_GEOMETRY) !== 0 && this.geometryMode === GEOMETRY_CYLINDRICAL)
+                        || ((flags & FLAG_SPONGE) !== 0
+                            && this.spongeWidth > 0
+                            && this.spongeStrength > 0);
+        const anySource = gravityOn || coolingOn || conductionOn || radiationOn
+                       || viscosityOn || ohmOn || geometryOn;
+        if (!anySource) return false;
 
-        // ── Self-gravity Poisson solve (Jacobi ping-pong) ──────────
+        const applyBcs = (label) => {
+            this._encodeApplyBcsHandles(encoder, handles, label, cache?.applyBcs ?? null);
+        };
+        const computePass = (label, body) => {
+            const pass = encoder.beginComputePass({ label });
+            body(pass);
+            pass.end();
+        };
+        const gravityBG = (phi) => {
+            if (timedCache && phi === b.phi) return timedCache.gravityPhi;
+            if (timedCache && phi === b.phi_next) return timedCache.gravityPhiNext;
+            return this._gravityBG(handles.U0, handles.U1, phi, handles.Bx, handles.By, dtBuffer);
+        };
+        const coolingBG = timedCache?.cooling
+            ?? this._coolingBG(handles.U0, handles.U1, handles.Bx, handles.By, dtBuffer);
+        const geometryBG = timedCache?.geometry
+            ?? this._geometryBG(handles.U0, handles.U1, handles.Bx, handles.By, dtBuffer);
+        const conductionBG = cache?.conduction
+            ?? this._conductionBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        const radiationBG = cache?.radiation
+            ?? this._radiationBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        const viscosityBG = cache?.viscosity
+            ?? this._viscosityBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        const ohmBG = cache?.ohm
+            ?? this._ohmBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        const energyFloorBG = cache?.energyFloor
+            ?? this._energyFloorBG(handles.U0, handles.U1, handles.Bx, handles.By);
+
+        applyBcs(`${labelPrefix}.preApplyBcs`);
+
+        // ── Self-gravity Poisson solve ─────────────────────────────
         // Runs FIRST so gravity acceleration uses the freshly-updated φ.
         // Cooling / conduction / Hall don't depend on φ so their order
         // among themselves doesn't matter for the breadth pass.
-        const selfGravOn = (this.physicsFlags & FLAG_GRAVITY_SELF) !== 0 && this.gravityG > 0;
         let gravityPhi = b.phi;
         if (selfGravOn) {
-            const poissonPass = encoder.beginComputePass({ label: 'plasma.poisson' });
-            // Compute the actual domain mean density before Jacobi iteration.
-            poissonPass.setPipeline(pipelines.pipelines.solvePoissonReduceMean);
-            poissonPass.setBindGroup(0, this._poissonBG(handles.U0, b.phi, b.phi_next));
-            poissonPass.dispatchWorkgroups(gInterior, gInterior, 1);
-            poissonPass.setPipeline(pipelines.pipelines.solvePoissonFinalizeMean);
-            poissonPass.dispatchWorkgroups(1, 1, 1);
-            // Iterate Jacobi. Ping-pong by alternating bind groups.
-            poissonPass.setPipeline(pipelines.pipelines.solvePoissonIterate);
             const iters = Math.max(0, this.gravityPoissonIters | 0);
-            const bgAB  = this._poissonBG(handles.U0, b.phi,      b.phi_next);
-            const bgBA  = this._poissonBG(handles.U0, b.phi_next, b.phi);
-            for (let it = 0; it < iters; it++) {
-                poissonPass.setBindGroup(0, (it & 1) ? bgBA : bgAB);
-                poissonPass.dispatchWorkgroups(gInterior, gInterior, 1);
+            this._encodePoissonMean(encoder, handles.U0, gInterior);
+            if (iters > 0) {
+                gravityPhi = this._canUsePoissonMultigrid()
+                    ? this._encodePoissonMultigrid(encoder, handles.U0, iters)
+                    : this._encodePoissonJacobi(encoder, handles.U0, gInterior, iters);
             }
-            poissonPass.end();
-            gravityPhi = (iters & 1) ? b.phi_next : b.phi;
         }
 
-        // ── Source-term + correction passes ────────────────────────
-        const pass = encoder.beginComputePass({ label: 'plasma.extendedPhysics' });
-        // Gravity source — momentum + energy.
-        pass.setPipeline(pipelines.pipelines.applyGravity);
-        pass.setBindGroup(0, this._gravityBG(handles.U0, handles.U1, gravityPhi, handles.Bx, handles.By));
-        pass.dispatchWorkgroups(gInterior, gInterior, 1);
-        // Cooling — local energy sink.
-        pass.setPipeline(pipelines.pipelines.applyCooling);
-        pass.setBindGroup(0, this._coolingBG(handles.U0, handles.U1, handles.Bx, handles.By));
-        pass.dispatchWorkgroups(gInterior, gInterior, 1);
-        // Anisotropic conduction — Session 15: sub-cycled with N_cond
-        // iterations of the compute_delta + apply_delta pair. Each
-        // iteration: compute frozen-T heat-flux delta from the current
-        // U1 into conduction_dE, then add it back to U1. The two
-        // dispatches share one bind group (cond_dt is host-seeded once
-        // per macro step, same value across all sub-cycle iterations).
-        const condBG = this._conductionBG(handles.U0, handles.U1, handles.Bx, handles.By);
-        for (let c = 0; c < Math.max(1, condSubsteps | 0); c++) {
-            pass.setPipeline(pipelines.pipelines.computeConductionDelta);
-            pass.setBindGroup(0, condBG);
-            pass.dispatchWorkgroups(gInterior, gInterior, 1);
-            pass.setPipeline(pipelines.pipelines.applyConductionDelta);
-            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        if (gravityOn || coolingOn) {
+            computePass(`${labelPrefix}.localSources`, (pass) => {
+                if (gravityOn) {
+                    pass.setPipeline(pipelines.pipelines.applyGravity);
+                    pass.setBindGroup(0, gravityBG(gravityPhi));
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                }
+                if (coolingOn) {
+                    pass.setPipeline(pipelines.pipelines.applyCooling);
+                    pass.setBindGroup(0, coolingBG);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                }
+            });
+            if (conductionOn || radiationOn || viscosityOn || ohmOn) {
+                applyBcs(`${labelPrefix}.afterLocalApplyBcs`);
+            }
         }
-        // Viscosity — frozen velocity-gradient delta, then momentum/energy
-        // application. Sub-cycled from host-sized transport coefficient
-        // bounds rather than compute-dt to stay under the storage-binding cap.
-        const viscBG = this._viscosityBG(handles.U0, handles.U1, handles.Bx, handles.By);
-        for (let v = 0; v < Math.max(1, viscSubsteps | 0); v++) {
-            pass.setPipeline(pipelines.pipelines.computeViscosityDelta);
-            pass.setBindGroup(0, viscBG);
-            pass.dispatchWorkgroups(gInterior, gInterior, 1);
-            pass.setPipeline(pipelines.pipelines.applyViscosityDelta);
-            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+
+        if (conductionOn) {
+            const nCond = Math.max(1, condSubsteps | 0);
+            for (let c = 0; c < nCond; c++) {
+                computePass(`${labelPrefix}.conduction.${c + 1}`, (pass) => {
+                    pass.setPipeline(pipelines.pipelines.computeConductionDelta);
+                    pass.setBindGroup(0, conductionBG);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                    pass.setPipeline(pipelines.pipelines.applyConductionDelta);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                });
+                if (c + 1 < nCond || radiationOn || viscosityOn || ohmOn) {
+                    applyBcs(`${labelPrefix}.afterConduction${c + 1}ApplyBcs`);
+                }
+            }
         }
-        // Unified generalized Ohm: Hall + ambipolar + Biermann are evaluated
-        // from one frozen state. Hall is applied and energy-repaired first;
-        // dissipative/non-barotropic terms are then applied without repair.
-        const ohmBG = this._ohmBG(handles.U0, handles.U1, handles.Bx, handles.By);
-        const ohmSubsteps = Math.max(1, hallSubsteps | 0, nonidealSubsteps | 0);
-        for (let o = 0; o < ohmSubsteps; o++) {
-            pass.setPipeline(pipelines.pipelines.computeOhmEmf);
-            pass.setBindGroup(0, ohmBG);
-            pass.dispatchWorkgroups(gN1, gN1, 1);
-            pass.setPipeline(pipelines.pipelines.applyOhmHall);
-            pass.dispatchWorkgroups(gN1, gN1, 1);
-            pass.setPipeline(pipelines.pipelines.repairOhmHallEnergy);
-            pass.dispatchWorkgroups(gInterior, gInterior, 1);
-            pass.setPipeline(pipelines.pipelines.applyOhmDissipative);
-            pass.dispatchWorkgroups(gN1, gN1, 1);
+
+        if (radiationOn) {
+            const nRad = Math.max(1, opts.radiationSubsteps ?? 1);
+            for (let r = 0; r < nRad; r++) {
+                computePass(`${labelPrefix}.radiation.${r + 1}`, (pass) => {
+                    pass.setPipeline(pipelines.pipelines.computeRadiationDelta);
+                    pass.setBindGroup(0, radiationBG);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                    pass.setPipeline(pipelines.pipelines.applyRadiationDelta);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                });
+            }
+            if (viscosityOn || ohmOn) {
+                applyBcs(`${labelPrefix}.afterRadiationApplyBcs`);
+            }
         }
-        // Cylindrical geometry + sponge layer. Runs late so source physics
-        // sees Cartesian conserved state, then the boundary environment can
-        // absorb the final source-updated momentum.
-        pass.setPipeline(pipelines.pipelines.applyGeometry);
-        pass.setBindGroup(0, this._geometryBG(handles.U0, handles.U1, handles.Bx, handles.By));
-        pass.dispatchWorkgroups(gInterior, gInterior, 1);
-        // Any source can change pressure support; clamp once against the final B.
-        pass.setPipeline(pipelines.pipelines.energyFloor);
-        pass.setBindGroup(0, this._energyFloorBG(handles.U0, handles.U1, handles.Bx, handles.By));
-        pass.dispatchWorkgroups(gInterior, gInterior, 1);
-        pass.end();
-        this._encodeApplyBcsDst(encoder, side, 'plasma.extended.postApplyBcsDst');
+
+        if (viscosityOn) {
+            const nVisc = Math.max(1, viscSubsteps | 0);
+            for (let v = 0; v < nVisc; v++) {
+                computePass(`${labelPrefix}.viscosity.${v + 1}`, (pass) => {
+                    pass.setPipeline(pipelines.pipelines.computeViscosityDelta);
+                    pass.setBindGroup(0, viscosityBG);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                    pass.setPipeline(pipelines.pipelines.applyViscosityDelta);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                });
+                if (v + 1 < nVisc || ohmOn) {
+                    applyBcs(`${labelPrefix}.afterViscosity${v + 1}ApplyBcs`);
+                }
+            }
+        }
+
+        if (ohmOn) {
+            const ohmSubsteps = Math.max(1, hallSubsteps | 0, nonidealSubsteps | 0);
+            for (let o = 0; o < ohmSubsteps; o++) {
+                computePass(`${labelPrefix}.ohm.${o + 1}`, (pass) => {
+                    pass.setPipeline(pipelines.pipelines.computeOhmEmf);
+                    pass.setBindGroup(0, ohmBG);
+                    pass.dispatchWorkgroups(gN1, gN1, 1);
+                    pass.setPipeline(pipelines.pipelines.applyOhmHall);
+                    pass.dispatchWorkgroups(gN1, gN1, 1);
+                    pass.setPipeline(pipelines.pipelines.repairOhmHallEnergy);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
+                    pass.setPipeline(pipelines.pipelines.applyOhmDissipative);
+                    pass.dispatchWorkgroups(gN1, gN1, 1);
+                });
+                if (o + 1 < ohmSubsteps) {
+                    applyBcs(`${labelPrefix}.afterOhm${o + 1}ApplyBcs`);
+                }
+            }
+        }
+
+        if (geometryOn) {
+            computePass(`${labelPrefix}.geometry`, (pass) => {
+                pass.setPipeline(pipelines.pipelines.applyGeometry);
+                pass.setBindGroup(0, geometryBG);
+                pass.dispatchWorkgroups(gInterior, gInterior, 1);
+            });
+        }
+
+        computePass(`${labelPrefix}.energyFloor`, (pass) => {
+            pass.setPipeline(pipelines.pipelines.energyFloor);
+            pass.setBindGroup(0, energyFloorBG);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        });
+        applyBcs(`${labelPrefix}.postApplyBcs`);
         return true;
     }
 
@@ -1768,18 +2320,21 @@ export class Sim {
     /**
      * Hall sub-cycling sizing (Session 15 — Tóth 2008 spirit).
      *
-     * The Hall term is dispersive (whistler waves) with stability bound
-     *   Δt_sub ≤ 1 / (v_A · d_i / dx) = 1 / hall_speed_max
+     * The Hall term is dispersive (whistler waves) with explicit stability bound
+     *   Δt_sub ≤ O(dx² / (v_A · d_i)) = 1 / hall_rate_max
      * The macro Δt only respects the hyperbolic CFL; we run the Hall
-     * 3-pass sequence N_hall times within one macro step with dt_sub =
-     * dt_macro / N_hall to maintain stability.
+     * 3-pass sequence N_hall times within each Strang half-step with
+     * dt_sub = dt_half / N_hall to maintain stability.
      *
      * Inputs:
-     *   - `_lastHallSpeedMax` from the previous step's `compute-dt`
+     *   - `_lastHallRateMax` from the previous step's `compute-dt`
      *     reduction (one-frame-stale, fine because Hall speed evolves
      *     slowly compared to one step).
      *   - `_lastDtHyp` from same readback.
-     *   - `hallSubstepsMax` user-supplied cap (uniform).
+     *   - `hallSubstepsMax` user-supplied soft cap (uniform). The GPU dt
+     *     reducer now shrinks future macro steps when that soft cap would be
+     *     exceeded; this host path may temporarily exceed it up to a hard
+     *     safety cap while dt feedback catches up.
      *
      * Returns:
      *   { nSubsteps, dtSub } where nSubsteps ≥ 1.
@@ -1788,26 +2343,30 @@ export class Sim {
         if ((this.physicsFlags & FLAG_HALL) === 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
-        if (this.hallDi <= 0 || this._lastHallSpeedMax <= 0) {
+        if (this.hallDi <= 0 || this._lastHallRateMax <= 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
-        // Each sub-step must satisfy dt_sub · hall_speed_max ≤ 1.
+        // Each Strang half-step sub-step must satisfy dt_sub · rate ≤ safety.
         // Add a 50% safety margin and cap by user-configured max.
         const safety = 0.5;
-        const ideal = dtMacro * this._lastHallSpeedMax / safety;
-        const maxN = Math.max(1, this.hallSubstepsMax | 0);
-        const n = Math.min(maxN, Math.max(1, Math.ceil(ideal)));
-        return { nSubsteps: n, dtSub: dtMacro / n };
+        const dtHalf = 0.5 * Math.max(dtMacro, 0);
+        const ideal = dtHalf * this._lastHallRateMax / safety;
+        const softCap = Math.max(1, this.hallSubstepsMax | 0);
+        const required = Math.max(1, Math.ceil(ideal));
+        const n = Math.min(this._sourceSubstepHardCap(), required);
+        this._lastSourceSoftCapExceeded ||= required > softCap;
+        this._lastSourceHardCapExceeded ||= required > n;
+        return { nSubsteps: n, dtSub: dtHalf / n };
     }
 
     /**
      * Conduction sub-cycling sizing (Session 15).
      *
      * Anisotropic conduction is parabolic with explicit-FE stability
-     * bound dt_sub ≤ 1 / (4χ/dx) = 1 / cond_speed_max, where χ = (γ-1)
+     * bound dt_sub ≤ dx² / (4χ) = 1 / cond_rate_max, where χ = (γ-1)
      * κ/ρ. Sub-cycling has the same shape as the Hall pattern — the
-     * compute_delta/apply_delta pair runs N_cond times within one macro
-     * Δt with dt_sub = dt_macro / N_cond.
+     * compute_delta/apply_delta pair runs N_cond times within each
+     * Strang half-step with dt_sub = dt_half / N_cond.
      *
      * A future iteration could fold the conduction operator into the
      * existing RKL2 super-step alongside resistivity (Phase 9 #4 in
@@ -1817,40 +2376,57 @@ export class Sim {
      * avoids the 10-binding cap reshuffling that proper RKL2 folding
      * would require.
      *
-     * Cap: the shared source sub-step ceiling controls explicit transport
-     * loops; Hall keeps its own whistler-specific cap.
+     * Cap: the shared source sub-step ceiling is a performance target, not
+     * a stability override. If the previous-step source rate says more
+     * substeps are needed, we take them up to SOURCE_SUBSTEPS_HARD_MAX; the
+     * compute-dt shader adds a source-cap macro limiter so steady workloads
+     * come back under the configured soft cap.
      */
     _conductionSizing(dtMacro) {
         if ((this.physicsFlags & FLAG_CONDUCTION) === 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
-        if (this.conductionKappa <= 0 || this._lastCondSpeedMax <= 0) {
+        if (this.conductionKappa <= 0 || this._lastCondRateMax <= 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
         const safety = 0.5;
-        const ideal = dtMacro * this._lastCondSpeedMax / safety;
-        const maxN = this._sourceSubstepCap();
-        const n = Math.min(maxN, Math.max(1, Math.ceil(ideal)));
-        return { nSubsteps: n, dtSub: dtMacro / n };
+        const dtHalf = 0.5 * Math.max(dtMacro, 0);
+        const ideal = dtHalf * this._lastCondRateMax / safety;
+        const softCap = this._sourceSubstepCap();
+        const required = Math.max(1, Math.ceil(ideal));
+        const n = Math.min(this._sourceSubstepHardCap(), required);
+        this._lastSourceSoftCapExceeded ||= required > softCap;
+        this._lastSourceHardCapExceeded ||= required > n;
+        return { nSubsteps: n, dtSub: dtHalf / n };
     }
 
     _sourceSubstepCap() {
         return Math.max(1, (this.sourceSubstepsMax ?? this.hallSubstepsMax ?? 8) | 0);
     }
 
+    _sourceSubstepHardCap() {
+        return SOURCE_SUBSTEPS_HARD_MAX;
+    }
+
     _viscositySizing(dtMacro) {
         if ((this.physicsFlags & FLAG_VISCOSITY) === 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
-        const nuEff = Math.max(this.viscosityNu || 0,
-                               this.viscosityBulk || 0,
+        const tscaleMax = MICRO_TRANSPORT_MAX_SCALE;
+        const nuEff = Math.max((this.viscosityNu || 0) * tscaleMax,
+                               (this.viscosityBulk || 0) * tscaleMax,
                                this.viscosityShock || 0);
         if (nuEff <= 0 || dtMacro <= 0) return { nSubsteps: 1, dtSub: dtMacro };
         const safety = 0.45;
+        const dtHalf = 0.5 * Math.max(dtMacro, 0);
         const parabolicRate = 4.0 * nuEff / Math.max(this.dx * this.dx, 1e-30);
-        const ideal = dtMacro * parabolicRate / safety;
-        const n = Math.min(this._sourceSubstepCap(), Math.max(1, Math.ceil(ideal)));
-        return { nSubsteps: n, dtSub: dtMacro / n };
+        const ideal = dtHalf * parabolicRate / safety;
+        const softCap = this._sourceSubstepCap();
+        const required = Math.max(1, Math.ceil(ideal));
+        const n = Math.min(this._sourceSubstepHardCap(), required);
+        this._lastSourceSoftCapExceeded ||= required > softCap;
+        this._lastSourceHardCapExceeded ||= required > n;
+        return { nSubsteps: n, dtSub: dtHalf / n };
     }
 
     _nonidealSizing(dtMacro) {
@@ -1860,7 +2436,10 @@ export class Sim {
         const biermannOn = (this.physicsFlags & FLAG_BIERMANN) !== 0
                         && this.biermannCoeff !== 0
                         && this.hallElectronPressureFrac > 0;
-        if (!ambiOn && !biermannOn) return { nSubsteps: 1, dtSub: dtMacro };
+        const electronInertiaOn = (this.physicsFlags & FLAG_ELECTRON_INERTIA) !== 0
+                               && this.electronInertiaLength > 0
+                               && this.electronInertiaDamping > 0;
+        if (!ambiOn && !biermannOn && !electronInertiaOn) return { nSubsteps: 1, dtSub: dtMacro };
 
         const ambiRate = ambiOn
             ? 4.0 * this.ambipolarEta * Math.max(this.neutralFrac, 0)
@@ -1872,13 +2451,95 @@ export class Sim {
         const batteryRate = biermannOn
             ? Math.abs(this.biermannCoeff) / Math.max(this.dx, 1e-30)
             : 0.0;
-        const rate = ambiRate + batteryRate;
+        const eta4 = electronInertiaOn
+            ? this.electronInertiaDamping * this.electronInertiaLength * this.electronInertiaLength
+            : 0.0;
+        const hyperRate = eta4 > 0
+            ? 16.0 * eta4 / Math.max(this.dx ** 4, 1e-30)
+            : 0.0;
+        const rate = ambiRate + batteryRate + hyperRate;
         if (rate <= 0 || dtMacro <= 0) return { nSubsteps: 1, dtSub: dtMacro };
 
         const safety = 0.45;
-        const ideal = dtMacro * rate / safety;
-        const n = Math.min(this._sourceSubstepCap(), Math.max(1, Math.ceil(ideal)));
-        return { nSubsteps: n, dtSub: dtMacro / n };
+        const dtHalf = 0.5 * Math.max(dtMacro, 0);
+        const ideal = dtHalf * rate / safety;
+        const softCap = this._sourceSubstepCap();
+        const required = Math.max(1, Math.ceil(ideal));
+        const n = Math.min(this._sourceSubstepHardCap(), required);
+        this._lastSourceSoftCapExceeded ||= required > softCap;
+        this._lastSourceHardCapExceeded ||= required > n;
+        return { nSubsteps: n, dtSub: dtHalf / n };
+    }
+
+    _radiationSizing(dtMacro) {
+        const radOn = (this.physicsFlags & FLAG_RADIATION) !== 0
+            && this.radiationC > 0
+            && (this.radiationKappaAbs > 0 || this.radiationKappaScat > 0);
+        if (!radOn || dtMacro <= 0) return { nSubsteps: 1, dtSub: dtMacro };
+        const kappa = Math.max(this.radiationKappaAbs || 0, 0)
+                    + Math.max(this.radiationKappaScat || 0, 0);
+        const dx2 = Math.max(this.dx * this.dx, 1e-30);
+        const opacityMin = 0.01;
+        const opacityMaxAbs = 32.0;
+        const diffusionRate = kappa > 0
+            ? 4.0 * this.radiationC / Math.max(kappa * opacityMin * dx2, 1e-30)
+            : 0.0;
+        const exchangeRate = this.radiationC
+            * Math.max(this.radiationKappaAbs || 0, 0)
+            * opacityMaxAbs;
+        const rate = diffusionRate + exchangeRate;
+        if (rate <= 0) return { nSubsteps: 1, dtSub: dtMacro };
+        const safety = 0.35;
+        const dtHalf = 0.5 * Math.max(dtMacro, 0);
+        const ideal = dtHalf * rate / safety;
+        const softCap = this._sourceSubstepCap();
+        const required = Math.max(1, Math.ceil(ideal));
+        const n = Math.min(this._sourceSubstepHardCap(), required);
+        this._lastSourceSoftCapExceeded ||= required > softCap;
+        this._lastSourceHardCapExceeded ||= required > n;
+        return { nSubsteps: n, dtSub: dtHalf / n };
+    }
+
+    _prepareSourceSubsteps(dtMacro) {
+        this._lastSourceSoftCapExceeded = false;
+        this._lastSourceHardCapExceeded = false;
+        const hallSizing = this._hallSizing(dtMacro);
+        const condSizing = this._conductionSizing(dtMacro);
+        const viscSizing = this._viscositySizing(dtMacro);
+        const nonidealSizing = this._nonidealSizing(dtMacro);
+        const radiationSizing = this._radiationSizing(dtMacro);
+
+        const ohmOn = (this.physicsFlags & (FLAG_HALL | FLAG_AMBIPOLAR | FLAG_BIERMANN | FLAG_ELECTRON_INERTIA)) !== 0;
+        const ohmSubsteps = ohmOn
+            ? Math.max(1, hallSizing.nSubsteps, nonidealSizing.nSubsteps)
+            : 1;
+        const params = new Float32Array([
+            1.0 / Math.max(1, ohmSubsteps),
+            1.0 / Math.max(1, condSizing.nSubsteps),
+            1.0 / Math.max(1, viscSizing.nSubsteps),
+            1.0 / Math.max(1, ohmSubsteps),
+            1.0 / Math.max(1, radiationSizing.nSubsteps),
+            0.0, 0.0, 0.0,
+        ]);
+        this.device.queue.writeBuffer(this.buffers.source_dt_params, 0, params.buffer);
+
+        if ((this.physicsFlags & FLAG_HALL) !== 0 && this.hallDi > 0) {
+            this._lastHallSubsteps = ohmSubsteps;
+        } else {
+            this._lastHallSubsteps = hallSizing.nSubsteps;
+        }
+        this._lastCondSubsteps = condSizing.nSubsteps;
+        this._lastViscSubsteps = viscSizing.nSubsteps;
+        this._lastNonidealSubsteps = ohmSubsteps;
+        this._lastRadiationSubsteps = radiationSizing.nSubsteps;
+
+        return {
+            hallSubsteps: ohmSubsteps,
+            condSubsteps: condSizing.nSubsteps,
+            viscSubsteps: viscSizing.nSubsteps,
+            nonidealSubsteps: ohmSubsteps,
+            radiationSubsteps: radiationSizing.nSubsteps,
+        };
     }
 
     step() {
@@ -1890,6 +2551,35 @@ export class Sim {
 
         // Pass 1: compute dt from U(n).
         this._encodeComputeDt(encoder);
+        this._encodeScaleDtHalf(encoder);
+
+        const hasExtendedSources = (this.physicsFlags & EXTENDED_SOURCE_FLAGS) !== 0;
+        const sourceSizing = hasExtendedSources
+            ? this._prepareSourceSubsteps(this._lastDtHyp)
+            : { hallSubsteps: 1, condSubsteps: 1, viscSubsteps: 1, nonidealSubsteps: 1, radiationSubsteps: 1 };
+        if (hasExtendedSources) {
+            this._encodeSourceDt(encoder);
+        }
+
+        // Pass 1.5: Strang-style source half-step on U(n). dt_half is
+        // produced on-GPU from the freshly reduced macro dt, avoiding a CPU
+        // readback stall before the hot path. Explicit sub-cycled sources
+        // (conduction / viscosity / generalized Ohm) use GPU-divided dt
+        // buffers from the same fresh half step; only their integer substep
+        // counts are conservatively based on last step's source speeds.
+        if (hasExtendedSources) {
+            this._encodeExtendedPhysics(encoder, side,
+                                        sourceSizing.hallSubsteps,
+                                        sourceSizing.condSubsteps,
+                                        sourceSizing.viscSubsteps,
+                                        sourceSizing.nonidealSubsteps,
+                                        {
+                                            target: 'src',
+                                            dtBuffer: b.dt_half,
+                                            radiationSubsteps: sourceSizing.radiationSubsteps,
+                                            labelPrefix: 'plasma.extended.preStrang',
+                                        });
+        }
 
         // Pass 2: three RK3 SSP stages. Optionally instrumented with two
         // timestamp queries (start of stage 1, end of stage 3) when the
@@ -1928,59 +2618,31 @@ export class Sim {
             rkl2Bounds.dtParabolic,
         );
 
-        // Pass 3.5 (breadth pass): extended physics — cooling, gravity,
-        // anisotropic conduction, Hall. Each is gated by a bit in
-        // `physicsFlags`; full no-op when nothing is enabled. Session 15:
-        // Hall is sub-cycled inside one macro Δt; sizing uses last step's
-        // hall_speed_max (one-frame-stale). One writeBuffer per macro
-        // step seeds hall_dt with dt_sub = dt_macro / N_hall.
-        const hallSizing = this._hallSizing(this._lastDtHyp);
-        if ((this.physicsFlags & FLAG_HALL) !== 0 && this.hallDi > 0) {
-            const hallDtSeed = new Float32Array([hallSizing.dtSub, 0, 0, 0]);
-            this.device.queue.writeBuffer(this.buffers.hall_dt, 0, hallDtSeed.buffer);
+        // Pass 3.5: matching source half-step on U(n+1). Source physics is
+        // still split from the hyperbolic RK3 operator, but the old Lie split
+        // is replaced by S(dt/2) H(dt) S(dt/2), which is the right next rung
+        // for stiff cooling/transport/Ohm/gravity coupling without moving the
+        // whole integrator to an IMEX method.
+        if (hasExtendedSources) {
+            this._encodeExtendedPhysics(encoder, side,
+                                        sourceSizing.hallSubsteps,
+                                        sourceSizing.condSubsteps,
+                                        sourceSizing.viscSubsteps,
+                                        sourceSizing.nonidealSubsteps,
+                                        {
+                                            target: 'dst',
+                                            dtBuffer: b.dt_half,
+                                            radiationSubsteps: sourceSizing.radiationSubsteps,
+                                            labelPrefix: 'plasma.extended.postStrang',
+                                        });
         }
-        this._lastHallSubsteps = hallSizing.nSubsteps;
-
-        const condSizing = this._conductionSizing(this._lastDtHyp);
-        if ((this.physicsFlags & FLAG_CONDUCTION) !== 0 && this.conductionKappa > 0) {
-            const condDtSeed = new Float32Array([condSizing.dtSub, 0, 0, 0]);
-            this.device.queue.writeBuffer(this.buffers.cond_dt, 0, condDtSeed.buffer);
-        }
-        this._lastCondSubsteps = condSizing.nSubsteps;
-
-        const viscSizing = this._viscositySizing(this._lastDtHyp);
-        if ((this.physicsFlags & FLAG_VISCOSITY) !== 0) {
-            const viscDtSeed = new Float32Array([viscSizing.dtSub, 0, 0, 0]);
-            this.device.queue.writeBuffer(this.buffers.visc_dt, 0, viscDtSeed.buffer);
-        }
-        this._lastViscSubsteps = viscSizing.nSubsteps;
-
-        const nonidealSizing = this._nonidealSizing(this._lastDtHyp);
-        const ohmOn = (this.physicsFlags & (FLAG_HALL | FLAG_AMBIPOLAR | FLAG_BIERMANN)) !== 0;
-        const ohmSubsteps = ohmOn
-            ? Math.max(1, hallSizing.nSubsteps, nonidealSizing.nSubsteps)
-            : 1;
-        if (ohmOn) {
-            const nonidealDtSeed = new Float32Array([this._lastDtHyp / ohmSubsteps, 0, 0, 0]);
-            this.device.queue.writeBuffer(this.buffers.nonideal_dt, 0, nonidealDtSeed.buffer);
-        }
-        if ((this.physicsFlags & FLAG_HALL) !== 0 && this.hallDi > 0) {
-            this._lastHallSubsteps = ohmSubsteps;
-        }
-        this._lastNonidealSubsteps = ohmSubsteps;
-
-        this._encodeExtendedPhysics(encoder, side,
-                                    hallSizing.nSubsteps,
-                                    condSizing.nSubsteps,
-                                    viscSizing.nSubsteps,
-                                    nonidealSizing.nSubsteps);
 
         // Pass 4: conservation diagnostics reduction over the just-
         // written destination state (stage 3 dst === U_next at this
         // point, before the swap below). Two dispatches in one pass —
         // per-tile partials, then a single-workgroup finalize. Output
-        // (cons_out) is pulled by stats-display via the existing
-        // readback batch at its own cadence; we just write it here.
+        // (cons_out) is pulled by stats-display as a tiny scalar packet at
+        // its own cadence; we just write it here.
         // Folding it inside the RK3 timestamp pass would corrupt the
         // GPU-step measurement, so it gets its own pass.
         {
@@ -2048,8 +2710,8 @@ export class Sim {
                 }
                 if (Number.isFinite(arr[1]) && arr[1] > 0) this._lastDtParabolic = arr[1];
                 if (Number.isFinite(arr[2])) this._lastEtaMax = arr[2];
-                if (Number.isFinite(arr[3]) && arr[3] >= 0) this._lastHallSpeedMax = arr[3];
-                if (Number.isFinite(arr[4]) && arr[4] >= 0) this._lastCondSpeedMax = arr[4];
+                if (Number.isFinite(arr[3]) && arr[3] >= 0) this._lastHallRateMax = arr[3];
+                if (Number.isFinite(arr[4]) && arr[4] >= 0) this._lastCondRateMax = arr[4];
             })
             .catch(e => {
                 // Validation errors on stale buffers can fire during
@@ -2060,7 +2722,74 @@ export class Sim {
             .finally(() => { this._dtReadbackBusy = false; });
     }
 
+    /**
+     * Apply a user-driven pointer perturbation to the CURRENT primary
+     * buffers (U0_n / U1_n / Bx_n / By_n at the side that will be read
+     * by the next `step()`). The dispatch goes in its own command buffer
+     * — WebGPU queue ordering guarantees it lands before the next step's
+     * compute-dt reads U_n.
+     *
+     * Args (all in interior-frame domain coords / units):
+     *   kind:    'drag' | 'excite'
+     *   cx, cy:  Gaussian center, in domain units (0 = interior left edge)
+     *   dvec_x, dvec_y: drag-vector magnitude × direction (code velocity
+     *           for drag, code-B for excite)
+     *   sigma:  Gaussian σ in domain units
+     *   amplitude: scalar pre-multiplier on the deposited δ(ρv) or δAz
+     *
+     * For drag, the deposited momentum at the center cell is
+     *   δm = amplitude · ρ · (dvec_x, dvec_y),
+     * so amplitude=1 means "drag this cell at exactly (dvec_x, dvec_y)".
+     *
+     * For excite, the curl-of-Az evaluated at the center gives δB =
+     * amplitude · (dvec_x, dvec_y). Smaller amplitudes for non-disruptive
+     * perturbations; the default scaling lives in ui.js.
+     */
+    applyPerturbation({ kind, cx, cy, dvec_x, dvec_y, sigma, amplitude = 1 }) {
+        if (!this.buffers || !this.pipelines) return;
+        if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+        if (!Number.isFinite(dvec_x) || !Number.isFinite(dvec_y)) return;
+        if (!Number.isFinite(sigma) || sigma <= 0) return;
+        if (kind !== 'drag' && kind !== 'excite') return;
+
+        const b = this.buffers;
+        b.pushPerturbUniforms({
+            cx, cy,
+            dvec_x, dvec_y,
+            sigma,
+            amplitude,
+        });
+
+        const side = b._side;
+        const bg = this._bgCache.perturb[side];
+        const { pipelines } = this.pipelines;
+        const N = this.n;
+        const gInterior = Math.ceil(N / WG);
+        const gN1       = Math.ceil((N + 1) / WG);
+
+        const encoder = this.device.createCommandEncoder({ label: 'plasma.perturb.enc' });
+        const pass = encoder.beginComputePass({ label: 'plasma.perturb.pass' });
+        pass.setBindGroup(0, bg);
+
+        if (kind === 'drag') {
+            pass.setPipeline(pipelines.perturbDrag);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        } else {
+            // excite: face B update (one extra row+col so every interior
+            // face has an owning invocation), then cell E re-sync. The
+            // two dispatches share one pass; WebGPU guarantees the second
+            // sees the first's writes.
+            pass.setPipeline(pipelines.perturbExciteB);
+            pass.dispatchWorkgroups(gN1, gN1, 1);
+            pass.setPipeline(pipelines.perturbExciteEnergy);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        }
+        pass.end();
+        this.device.queue.submit([encoder.finish()]);
+    }
+
     render() {
+        const licEnabled = this.licIntensity > 1.0e-6;
         // Advance LIC phase by wall-clock dt (not simulation dt) — the
         // drift is purely visual. Phase is in seconds; the shader
         // multiplies by lic_drift_{x,y} (noise-pixels/sec) to get a
@@ -2076,6 +2805,6 @@ export class Sim {
         // main 64 B physics uniform is rewritten only on parameter
         // changes (setEta / setCFL / setViewMode / setGamma / loadPreset).
         this._pushLicUniforms();
-        this.renderer.render();
+        this.renderer.render({ licEnabled });
     }
 }

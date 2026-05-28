@@ -20,7 +20,8 @@
 // Integration: explicit forward Euler over the globally source-limited dt.
 // The host compute-dt pass includes a conduction diffusion bound. This shader
 // is split into compute_delta/apply_delta so all heat fluxes are evaluated
-// from a frozen U/B state before U1.E is mutated.
+// from a frozen U/B state before U1.E is mutated. In cylindrical geometry,
+// the radial heat-flux divergence uses 1/r d(r q_r)/dr.
 //
 // Discretization: cell-centered T from cons_to_prim_mhd, face-centered
 // ∇T via central difference between the two neighbour cell values, then
@@ -50,14 +51,15 @@ struct DtUniform {
 @group(0) @binding(6) var<storage, read_write> dE_cond:    array<f32>;
 @group(0) @binding(7) var<storage, read>       micro:      array<vec4<f32>>;
 
-const MICRO_TRANSPORT_START: u32 = 48u;
-const MICRO_TRANSPORT_COUNT: u32 = 16u;
+const MICRO_TRANSPORT_START: u32 = 72u;
+const MICRO_TRANSPORT_COUNT: u32 = 24u;
 const INV_LN10_COND: f32 = 0.4342944819032518;
+const TRANSPORT_SCALE_MAX_COND: f32 = 1.0e5;
 
 fn micro_log_interp_cond(start: u32, count: u32, theta: f32) -> f32 {
     let log_theta = log(max(theta, 1.0e-30)) * INV_LN10_COND;
     var idx = start;
-    for (var i: u32 = 0u; i < 15u; i = i + 1u) {
+    for (var i: u32 = 0u; i < 23u; i = i + 1u) {
         if (i + 1u >= count) { break; }
         let next = micro[start + i + 1u];
         if (log_theta < next.x) {
@@ -71,7 +73,8 @@ fn micro_log_interp_cond(start: u32, count: u32, theta: f32) -> f32 {
 }
 
 fn transport_scale(theta: f32) -> f32 {
-    return pow(10.0, micro_log_interp_cond(MICRO_TRANSPORT_START, MICRO_TRANSPORT_COUNT, theta));
+    return clamp(pow(10.0, micro_log_interp_cond(MICRO_TRANSPORT_START, MICRO_TRANSPORT_COUNT, theta)),
+                 0.0, TRANSPORT_SCALE_MAX_COND);
 }
 
 // Cell-centered temperature T = p / ρ in code units.
@@ -214,7 +217,17 @@ fn compute_delta(@builtin(global_invocation_id) gid: vec3<u32>) {
     let qxR = q_x_face(ix + 1u, iy, n_total, p_floor, gamma);
     let qyD = q_y_face(ix, iy,      n_total, p_floor, gamma);
     let qyU = q_y_face(ix, iy + 1u, n_total, p_floor, gamma);
-    let divq = (qxR - qxL + qyU - qyD) / dx;
+
+    var divq = (qxR - qxL + qyU - qyD) / dx;
+    let geom_cyl = flag_set(U_uniforms.physics_flags, FLAG_GEOMETRY)
+                && U_uniforms.geometry_mode == 1u;
+    if (geom_cyl) {
+        let r_l = max(U_uniforms.geometry_r_min + f32(gid.x) * dx, 0.0);
+        let r_r = max(U_uniforms.geometry_r_min + (f32(gid.x) + 1.0) * dx, 0.0);
+        let r_c = max(U_uniforms.geometry_r_min + (f32(gid.x) + 0.5) * dx, 0.5 * dx);
+        divq = (r_r * qxR - r_l * qxL) / (r_c * dx)
+             + (qyU - qyD) / dx;
+    }
 
     // dE/dt = -∇·q. (Heat flux is the energy flux; divergence subtracts from local energy.)
     let dE = -divq * dt;

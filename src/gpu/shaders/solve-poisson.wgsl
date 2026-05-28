@@ -1,12 +1,22 @@
 // ─── solve-poisson.wgsl ───────────────────────────────────────────────
-// Periodic Jacobi iterator for the gravitational potential
+// Jacobi iterator for the gravitational potential
 //
-//   ∇²φ = 4πG · (ρ − ρ̄)
+//   periodic:  ∇²φ = 4πG · (ρ − ρ̄)
+//   isolated:  ∇²φ = 4πG · ρ, with a zero-φ exterior
+//
+// In cylindrical geometry mode (x = radius r, y = z), the iterator switches
+// the operator to:
+//
+//   (1/r) ∂r(r ∂rφ) + ∂zzφ = rhs
+//
+// with the same boundary selector. The radial part uses finite-volume face
+// radii so the operator matches the r-weighted mass/CT geometry rather than
+// treating the r-z mesh as Cartesian.
 //
 // on the cell-centered grid. The mean density is reduced from the actual
-// interior domain each step so the periodic Poisson compatibility condition
-// is satisfied. φ itself is indexed periodically; it does not rely on ghost
-// cells being filled for the potential.
+// interior domain each step for the periodic compatibility condition. In
+// isolated mode, the same Jacobi topology is used but neighbor samples outside
+// the interior are held at φ=0 and the mean-density subtraction is disabled.
 //
 // Entry points:
 //   reduce_mean     one partial density sum per 8×8 tile.
@@ -36,6 +46,28 @@ fn periodic_phi(ix: u32, iy: u32, n_interior: u32, n_total: u32, ghost: u32) -> 
     let gx = (ix + n_interior - ghost) % n_interior;
     let gy = (iy + n_interior - ghost) % n_interior;
     return phi_in[periodic_cell_idx_from_gid(gx, gy, n_interior, n_total, ghost)];
+}
+
+fn poisson_isolated() -> bool {
+    return U_uniforms.gravity_boundary_mode == 1u;
+}
+
+fn poisson_cylindrical() -> bool {
+    return flag_set(U_uniforms.physics_flags, FLAG_GEOMETRY)
+        && U_uniforms.geometry_mode == 1u;
+}
+
+fn phi_sample(gx_in: i32, gy_in: i32, n_interior: u32, n_total: u32, ghost: u32) -> f32 {
+    let n = i32(n_interior);
+    if (poisson_isolated()) {
+        if (gx_in < 0 || gx_in >= n || gy_in < 0 || gy_in >= n) {
+            return 0.0;
+        }
+        return phi_in[periodic_cell_idx_from_gid(u32(gx_in), u32(gy_in), n_interior, n_total, ghost)];
+    }
+    let gx = ((gx_in % n) + n) % n;
+    let gy = ((gy_in % n) + n) % n;
+    return phi_in[periodic_cell_idx_from_gid(u32(gx), u32(gy), n_interior, n_total, ghost)];
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -100,17 +132,15 @@ fn iterate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c  = cell_idx_total(ix, iy, n_total);
 
     let rho     = U0[c].x;
-    let rho_bar = rho_mean[0];
+    let rho_bar = select(rho_mean[0], 0.0, poisson_isolated());
     let rhs     = 4.0 * PI_POISSON * U_uniforms.gravity_G * (rho - rho_bar);
 
-    let gx_l = (gid.x + n_interior - 1u) % n_interior;
-    let gx_r = (gid.x + 1u) % n_interior;
-    let gy_d = (gid.y + n_interior - 1u) % n_interior;
-    let gy_u = (gid.y + 1u) % n_interior;
-    let phi_l = phi_in[periodic_cell_idx_from_gid(gx_l, gid.y, n_interior, n_total, ghost)];
-    let phi_r = phi_in[periodic_cell_idx_from_gid(gx_r, gid.y, n_interior, n_total, ghost)];
-    let phi_d = phi_in[periodic_cell_idx_from_gid(gid.x, gy_d, n_interior, n_total, ghost)];
-    let phi_u = phi_in[periodic_cell_idx_from_gid(gid.x, gy_u, n_interior, n_total, ghost)];
+    let gx = i32(gid.x);
+    let gy = i32(gid.y);
+    let phi_l = phi_sample(gx - 1, gy,     n_interior, n_total, ghost);
+    let phi_r = phi_sample(gx + 1, gy,     n_interior, n_total, ghost);
+    let phi_d = phi_sample(gx,     gy - 1, n_interior, n_total, ghost);
+    let phi_u = phi_sample(gx,     gy + 1, n_interior, n_total, ghost);
 
     let dx = U_uniforms.dx;
     let softened = U_uniforms.gravity_softening > 0.0;
@@ -118,8 +148,20 @@ fn iterate(@builtin(global_invocation_id) gid: vec3<u32>) {
                        (dx / max(U_uniforms.gravity_softening, 1.0e-30))
                      * (dx / max(U_uniforms.gravity_softening, 1.0e-30)),
                        softened);
-    let jacobi = (phi_l + phi_r + phi_d + phi_u - dx * dx * rhs)
+    var jacobi: f32;
+    if (poisson_cylindrical()) {
+        let r_l = max(U_uniforms.geometry_r_min + f32(gid.x) * dx, 0.0);
+        let r_r = max(U_uniforms.geometry_r_min + (f32(gid.x) + 1.0) * dx, 0.0);
+        let r_c = max(U_uniforms.geometry_r_min + (f32(gid.x) + 0.5) * dx, 0.5 * dx);
+        let numerator = r_r * phi_r + r_l * phi_l
+                      + r_c * (phi_u + phi_d)
+                      - r_c * dx * dx * rhs;
+        let denom = r_r + r_l + 2.0 * r_c + soft2 * r_c;
+        jacobi = numerator / max(denom, 1.0e-6);
+    } else {
+        jacobi = (phi_l + phi_r + phi_d + phi_u - dx * dx * rhs)
                / max(4.0 + soft2, 1.0e-6);
+    }
     let omega = clamp(U_uniforms.gravity_poisson_omega, 0.05, 1.95);
     phi_out[c] = mix(phi_in[c], jacobi, omega);
 }

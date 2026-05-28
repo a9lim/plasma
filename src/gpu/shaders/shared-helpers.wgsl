@@ -168,14 +168,14 @@ struct Uniforms {
     sponge_width:             f32,  // sponge width in grid cells
     sponge_strength:          f32,  // damping rate for boundary sponge
     cooling_table_mix:        f32,  // reserved blend/scale for external tables
-    _pad_ext_52:              f32,
-    _pad_ext_53:              f32,
-    _pad_ext_54:              f32,
-    _pad_ext_55:              f32,
-    _pad_ext_56:              f32,
-    _pad_ext_57:              f32,
-    _pad_ext_58:              f32,
-    _pad_ext_59:              f32,
+    radiation_c:              f32,  // reduced speed of light for grey radiation transfer
+    radiation_kappa_abs:      f32,  // absorption/thermal coupling opacity
+    radiation_kappa_scat:     f32,  // scattering opacity for flux-limited diffusion
+    radiation_const:          f32,  // radiation constant a_r in E_rad = a_r T^4
+    radiation_floor:          f32,  // floor for positive radiation energy density
+    electron_inertia_length:  f32,  // kinetic regularization length d_e for hyper-resistive Ohm term
+    electron_inertia_damping: f32,  // coefficient for d_e^2 ∇²J high-k smoothing
+    gravity_boundary_mode:    u32,  // 0 = periodic mean-subtracted, 1 = isolated zero-φ exterior
     _pad_ext_60:              f32,
     _pad_ext_61:              f32,
     _pad_ext_62:              f32,
@@ -196,6 +196,8 @@ const FLAG_VISCOSITY:    u32 = 1u << 9u;
 const FLAG_GEOMETRY:     u32 = 1u << 10u;
 const FLAG_SPONGE:       u32 = 1u << 11u;
 const FLAG_HEATING:      u32 = 1u << 12u;
+const FLAG_RADIATION:    u32 = 1u << 13u;
+const FLAG_ELECTRON_INERTIA: u32 = 1u << 14u;
 
 fn flag_set(flags: u32, bit: u32) -> bool {
     return (flags & bit) != 0u;
@@ -226,6 +228,10 @@ const BC_PERIODIC:   u32 = 0u;
 const BC_OUTFLOW:    u32 = 1u;
 const BC_REFLECTING: u32 = 2u;
 const BC_DRIVEN:     u32 = 3u;
+const EDGE_N_BC: u32 = 0u;
+const EDGE_S_BC: u32 = 1u;
+const EDGE_E_BC: u32 = 2u;
+const EDGE_W_BC: u32 = 3u;
 
 // Per-edge BC config + driven inflow state. Single storage buffer bound
 // only by apply-bcs.wgsl. Driven state is in primitive form; the shader
@@ -241,14 +247,38 @@ struct BcUniforms {
     mode_s: u32,
     mode_e: u32,
     mode_w: u32,
-    driven_rho: f32,
-    driven_vx:  f32,
-    driven_vy:  f32,
-    driven_vz:  f32,
-    driven_bx:  f32,
-    driven_by:  f32,
-    driven_bz:  f32,
-    driven_p:   f32,
+    driven_n_rho: f32,
+    driven_n_vx:  f32,
+    driven_n_vy:  f32,
+    driven_n_vz:  f32,
+    driven_n_bx:  f32,
+    driven_n_by:  f32,
+    driven_n_bz:  f32,
+    driven_n_p:   f32,
+    driven_s_rho: f32,
+    driven_s_vx:  f32,
+    driven_s_vy:  f32,
+    driven_s_vz:  f32,
+    driven_s_bx:  f32,
+    driven_s_by:  f32,
+    driven_s_bz:  f32,
+    driven_s_p:   f32,
+    driven_e_rho: f32,
+    driven_e_vx:  f32,
+    driven_e_vy:  f32,
+    driven_e_vz:  f32,
+    driven_e_bx:  f32,
+    driven_e_by:  f32,
+    driven_e_bz:  f32,
+    driven_e_p:   f32,
+    driven_w_rho: f32,
+    driven_w_vx:  f32,
+    driven_w_vy:  f32,
+    driven_w_vz:  f32,
+    driven_w_bx:  f32,
+    driven_w_by:  f32,
+    driven_w_bz:  f32,
+    driven_w_p:   f32,
 };
 
 // PRESSURE_FLOOR is now live-controlled via U.pressure_floor (Uniforms

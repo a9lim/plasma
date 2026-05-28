@@ -1,16 +1,10 @@
 /**
  * @fileoverview Stats tab — energy / β / ∇·B / reconnection-rate display.
  *
- * Phase 5 takes a pragmatic approach: instead of building dedicated
- * GPU reduction kernels for every aggregate (which the LIC work in
- * Phase 6 will piggyback on), we readback the interior `U0_n` + `U1_n`
- * + face-B buffers at a low cadence (every 5 frames ≈ 12 Hz) and
- * compute the aggregates on the CPU. At 256² interior the slice is
- * ~640 KB total — comfortable for the 12 Hz cadence, and zero on the
- * 53.33 ms not-readback-frame budget.
- *
- * For 512² and 1024² the readback grows; we drop the cadence to every
- * 10 frames (6 Hz) at 512 and every 20 frames (3 Hz) at 1024.
+ * The heavy aggregates are reduced on the GPU by
+ * conservation-{reduce,finalize}.wgsl. This panel reads back only dt,
+ * the scalar diagnostics packet, and optional timestamps at a low cadence
+ * instead of copying U/B field buffers to JS.
  *
  * The conservation-drift baseline is captured at the first successful
  * readback and reset whenever the user changes preset/resolution.
@@ -24,10 +18,9 @@
  */
 
 import { readbackBatch, ReadbackPool } from './gpu/readback.js';
-import { GHOST_WIDTH, DENSITY_FLOOR, DT_MIN } from './config.js';
+import { DT_MIN } from './config.js';
 
 const SPARK_CAP = 240;
-const DUAL_ENERGY_FRACTION = 1e-3;
 
 /** Helper: create a DOM element with optional class + text. */
 function el(tag, cls, text) {
@@ -50,15 +43,6 @@ function statRow(label, opts) {
 /** Group label (matches geon's `.group-label`). */
 function groupLabel(text) {
     return el('h2', 'group-label', text);
-}
-
-function pressureFromDualEnergy({ E, eAux, ke, mb, gammaM1, pFloor }) {
-    const ethFloor = pFloor / Math.max(gammaM1, 1e-6);
-    const ethTotal = E - ke - mb;
-    const totalOk = Number.isFinite(ethTotal)
-        && ethTotal > Math.max(ethFloor, DUAL_ENERGY_FRACTION * Math.max(Math.abs(E), ethFloor));
-    const eth = totalOk ? ethTotal : Math.max(eAux, ethFloor);
-    return Math.max(gammaM1 * eth, pFloor);
 }
 
 /** Build a sparkline canvas + ring buffer. */
@@ -92,6 +76,7 @@ export class StatsDisplay {
         this.pool = new ReadbackPool(this.device);
         this._readbackBusy = false;
         this._frameCounter = 0;
+        this._bufferGeneration = 0;
         this._baseline = null;   // { Etot, mass } captured first tick after reset
 
         this._build();
@@ -100,6 +85,10 @@ export class StatsDisplay {
     /** Re-read buffer handles from sim after a resolution change. */
     bindBuffers(buffers) {
         this.buffers = buffers;
+        this._bufferGeneration += 1;
+        this.pool.destroy();
+        this.pool = new ReadbackPool(this.device);
+        this._readbackBusy = false;
         this._resetBaseline();
     }
 
@@ -254,25 +243,13 @@ export class StatsDisplay {
     }
 
     async _doReadback() {
+        const generation = this._bufferGeneration;
         const b = this.buffers;
-        const n = this.sim.n;
-        const nT = this.sim.n_total;
-        const cellsT = nT * nT;
-        const xfaceCells = (nT + 1) * nT;
-        const yfaceCells = nT * (nT + 1);
-        const F32 = 4, V4 = 16;
+        const F32 = 4;
 
         const specs = [
-            { buf: b.U0_n, byteOffset: 0, byteSize: cellsT * V4 },
-            { buf: b.U1_n, byteOffset: 0, byteSize: cellsT * V4 },
-            { buf: b.Bx_n, byteOffset: 0, byteSize: xfaceCells * F32 },
-            { buf: b.By_n, byteOffset: 0, byteSize: yfaceCells * F32 },
             { buf: b.dt,   byteOffset: 0, byteSize: F32 },
-            // Conservation diagnostics — 8 × f32 (7 live + 1 pad). The
-            // GPU-side reduction runs at the end of every sim step; we
-            // pull the current value at the same cadence as everything
-            // else here. Negligible bandwidth: 32 B vs ~640 KB for U/B.
-            { buf: b.cons_out, byteOffset: 0, byteSize: 8 * F32 },
+            { buf: b.cons_out, byteOffset: 0, byteSize: 24 * F32 },
         ];
         // Timestamp resolve buffer (2 × u64 = 16 B) when the device
         // supports `timestamp-query`. Batched alongside the other reads so
@@ -289,14 +266,9 @@ export class StatsDisplay {
             console.warn('[plasma.stats] readback failed:', e);
             return;
         }
-        const U0 = new Float32Array(bufs[0]);
-        const U1 = new Float32Array(bufs[1]);
-        const Bxf = new Float32Array(bufs[2]);
-        const Byf = new Float32Array(bufs[3]);
-        const dtArr = new Float32Array(bufs[4]);
-        // Conservation: 8 f32 — [mass, mom_x, mom_y, mom_z, E_tot,
-        // E_mag, divB_L1, _pad]. Sums (NOT pre-multiplied by dx²).
-        const consArr = new Float32Array(bufs[5]);
+        if (generation !== this._bufferGeneration) return;
+        const dtArr = new Float32Array(bufs[0]);
+        const statsArr = new Float32Array(bufs[1]);
 
         // Decode the two 64-bit timestamps (ns since some device epoch) into
         // a step time in ms. We read as two BigUint64s — the high bits of
@@ -317,117 +289,37 @@ export class StatsDisplay {
             }
         }
 
-        this._compute(U0, U1, Bxf, Byf, dtArr[0], n, nT, gpuMs, consArr);
+        this._compute(dtArr[0], gpuMs, statsArr);
     }
 
-    _compute(U0, U1, Bxf, Byf, dt, n, nT, gpuMs, consArr) {
-        const ghost = GHOST_WIDTH;
+    _compute(dt, gpuMs, consArr) {
         const dx = this.sim.dx;
-        const dxInv = 1 / dx;
         const cellArea = dx * dx;
-        const gammaM1 = this.sim.gamma - 1;
-
-        // Aggregates
-        let Ekin = 0, Emag = 0, Eint = 0;
-        let betaSum = 0, betaMin = Infinity, betaMax = -Infinity;
-        let bMagMax = 0, vMagMax = 0, jzMax = 0;
-        let divBSq = 0;
-        let nCells = 0;
-        let nanCount = 0, rhoFloorCount = 0, pFloorCount = 0;
-        const pFloor = this.sim.pressureFloor ?? 1e-6;
-
-        for (let j = ghost; j < ghost + n; j++) {
-            for (let i = ghost; i < ghost + n; i++) {
-                const idx = j * nT + i;
-                const rhoRaw = U0[idx * 4 + 0];
-                const rho = Math.max(rhoRaw, DENSITY_FLOOR);
-                const mx  = U0[idx * 4 + 1];
-                const my  = U0[idx * 4 + 2];
-                const mz  = U0[idx * 4 + 3];
-                const E   = U1[idx * 4 + 0];
-                const Bz  = U1[idx * 4 + 1];
-
-                // Cell-centered face-B average.
-                const bxL = Bxf[j * (nT + 1) + i];
-                const bxR = Bxf[j * (nT + 1) + (i + 1)];
-                const byD = Byf[j * nT + i];
-                const byU = Byf[(j + 1) * nT + i];
-                const Bx = 0.5 * (bxL + bxR);
-                const By = 0.5 * (byD + byU);
-
-                if (![rhoRaw, mx, my, mz, E, Bz, Bx, By].every(Number.isFinite)) {
-                    nanCount += 1;
-                    continue;
-                }
-
-                if (rhoRaw <= 1.001 * DENSITY_FLOOR) rhoFloorCount += 1;
-
-                const vx = mx / rho, vy = my / rho, vz = mz / rho;
-                const ke = 0.5 * rho * (vx * vx + vy * vy + vz * vz);
-                const mb = 0.5 * (Bx * Bx + By * By + Bz * Bz);
-                const eAux = U1[idx * 4 + 2];
-                const p = pressureFromDualEnergy({ E, eAux, ke, mb, gammaM1, pFloor });
-                if (p <= 1.001 * pFloor) pFloorCount += 1;
-
-                Ekin += ke * cellArea;
-                Emag += mb * cellArea;
-                Eint += (p / gammaM1) * cellArea;
-
-                const beta = 2 * p / Math.max(2 * mb, 1e-12);
-                betaSum += beta;
-                if (beta < betaMin) betaMin = beta;
-                if (beta > betaMax) betaMax = beta;
-
-                const Bmag = Math.sqrt(Bx * Bx + By * By + Bz * Bz);
-                if (Bmag > bMagMax) bMagMax = Bmag;
-                const vMag = Math.sqrt(vx * vx + vy * vy + vz * vz);
-                if (vMag > vMagMax) vMagMax = vMag;
-
-                // ∇·B at cell — uses face values directly (CT-exact).
-                const divB = (bxR - bxL) * dxInv + (byU - byD) * dxInv;
-                divBSq += divB * divB;
-
-                // J_z = ∂By/∂x - ∂Bx/∂y, central difference on cell-centered values.
-                // We approximate with face deltas: ((By_iR_avg - By_iL_avg)/dx - (Bx_jU_avg - Bx_jD_avg)/dx).
-                // For a Phase-5 magnitude estimate this is sufficient; the
-                // shader-side J_z uses neighbour cell averages — close enough.
-                if (i > ghost && i < ghost + n - 1 && j > ghost && j < ghost + n - 1) {
-                    const idxR = j * nT + (i + 1);
-                    const idxL = j * nT + (i - 1);
-                    const idxU = (j + 1) * nT + i;
-                    const idxD = (j - 1) * nT + i;
-                    const ByR = 0.5 * (Byf[j * nT + (i + 1)] + Byf[(j + 1) * nT + (i + 1)]);
-                    const ByL = 0.5 * (Byf[j * nT + (i - 1)] + Byf[(j + 1) * nT + (i - 1)]);
-                    const BxU = 0.5 * (Bxf[(j + 1) * (nT + 1) + i] + Bxf[(j + 1) * (nT + 1) + (i + 1)]);
-                    const BxD = 0.5 * (Bxf[(j - 1) * (nT + 1) + i] + Bxf[(j - 1) * (nT + 1) + (i + 1)]);
-                    const jz = (ByR - ByL) * 0.5 * dxInv - (BxU - BxD) * 0.5 * dxInv;
-                    const ajz = Math.abs(jz);
-                    if (ajz > jzMax) jzMax = ajz;
-                }
-
-                nCells++;
-            }
-        }
-
+        const nCells = Math.max(0, Math.round(consArr[20] || 0));
+        const Ekin = consArr[7] * cellArea;
+        const Emag = consArr[5] * cellArea;
+        const Eint = consArr[8] * cellArea;
         const Etot = Ekin + Emag + Eint;
-        const divBNorm = Math.sqrt(divBSq * cellArea);
+        const betaSum = consArr[9];
+        const betaMean = betaSum / Math.max(nCells, 1);
+        const betaMin = nCells > 0 ? consArr[10] : 0;
+        const betaMax = nCells > 0 ? consArr[11] : 0;
+        const bMagMax = consArr[12];
+        const vMagMax = consArr[13];
+        const jzMax = consArr[14];
+        const divBNorm = Math.sqrt(Math.max(consArr[15] * cellArea, 0));
+        const nanCount = Math.round(consArr[16] || 0);
+        const rhoFloorCount = Math.round(consArr[17] || 0);
+        const pFloorCount = Math.round(consArr[18] || 0);
 
         if (!this._baseline) this._baseline = { Etot };
         const drift = this._baseline.Etot !== 0
             ? 100 * (Etot - this._baseline.Etot) / Math.abs(this._baseline.Etot)
             : 0;
 
-        // Reconnection rate (Harris only): ψ(t) = ∫ Bx dy at x=0, y∈[0, L/2].
-        // We approximate by summing Bx along the column at the center of
-        // the domain over the upper half-plane interior.
-        let psi = 0;
-        if (!this._reconWrap.hidden) {
-            const iCol = ghost + (n >> 1);
-            const jMid = ghost + (n >> 1);
-            for (let j = jMid; j < ghost + n; j++) {
-                psi += Bxf[j * (nT + 1) + iCol] * dx;
-            }
-        }
+        // Harris reconnection proxy: shader slot 19 sums Bx along the
+        // center column over the upper half-plane; scale by dx here.
+        const psi = this._reconWrap.hidden ? 0 : consArr[19] * dx;
         let rrate = 0;
         if (this._reconPsiPrev !== undefined && this._reconPsiPrev !== null && !this._reconWrap.hidden) {
             // dΨ/dt approximated by (Δψ / Δsteps · dt). We don't have
@@ -449,7 +341,6 @@ export class StatsDisplay {
         this._refs.eInt.textContent   = fmt(Eint);
         this._refs.eDrift.textContent = (drift >= 0 ? '+' : '') + drift.toFixed(2) + '%';
 
-        const betaMean = betaSum / Math.max(nCells, 1);
         this._refs.bMean.textContent = fmtFx(betaMean);
         this._refs.bMin.textContent  = fmt(betaMin);
         this._refs.bMax.textContent  = fmt(betaMax);
@@ -489,12 +380,8 @@ export class StatsDisplay {
         pushSparkSample(this._sparkDivB.hist, divBNorm);
 
         // ── Conservation diagnostics (GPU-reduced) ───────────────
-        // consArr layout (from conservation-finalize.wgsl): seven
-        // straight sums over interior cells (NOT pre-multiplied by
-        // dx²) followed by a pad slot. Scale by cellArea here so the
-        // numbers match the "∫" framing in the UI labels and the
-        // CPU-computed Etot above (post-scale they're in the same
-        // unit system).
+        // consArr slots 0..6 preserve the conservation-panel contract:
+        // straight sums over interior cells (NOT pre-multiplied by dx²).
         const massSum = consArr[0] * cellArea;
         const momX    = consArr[1] * cellArea;
         const momY    = consArr[2] * cellArea;

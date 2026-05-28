@@ -1,0 +1,1023 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plasma — physics validation matrix | a9l.im</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="/favicon.ico">
+
+<link rel="stylesheet" href="/fonts/fonts.css">
+<script src="/shared-tokens.js"></script>
+<link rel="stylesheet" href="/shared-base.css">
+<link rel="stylesheet" href="../styles.css">
+
+<style>
+  body.sim-body { overflow: auto; padding: 24px; }
+  #wrap { max-width: 1180px; margin: 0 auto; font-family: var(--font-sans); }
+  h1 { font-family: var(--font-display); margin: 0 0 8px; }
+  .hint { color: var(--text-muted); margin: 4px 0 16px; font-size: var(--font-sm); line-height: 1.55; }
+  .actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+  button.tool-btn { padding: 8px 16px; font-size: var(--font-base); }
+  table { width: 100%; border-collapse: collapse; margin-top: 16px;
+          font-family: var(--font-mono); font-size: var(--font-sm);
+          font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 10px; text-align: right; vertical-align: top; }
+  th { background: var(--bg-elevated); color: var(--text); font-weight: 600; }
+  th:first-child, td:first-child,
+  th:nth-child(2), td:nth-child(2) { text-align: left; }
+  tbody tr:nth-child(even) { background: var(--bg-elevated); }
+  tr.pass td:first-child::before { content: "PASS "; color: var(--accent); }
+  tr.fail td:first-child::before { content: "FAIL "; color: #c02520; }
+  tr.running td:first-child::before { content: "RUN  "; color: var(--text-muted); }
+  #log { font-family: var(--font-mono); font-size: var(--font-sm);
+         background: var(--bg-elevated); padding: 12px; border-radius: var(--radius);
+         margin-top: 16px; white-space: pre-wrap; min-height: 84px; max-height: 240px; overflow: auto; }
+  .metric { color: var(--text-muted); }
+  .err { color: #c02520; }
+  code { font-family: var(--font-mono); }
+</style>
+</head>
+<body class="sim-body">
+<div id="wrap">
+  <h1>Physics validation matrix</h1>
+  <p class="hint">
+    Production WebGPU <code>Sim</code> checks for the base MHD engine and the opt-in
+    source stack. This is a regression gate, not a visualization: it reads back
+    conserved state, measures finite-state invariants, divergence, selected mode
+    amplitudes, source-response signs, and transport anisotropy.
+  </p>
+  <div class="actions">
+    <button id="runBtn" class="tool-btn">Run matrix</button>
+    <span id="status" class="hint">Idle.</span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Case</th>
+        <th>N</th>
+        <th>Steps</th>
+        <th>t</th>
+        <th>ρ range</th>
+        <th>p_min</th>
+        <th>⟨|∇·B|⟩</th>
+        <th>Primary metric</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="log"></div>
+</div>
+
+<script type="module">
+import { initDevice } from '../src/gpu/device.js';
+import {
+    makeSodPreset, makeBrioWuPreset, makeOrszagTangPreset, makeHarrisPreset,
+    makeDrivenWindPreset, makeHallWhistlerPreset, makeConductionFrontPreset,
+    makeCoolingInstabilityPreset, makeRadiativeRelaxationPreset,
+    makeKineticCurrentSmoothingPreset, makeJeansInstabilityPreset,
+    makeIsolatedGravityPulsePreset, makeCylindricalExpansionPreset,
+    makeCylindricalStaticEquilibriumPreset, makeCylindricalMagneticCompressionPreset,
+    makeCylindricalConductionBalancePreset, makeCylindricalGravityColumnPreset,
+} from '../src/presets.js';
+import {
+    BC_DRIVEN,
+    FLAG_CONDUCTION, FLAG_HALL,
+    GRAVITY_SOLVER_MULTIGRID, GRAVITY_SOLVER_JACOBI,
+} from '../src/config.js';
+import {
+    buildMicrophysicsTable, MICRO_TABLE_ENTRIES, MICRO_STRIDE,
+    MICRO_FAMILY_SIZE, MICRO_COOL_START, MICRO_ION_START,
+    MICRO_TRANSPORT_START, MICRO_RAD_ABS_START, MICRO_RAD_SCAT_START,
+    MICROPHYSICS_DATASET,
+} from '../src/microphysics.js';
+import {
+    createSimAtResolution, fmt, makePool, readState, runForSteps, runForTime,
+    runExtendedSourceOnly, summarizeState, cosineModeAmplitude, temperatureMoments,
+} from './physics-test-utils.js';
+
+const runBtn = document.getElementById('runBtn');
+const rowsEl = document.getElementById('rows');
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+function logln(text, cls) {
+    const node = document.createElement('div');
+    if (cls) node.className = cls;
+    node.textContent = text;
+    logEl.appendChild(node);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(text) {
+    statusEl.textContent = text;
+}
+
+function rowFor(label, n) {
+    const tr = document.createElement('tr');
+    tr.className = 'running';
+    tr.innerHTML = `
+      <td>running</td>
+      <td>${label}</td>
+      <td>${n}</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td>...</td>
+      <td class="metric">...</td>
+    `;
+    rowsEl.appendChild(tr);
+    return tr;
+}
+
+function finishRow(row, result) {
+    row.className = result.ok ? 'pass' : 'fail';
+    row.children[0].textContent = result.ok ? 'pass' : 'fail';
+    row.children[3].textContent = String(result.steps ?? '');
+    row.children[4].textContent = fmt(result.t ?? 0, 4);
+    row.children[5].textContent = result.summary
+        ? `${fmt(result.summary.rhoMin, 3)}..${fmt(result.summary.rhoMax, 3)}`
+        : '';
+    row.children[6].textContent = result.summary ? fmt(result.summary.pMin, 3) : '';
+    row.children[7].textContent = result.summary ? fmt(result.summary.divbAbsAvg, 3) : '';
+    row.children[8].textContent = result.metric ?? '';
+}
+
+function finiteGate(summary, opts = {}) {
+    const maxDivB = opts.maxDivB ?? 5.0e-2;
+    const maxFloor = opts.maxFloor ?? 0;
+    const ok = summary.finite
+        && summary.rhoMin > 0
+        && summary.pMin > 0
+        && summary.divbAbsAvg <= maxDivB
+        && summary.pFloorCount <= maxFloor
+        && summary.rhoFloorCount <= maxFloor;
+    const why = [];
+    if (!summary.finite) why.push(`non-finite at ${JSON.stringify(summary.firstBad)}`);
+    if (summary.divbAbsAvg > maxDivB) why.push(`divB ${summary.divbAbsAvg} > ${maxDivB}`);
+    if (summary.pFloorCount > maxFloor) why.push(`p floors ${summary.pFloorCount} > ${maxFloor}`);
+    if (summary.rhoFloorCount > maxFloor) why.push(`rho floors ${summary.rhoFloorCount} > ${maxFloor}`);
+    return { ok, why };
+}
+
+function evalMicro(table, start, count, theta) {
+    const logTheta = Math.log10(Math.max(theta, 1e-30));
+    let idx = start;
+    for (let i = 0; i < count - 1; i++) {
+        const next = (start + i + 1) * MICRO_STRIDE;
+        if (logTheta < table[next + 0]) {
+            idx = start + i;
+            break;
+        }
+        idx = start + i + 1;
+    }
+    const base = idx * MICRO_STRIDE;
+    const logValue = table[base + 1] + table[base + 2] * (logTheta - table[base + 0]);
+    return Math.pow(10, logValue);
+}
+
+async function runMicrophysicsTableCase() {
+    const row = rowFor('microphysics table shape/opacities', 'host');
+    try {
+        const table = buildMicrophysicsTable();
+        const expected = MICRO_TABLE_ENTRIES * MICRO_STRIDE;
+        const coolLow = evalMicro(table, MICRO_COOL_START, MICRO_FAMILY_SIZE, 1.0e-3);
+        const coolPeak = evalMicro(table, MICRO_COOL_START, MICRO_FAMILY_SIZE, 0.12);
+        const coolTrough = evalMicro(table, MICRO_COOL_START, MICRO_FAMILY_SIZE, 2.0);
+        const coolTail = evalMicro(table, MICRO_COOL_START, MICRO_FAMILY_SIZE, 100.0);
+        const neutralCold = evalMicro(table, MICRO_ION_START, MICRO_FAMILY_SIZE, 1.0e-3);
+        const neutralHot = evalMicro(table, MICRO_ION_START, MICRO_FAMILY_SIZE, 10.0);
+        const transportCold = evalMicro(table, MICRO_TRANSPORT_START, MICRO_FAMILY_SIZE, 1.0e-2);
+        const transportHot = evalMicro(table, MICRO_TRANSPORT_START, MICRO_FAMILY_SIZE, 100.0);
+        const absCold = evalMicro(table, MICRO_RAD_ABS_START, MICRO_FAMILY_SIZE, 1.0e-3);
+        const absHot = evalMicro(table, MICRO_RAD_ABS_START, MICRO_FAMILY_SIZE, 100.0);
+        const scatCold = evalMicro(table, MICRO_RAD_SCAT_START, MICRO_FAMILY_SIZE, 1.0e-4);
+        const scatHot = evalMicro(table, MICRO_RAD_SCAT_START, MICRO_FAMILY_SIZE, 1.0);
+        const checks = [
+            table.length === expected,
+            MICROPHYSICS_DATASET.id === 'sd93-solar-cie-v1',
+            coolPeak > 8.0 * coolTrough,
+            coolTrough > 2.0 * coolTail,
+            coolTail > 1.0e5 * coolLow,
+            neutralCold > 0.85,
+            neutralHot < 1.0e-4,
+            transportHot > 1.0e7 * transportCold,
+            absCold > 10.0,
+            absHot < 0.02,
+            scatCold < 0.02,
+            scatHot > 0.9,
+        ];
+        const ok = checks.every(Boolean);
+        finishRow(row, {
+            ok, steps: 0, t: 0,
+            metric: ok
+                ? `${MICROPHYSICS_DATASET.id}, rows=${MICRO_TABLE_ENTRIES}, cool peak/trough=${fmt(coolPeak / coolTrough, 3)}, tail/low=${fmt(coolTail / coolLow, 3)}`
+                : `failed checks=${checks.map((v, i) => v ? '' : i).filter(v => v !== '').join(',')}`,
+        });
+        return ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`microphysics table: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function withSim(device, format, n, preset, fn) {
+    const pool = makePool(device);
+    const { sim, canvas } = await createSimAtResolution(device, format, n, preset);
+    try {
+        return await fn(sim, pool, preset);
+    } finally {
+        canvas.remove();
+    }
+}
+
+async function runSmokeCase(device, format, spec) {
+    const row = rowFor(spec.label, spec.n);
+    try {
+        const result = await withSim(device, format, spec.n, spec.make(spec.n), async (sim, pool) => {
+            const t = await runForSteps(device, pool, sim, spec.steps);
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const gate = finiteGate(summary, spec.gate ?? {});
+            return {
+                ok: gate.ok,
+                steps: spec.steps,
+                t,
+                summary,
+                metric: gate.ok ? `finite, |B|max=${fmt(summary.bMax, 3)}`
+                                : gate.why.join('; '),
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`${spec.label}: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runSourceSizingCase(device, format) {
+    const row = rowFor('source substep rate sizing', 256);
+    try {
+        const result = await withSim(device, format, 256, makeHallWhistlerPreset(256), async (sim) => {
+            const dtMacro = 1.0e-3;
+            const rate = 1.0 / Math.max(sim.dx * sim.dx, 1.0e-30);
+            const expected = Math.ceil((0.5 * dtMacro * rate) / 0.5);
+
+            sim.physicsFlags |= FLAG_HALL | FLAG_CONDUCTION;
+            sim.hallDi = 1.0;
+            sim.conductionKappa = 1.0;
+            sim.hallSubstepsMax = 10000;
+            sim.sourceSubstepsMax = 10000;
+            sim._lastHallRateMax = rate;
+            sim._lastCondRateMax = rate;
+
+            const hall = sim._hallSizing(dtMacro);
+            const cond = sim._conductionSizing(dtMacro);
+            const ok = hall.nSubsteps === expected && cond.nSubsteps === expected
+                && hall.dtSub <= 0.5 / rate && cond.dtSub <= 0.5 / rate;
+
+            return {
+                ok, steps: 0, t: 0, summary: null,
+                metric: `expected ${expected}, Hall=${hall.nSubsteps}, cond=${cond.nSubsteps}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`source sizing: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runCoolingCase(device, format) {
+    const row = rowFor('cooling energy monotonicity', 64);
+    try {
+        const result = await withSim(device, format, 64, makeCoolingInstabilityPreset(64), async (sim, pool) => {
+            const initial = summarizeState(sim, await readState(device, pool, sim));
+            const run = await runForTime(device, pool, sim, 0.08, { maxSteps: 400 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const gate = finiteGate(summary, { maxDivB: 1e-6, maxFloor: 0 });
+            const dE = summary.energy - initial.energy;
+            const ok = gate.ok && dE < -1e-4;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `ΔE=${fmt(dE, 4)}${ok ? '' : ' (expected negative)'}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`cooling: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runConductionCase(device, format) {
+    const row = rowFor('anisotropic conduction front', 64);
+    try {
+        const result = await withSim(device, format, 64, makeConductionFrontPreset(64), async (sim, pool) => {
+            const initialState = await readState(device, pool, sim);
+            const initial = temperatureMoments(sim, initialState);
+            const run = await runExtendedSourceOnly(device, sim, 0.001, 40);
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const final = temperatureMoments(sim, state);
+            const growX = final.varX - initial.varX;
+            const growY = final.varY - initial.varY;
+            const gate = finiteGate(summary, { maxDivB: 1e-6, maxFloor: 0 });
+            const ok = gate.ok && growX > 0 && growY >= 0 && growX > 2.5 * growY;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `Δσx²=${fmt(growX, 4)}, Δσy²=${fmt(growY, 4)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`conduction: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runRadiationCase(device, format) {
+    const row = rowFor('grey radiation energy exchange', 64);
+    try {
+        const result = await withSim(device, format, 64, makeRadiativeRelaxationPreset(64), async (sim, pool) => {
+            const initial = summarizeState(sim, await readState(device, pool, sim));
+            const run = await runExtendedSourceOnly(device, sim, 0.0005, 40, { substeps: 2 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const gate = finiteGate(summary, { maxDivB: 1e-6, maxFloor: 0 });
+            const dGas = summary.energy - initial.energy;
+            const dRad = summary.radiation - initial.radiation;
+            const dTot = dGas + dRad;
+            const relTot = Math.abs(dTot) / Math.max(initial.energy + initial.radiation, 1e-30);
+            const ok = gate.ok && dGas < -1e-4 && dRad > 1e-4 && relTot < 2e-3;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `ΔEgas=${fmt(dGas, 4)}, ΔEr=${fmt(dRad, 4)}, rel total=${fmt(relTot, 3)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`radiation: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runBoundaryCase(device, format) {
+    const row = rowFor('per-edge driven boundary states', 32);
+    try {
+        const states = {
+            N: { rho: 1.4, vx: 0.01, vy: -0.30, vz: 0.02, bx: 0.10, by: -0.20, bz: 0.03, p: 0.90 },
+            S: { rho: 1.1, vx: 0.02, vy:  0.25, vz: 0.01, bx: 0.05, by:  0.18, bz: 0.02, p: 0.80 },
+            E: { rho: 0.9, vx: -0.35, vy: 0.03, vz: 0.04, bx: -0.22, by: 0.04, bz: 0.01, p: 0.70 },
+            W: { rho: 1.2, vx:  0.40, vy: 0.04, vz: 0.05, bx:  0.25, by: 0.06, bz: 0.02, p: 0.85 },
+        };
+        const preset = makeSodPreset(32);
+        preset.bc = {
+            modeN: BC_DRIVEN, modeS: BC_DRIVEN,
+            modeE: BC_DRIVEN, modeW: BC_DRIVEN,
+            driven: states.W,
+            drivenN: states.N,
+            drivenS: states.S,
+            drivenE: states.E,
+            drivenW: states.W,
+        };
+        const result = await withSim(device, format, 32, preset, async (sim, pool) => {
+            const encoder = device.createCommandEncoder({ label: 'plasma.test.perEdgeBc.enc' });
+            sim._encodeApplyBcsHandles(
+                encoder,
+                sim._sourceHandles(sim.buffers._side, 'src'),
+                'plasma.test.perEdgeBc.applyBcs',
+            );
+            device.queue.submit([encoder.finish()]);
+            await device.queue.onSubmittedWorkDone();
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const n = sim.n;
+            const ghost = sim.ghost;
+            const nT = n + 2 * ghost;
+            const mid = ghost + Math.floor(n / 2);
+            const cIdx = (i, j) => j * nT + i;
+            const bxIdx = (i, j) => j * (nT + 1) + i;
+            const byIdx = (i, j) => j * nT + i;
+            const cellPrim = (i, j) => {
+                const c = cIdx(i, j);
+                const rho = state.U0[4 * c + 0];
+                return {
+                    rho,
+                    vx: state.U0[4 * c + 1] / rho,
+                    vy: state.U0[4 * c + 2] / rho,
+                    vz: state.U0[4 * c + 3] / rho,
+                    bz: state.U1[4 * c + 1],
+                };
+            };
+            const eps = 2e-5;
+            const close = (a, b) => Math.abs(a - b) <= eps * Math.max(1, Math.abs(b));
+            const cellOk = (actual, expected) =>
+                close(actual.rho, expected.rho)
+                && close(actual.vx, expected.vx)
+                && close(actual.vy, expected.vy)
+                && close(actual.vz, expected.vz)
+                && close(actual.bz, expected.bz);
+            const checks = [
+                cellOk(cellPrim(ghost - 1, mid), states.W),
+                cellOk(cellPrim(ghost + n, mid), states.E),
+                cellOk(cellPrim(mid, ghost - 1), states.S),
+                cellOk(cellPrim(mid, ghost + n), states.N),
+                close(state.Bx[bxIdx(ghost, mid)], states.W.bx),
+                close(state.Bx[bxIdx(ghost + n, mid)], states.E.bx),
+                close(state.By[byIdx(mid, ghost)], states.S.by),
+                close(state.By[byIdx(mid, ghost + n)], states.N.by),
+            ];
+            const ok = checks.every(Boolean);
+            return {
+                ok, steps: 1, t: 0, summary,
+                metric: ok ? 'N/S/E/W driven primitives distinct'
+                           : `failed checks=${checks.map((v, i) => v ? '' : i).filter(v => v !== '').join(',')}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`boundaries: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+function wrapPhase(x) {
+    let y = (x + Math.PI) % (2 * Math.PI);
+    if (y < 0) y += 2 * Math.PI;
+    return y - Math.PI;
+}
+
+function complexByMode(sim, state, mode) {
+    const n = sim.n;
+    const ghost = sim.ghost;
+    const nT = n + 2 * ghost;
+    const byIdx = (i, j) => j * nT + i;
+    let re = 0, im = 0;
+    for (let j = ghost; j < ghost + n; j++) {
+        for (let i = ghost; i < ghost + n; i++) {
+            const x = (i - ghost + 0.5) / n;
+            const by = 0.5 * (state.By[byIdx(i, j)] + state.By[byIdx(i, j + 1)]);
+            const p = 2 * Math.PI * mode * x;
+            re += by * Math.cos(p);
+            im -= by * Math.sin(p);
+        }
+    }
+    return { amp: 2 * Math.hypot(re, im) / (n * n), phase: Math.atan2(im, re) };
+}
+
+async function runKineticClosureCase(device, format) {
+    const row = rowFor('electron-inertia current smoothing', 64);
+    try {
+        const result = await withSim(device, format, 64, makeKineticCurrentSmoothingPreset(64), async (sim, pool, preset) => {
+            const initialState = await readState(device, pool, sim);
+            const initial = complexByMode(sim, initialState, preset.kinetic.mode);
+            const run = await runExtendedSourceOnly(device, sim, 0.00002, 80, { substeps: 2 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const final = complexByMode(sim, state, preset.kinetic.mode);
+            const ampRatio = final.amp / Math.max(initial.amp, 1e-30);
+            const gate = finiteGate(summary, { maxDivB: 1e-6, maxFloor: 0 });
+            const ok = gate.ok && ampRatio > 0.35 && ampRatio < 0.9;
+            const gateNote = gate.ok ? '' : `, gate=${gate.why.join('; ')}`;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `By mode ratio=${fmt(ampRatio, 3)}, |J|max=${fmt(summary.jMax, 3)}${gateNote}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`electron inertia: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runWhistlerCase(device, format) {
+    const row = rowFor('Hall whistler dispersion', 64);
+    try {
+        const result = await withSim(device, format, 64, makeHallWhistlerPreset(64), async (sim, pool, preset) => {
+            const meta = preset.whistler;
+            const initial = complexByMode(sim, await readState(device, pool, sim), meta.k_n);
+            const target = 0.20 * preset.verifyTime;
+            const run = await runForTime(device, pool, sim, target, { maxSteps: 600 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const final = complexByMode(sim, state, meta.k_n);
+            const expected = -meta.omega_whistler * run.t;
+            const err = Math.min(
+                Math.abs(wrapPhase(final.phase - initial.phase - expected)),
+                Math.abs(wrapPhase(final.phase - initial.phase + expected)),
+            );
+            const ampRatio = final.amp / Math.max(initial.amp, 1e-30);
+            const gate = finiteGate(summary, { maxDivB: 5e-3, maxFloor: 0 });
+            const ok = gate.ok && ampRatio > 0.25 && ampRatio < 1.75 && err < 0.9;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `phase err=${fmt(err, 3)}, amp ratio=${fmt(ampRatio, 3)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`whistler: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runJeansCase(device, format) {
+    const row = rowFor('Jeans mode growth', 64);
+    try {
+        const result = await withSim(device, format, 64, makeJeansInstabilityPreset(64), async (sim, pool, preset) => {
+            const initialState = await readState(device, pool, sim);
+            const a0 = cosineModeAmplitude(sim, initialState, 'rho', 1);
+            const target = Math.min(0.08, 0.6 * preset.verifyTime);
+            const run = await runForTime(device, pool, sim, target, { maxSteps: 500 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const a1 = cosineModeAmplitude(sim, state, 'rho', 1);
+            const growth = a1 / Math.max(a0, 1e-30);
+            const gate = finiteGate(summary, { maxDivB: 1e-6, maxFloor: 0 });
+            const ok = gate.ok && growth > 1.05;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `mode growth=${fmt(growth, 3)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`jeans: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runIsolatedGravityCase(device, format) {
+    const row = rowFor('isolated gravity potential well', 64);
+    try {
+        const result = await withSim(device, format, 64, makeIsolatedGravityPulsePreset(64), async (sim, pool) => {
+            const run = await runExtendedSourceOnly(device, sim, 0.0, 1);
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const n = sim.n;
+            const ghost = sim.ghost;
+            const nT = n + 2 * ghost;
+            const cIdx = (i, j) => j * nT + i;
+            const mid = ghost + Math.floor(n / 2);
+            const centerPhi = state.phi[cIdx(mid, mid)];
+            const edgePhi = state.phi[cIdx(ghost, mid)];
+            const cornerPhi = state.phi[cIdx(ghost, ghost)];
+            const gate = finiteGate(summary, { maxDivB: 1e-8, maxFloor: 0 });
+            const ok = gate.ok
+                && Number.isFinite(centerPhi)
+                && centerPhi < -1e-3
+                && centerPhi < edgePhi
+                && edgePhi < cornerPhi + 1e-3
+                && Math.abs(cornerPhi) < Math.abs(centerPhi) * 0.45;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `φc=${fmt(centerPhi, 4)}, φedge=${fmt(edgePhi, 4)}, φcorner=${fmt(cornerPhi, 4)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`isolated gravity: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function measurePoissonSolver(device, format, solverMode, iters) {
+    return withSim(device, format, 64, makeIsolatedGravityPulsePreset(64), async (sim, pool, preset) => {
+        sim.setGravitySolverMode(solverMode);
+        sim.setGravityPoissonIters(iters);
+        const run = await runExtendedSourceOnly(device, sim, 0.0, 1);
+        const state = await readState(device, pool, sim);
+        const summary = summarizeState(sim, state);
+        const residual = poissonResiduals(sim, state, {
+            G: preset.isolatedGravity.G,
+            softening: sim.gravitySoftening,
+        });
+        return { run, summary, residual };
+    });
+}
+
+async function runPoissonMultigridCase(device, format) {
+    const row = rowFor('Cartesian Poisson multigrid convergence', 64);
+    try {
+        const iters = 48;
+        const jacobi = await measurePoissonSolver(device, format, GRAVITY_SOLVER_JACOBI, iters);
+        const mg = await measurePoissonSolver(device, format, GRAVITY_SOLVER_MULTIGRID, iters);
+        const relJacobi = jacobi.residual.cartAvg / Math.max(jacobi.residual.rhsAvg, 1e-30);
+        const relMg = mg.residual.cartAvg / Math.max(mg.residual.rhsAvg, 1e-30);
+        const gate = finiteGate(mg.summary, { maxDivB: 1e-8, maxFloor: 0 });
+        const ratio = mg.residual.cartAvg / Math.max(jacobi.residual.cartAvg, 1e-30);
+        const ok = gate.ok && ratio < 0.55 && relMg < 0.75;
+        const result = {
+            ok,
+            steps: mg.run.steps,
+            t: mg.run.t,
+            summary: mg.summary,
+            metric: `MG/Jac residual=${fmt(mg.residual.cartAvg, 3)}/${fmt(jacobi.residual.cartAvg, 3)}, ratio=${fmt(ratio, 3)}, rel=${fmt(relMg, 3)} vs ${fmt(relJacobi, 3)}, budget=${iters}`,
+        };
+        finishRow(row, result);
+        return ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`poisson multigrid: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runCylindricalCase(device, format) {
+    const row = rowFor('cylindrical r-weighted expansion', 64);
+    try {
+        const result = await withSim(device, format, 64, makeCylindricalExpansionPreset(64), async (sim, pool, preset) => {
+            const initial = await readState(device, pool, sim);
+            const run = await runForTime(device, pool, sim, 0.02, { maxSteps: 200 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const n = sim.n;
+            const ghost = sim.ghost;
+            const nT = n + 2 * ghost;
+            const mid = ghost + Math.floor(n / 2);
+            const cIdx = (i, j) => j * nT + i;
+            const rhoAt = (buf, i, j) => buf.U0[4 * cIdx(i, j) + 0];
+            const inner0 = rhoAt(initial, ghost, mid);
+            const outer0 = rhoAt(initial, ghost + n - 1, mid);
+            const inner1 = rhoAt(state, ghost, mid);
+            const outer1 = rhoAt(state, ghost + n - 1, mid);
+            const innerDrop = inner0 - inner1;
+            const outerDrop = outer0 - outer1;
+            const gate = finiteGate(summary, { maxDivB: 1e-8, maxFloor: 0 });
+            const rInner = preset.cylindrical.rMin + 0.5 * preset.cylindrical.dx;
+            const expectedInner = inner0 * Math.exp(-preset.cylindrical.vr * run.t / rInner);
+            const relErr = Math.abs(inner1 - expectedInner) / Math.max(expectedInner, 1e-30);
+            const ok = gate.ok && innerDrop > outerDrop * 1.5 && relErr < 0.12;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `inner drop=${fmt(innerDrop, 4)}, outer drop=${fmt(outerDrop, 4)}, err=${fmt(relErr, 3)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`cylindrical: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runCylindricalEquilibriumCase(device, format) {
+    const row = rowFor('cylindrical static pressure balance', 64);
+    try {
+        const result = await withSim(device, format, 64, makeCylindricalStaticEquilibriumPreset(64), async (sim, pool) => {
+            const run = await runForTime(device, pool, sim, 0.02, { maxSteps: 120 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const gate = finiteGate(summary, { maxDivB: 1e-8, maxFloor: 0 });
+            const ok = gate.ok && summary.vMax < 2e-3 && summary.pMin > 0.99;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `vmax=${fmt(summary.vMax, 3)}, pmin=${fmt(summary.pMin, 4)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`cylindrical equilibrium: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+function maxTemperatureChange(sim, initial, state, margin = 5) {
+    const n = sim.n;
+    const ghost = sim.ghost;
+    const nT = n + 2 * ghost;
+    const gamma = sim.gamma;
+    const cIdx = (i, j) => j * nT + i;
+    let maxDelta = 0;
+    let avgDelta = 0;
+    let count = 0;
+    for (let j = ghost + margin; j < ghost + n - margin; j++) {
+        for (let i = ghost + margin; i < ghost + n - margin; i++) {
+            const c = cIdx(i, j);
+            const rho0 = initial.U0[4 * c + 0];
+            const rho1 = state.U0[4 * c + 0];
+            const T0 = (gamma - 1) * initial.U1[4 * c + 0] / Math.max(rho0, 1e-30);
+            const T1 = (gamma - 1) * state.U1[4 * c + 0] / Math.max(rho1, 1e-30);
+            const d = Math.abs(T1 - T0);
+            maxDelta = Math.max(maxDelta, d);
+            avgDelta += d;
+            count++;
+        }
+    }
+    return { max: maxDelta, avg: avgDelta / Math.max(count, 1) };
+}
+
+async function runConductionOnly(device, sim, dt, steps, substeps = 1) {
+    const n = Math.max(1, substeps | 0);
+    const seed = new Float32Array([dt / n, 0, 0, 0]);
+    const gInterior = Math.ceil(sim.n / 8);
+    let t = 0;
+    for (let step = 0; step < steps; step++) {
+        device.queue.writeBuffer(sim.buffers.cond_dt, 0, seed.buffer);
+        const encoder = device.createCommandEncoder({ label: 'plasma.test.conductionOnly.enc' });
+        const handles = sim._sourceHandles(sim.buffers._side, 'src');
+        sim._encodeApplyBcsHandles(encoder, handles, 'plasma.test.conductionOnly.applyBcs');
+        const pass = encoder.beginComputePass({ label: 'plasma.test.conductionOnly' });
+        const bg = sim._conductionBG(handles.U0, handles.U1, handles.Bx, handles.By);
+        for (let s = 0; s < n; s++) {
+            pass.setPipeline(sim.pipelines.pipelines.computeConductionDelta);
+            pass.setBindGroup(0, bg);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+            pass.setPipeline(sim.pipelines.pipelines.applyConductionDelta);
+            pass.dispatchWorkgroups(gInterior, gInterior, 1);
+        }
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        t += dt;
+    }
+    return { t, steps };
+}
+
+async function runCylindricalConductionCase(device, format) {
+    const row = rowFor('cylindrical conduction balance', 64);
+    try {
+        const result = await withSim(device, format, 64, makeCylindricalConductionBalancePreset(64), async (sim, pool) => {
+            const initial = await readState(device, pool, sim);
+            const run = await runConductionOnly(device, sim, 0.001, 20, 2);
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const delta = maxTemperatureChange(sim, initial, state);
+            const gate = finiteGate(summary, { maxDivB: 1e-8, maxFloor: 0 });
+            const ok = gate.ok && delta.max < 8e-5 && delta.avg < 2e-5;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `ΔTmax=${fmt(delta.max, 3)}, ΔTavg=${fmt(delta.avg, 3)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`cylindrical conduction: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+function cylindricalDivB(sim, state, margin = 3) {
+    const n = sim.n;
+    const ghost = sim.ghost;
+    const nT = n + 2 * ghost;
+    const dx = sim.dx;
+    const rMin = sim.geometryRMin ?? 0;
+    const bxIdx = (i, j) => j * (nT + 1) + i;
+    const byIdx = (i, j) => j * nT + i;
+    let sum = 0;
+    let maxAbs = 0;
+    let count = 0;
+    for (let j = ghost + margin; j < ghost + n - margin; j++) {
+        for (let i = ghost + margin; i < ghost + n - margin; i++) {
+            const localI = i - ghost;
+            const rL = Math.max(rMin + localI * dx, 0);
+            const rR = Math.max(rMin + (localI + 1) * dx, 0);
+            const rC = Math.max(rMin + (localI + 0.5) * dx, 0.5 * dx);
+            const div = (rR * state.Bx[bxIdx(i + 1, j)] - rL * state.Bx[bxIdx(i, j)]) / (rC * dx)
+                      + (state.By[byIdx(i, j + 1)] - state.By[byIdx(i, j)]) / dx;
+            const a = Math.abs(div);
+            sum += a;
+            maxAbs = Math.max(maxAbs, a);
+            count++;
+        }
+    }
+    return { avg: sum / Math.max(count, 1), max: maxAbs };
+}
+
+async function runCylindricalMagneticCase(device, format) {
+    const row = rowFor('cylindrical CT magnetic divergence', 64);
+    try {
+        const result = await withSim(device, format, 64, makeCylindricalMagneticCompressionPreset(64), async (sim, pool) => {
+            const initialState = await readState(device, pool, sim);
+            const div0 = cylindricalDivB(sim, initialState);
+            const run = await runForTime(device, pool, sim, 0.02, { maxSteps: 120 });
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const div1 = cylindricalDivB(sim, state);
+            const gate = finiteGate(summary, { maxDivB: 5e-2, maxFloor: 0 });
+            const ok = gate.ok && div0.avg < 1e-6 && div1.avg < 2e-3 && div1.max < 2e-2;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `⟨|∇·B|cyl⟩ ${fmt(div0.avg, 3)}→${fmt(div1.avg, 3)}, max=${fmt(div1.max, 3)}`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`cylindrical magnetic: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+function poissonResiduals(sim, state, opts = {}) {
+    const n = sim.n;
+    const ghost = sim.ghost;
+    const nT = n + 2 * ghost;
+    const dx = sim.dx;
+    const dx2 = dx * dx;
+    const margin = opts.margin ?? 4;
+    const G = opts.G ?? sim.gravityG;
+    const rMin = opts.rMin ?? sim.geometryRMin ?? 0;
+    const softening = opts.softening ?? sim.gravitySoftening ?? 0;
+    const cIdx = (i, j) => j * nT + i;
+    let rhoMean = 0;
+    if (opts.subtractMean) {
+        let rhoSum = 0;
+        let rhoCount = 0;
+        for (let j = ghost; j < ghost + n; j++) {
+            for (let i = ghost; i < ghost + n; i++) {
+                rhoSum += state.U0[4 * cIdx(i, j) + 0];
+                rhoCount++;
+            }
+        }
+        rhoMean = rhoSum / Math.max(rhoCount, 1);
+    }
+    const softInv2 = softening > 0 ? 1 / (softening * softening) : 0;
+    let cylSum = 0;
+    let cartSum = 0;
+    let rhsSum = 0;
+    let count = 0;
+    for (let j = ghost + margin; j < ghost + n - margin; j++) {
+        for (let i = ghost + margin; i < ghost + n - margin; i++) {
+            const localI = i - ghost;
+            const c = cIdx(i, j);
+            const phiC = state.phi[c];
+            const phiL = state.phi[cIdx(i - 1, j)];
+            const phiR = state.phi[cIdx(i + 1, j)];
+            const phiD = state.phi[cIdx(i, j - 1)];
+            const phiU = state.phi[cIdx(i, j + 1)];
+            const rho = state.U0[4 * c + 0];
+            const rhs = 4 * Math.PI * G * (rho - rhoMean);
+            const rL = Math.max(rMin + localI * dx, 0);
+            const rR = Math.max(rMin + (localI + 1) * dx, 0);
+            const rC = Math.max(rMin + (localI + 0.5) * dx, 0.5 * dx);
+            const lapCyl = (rR * (phiR - phiC) - rL * (phiC - phiL)) / (rC * dx2)
+                         + (phiU + phiD - 2 * phiC) / dx2
+                         - phiC * softInv2;
+            const lapCart = (phiL + phiR + phiD + phiU - 4 * phiC) / dx2
+                          - phiC * softInv2;
+            cylSum += Math.abs(lapCyl - rhs);
+            cartSum += Math.abs(lapCart - rhs);
+            rhsSum += Math.abs(rhs);
+            count++;
+        }
+    }
+    return {
+        cylAvg: cylSum / Math.max(count, 1),
+        cartAvg: cartSum / Math.max(count, 1),
+        rhsAvg: rhsSum / Math.max(count, 1),
+    };
+}
+
+async function runCylindricalGravityCase(device, format) {
+    const row = rowFor('cylindrical Poisson operator residual', 64);
+    try {
+        const result = await withSim(device, format, 64, makeCylindricalGravityColumnPreset(64), async (sim, pool, preset) => {
+            sim.setGravityPoissonIters(2200);
+            const run = await runExtendedSourceOnly(device, sim, 0.0, 1);
+            const state = await readState(device, pool, sim);
+            const summary = summarizeState(sim, state);
+            const residual = poissonResiduals(sim, state, {
+                G: preset.cylindricalGravity.G,
+                rMin: preset.cylindricalGravity.rMin,
+            });
+            const n = sim.n;
+            const ghost = sim.ghost;
+            const nT = n + 2 * ghost;
+            const cIdx = (i, j) => j * nT + i;
+            const rCell = (r) => ghost + Math.max(0, Math.min(n - 1, Math.floor((r - preset.cylindricalGravity.rMin) / sim.dx)));
+            const zCell = (z) => ghost + Math.max(0, Math.min(n - 1, Math.floor(z / sim.dx)));
+            const centerPhi = state.phi[cIdx(rCell(preset.cylindricalGravity.r0), zCell(preset.cylindricalGravity.z0))];
+            const rel = residual.cylAvg / Math.max(residual.rhsAvg, 1e-30);
+            const gate = finiteGate(summary, { maxDivB: 1e-8, maxFloor: 0 });
+            const ok = gate.ok
+                && Number.isFinite(centerPhi)
+                && centerPhi < -1e-3
+                && residual.cylAvg < residual.cartAvg * 0.82
+                && rel < 0.7;
+            return {
+                ok, steps: run.steps, t: run.t, summary,
+                metric: `res cyl/cart=${fmt(residual.cylAvg, 3)}/${fmt(residual.cartAvg, 3)}, rel=${fmt(rel, 3)}, φc=${fmt(centerPhi, 4)}, iters=2200`,
+            };
+        });
+        finishRow(row, result);
+        return result.ok;
+    } catch (e) {
+        finishRow(row, { ok: false, metric: e.message });
+        logln(`cylindrical gravity: ${e.stack || e}`, 'err');
+        return false;
+    }
+}
+
+async function runMatrix() {
+    rowsEl.textContent = '';
+    logEl.textContent = '';
+    runBtn.disabled = true;
+    setStatus('Requesting WebGPU device...');
+    let failures = 0;
+    try {
+        const { device, format } = await initDevice();
+        device.addEventListener('uncapturederror', (event) => {
+            logln(`WebGPU validation error: ${event.error?.message || event.error}`, 'err');
+        });
+
+        const smoke = [
+            { label: 'Sod shock tube finite-state smoke', n: 64, steps: 40, make: makeSodPreset, gate: { maxDivB: 1e-8, maxFloor: 0 } },
+            { label: 'Brio-Wu MHD shock finite-state smoke', n: 64, steps: 50, make: makeBrioWuPreset, gate: { maxDivB: 2e-2, maxFloor: 0 } },
+            { label: 'Orszag-Tang ideal-MHD finite-state smoke', n: 64, steps: 60, make: makeOrszagTangPreset, gate: { maxDivB: 5e-2, maxFloor: 0 } },
+            { label: 'Harris reconnection finite-state smoke', n: 64, steps: 80, make: makeHarrisPreset, gate: { maxDivB: 8e-2, maxFloor: 0 } },
+            { label: 'Driven wind/cloud open-boundary smoke', n: 64, steps: 45, make: makeDrivenWindPreset, gate: { maxDivB: 8e-2, maxFloor: 4 } },
+        ];
+        for (const spec of smoke) {
+            setStatus(`Running ${spec.label}...`);
+            if (!await runSmokeCase(device, format, spec)) failures++;
+        }
+        setStatus('Running boundary fill checks...');
+        if (!await runBoundaryCase(device, format)) failures++;
+        setStatus('Checking microphysics table shape...');
+        if (!await runMicrophysicsTableCase()) failures++;
+        if (!await runSourceSizingCase(device, format)) failures++;
+        setStatus('Running source-physics response checks...');
+        if (!await runCoolingCase(device, format)) failures++;
+        if (!await runConductionCase(device, format)) failures++;
+        if (!await runRadiationCase(device, format)) failures++;
+        if (!await runKineticClosureCase(device, format)) failures++;
+        if (!await runWhistlerCase(device, format)) failures++;
+        if (!await runJeansCase(device, format)) failures++;
+        if (!await runIsolatedGravityCase(device, format)) failures++;
+        if (!await runPoissonMultigridCase(device, format)) failures++;
+        if (!await runCylindricalCase(device, format)) failures++;
+        if (!await runCylindricalEquilibriumCase(device, format)) failures++;
+        if (!await runCylindricalConductionCase(device, format)) failures++;
+        if (!await runCylindricalMagneticCase(device, format)) failures++;
+        if (!await runCylindricalGravityCase(device, format)) failures++;
+
+        const passed = rowsEl.children.length - failures;
+        setStatus(`${passed}/${rowsEl.children.length} checks passed.`);
+        const result = {
+            passed,
+            failed: failures,
+            rows: Array.from(rowsEl.children).map(row => ({
+                ok: row.className === 'pass',
+                case: row.children[1].textContent,
+                n: row.children[2].textContent,
+                steps: row.children[3].textContent,
+                t: row.children[4].textContent,
+                metric: row.children[8].textContent,
+            })),
+        };
+        window.__PHYSICS_VALIDATION_RESULT = result;
+        window.__PHYSICS_VALIDATION_DONE = true;
+        console.log('PHYSICS_VALIDATION_JSON_BEGIN');
+        console.log(JSON.stringify(result, null, 2));
+        console.log('PHYSICS_VALIDATION_JSON_END');
+    } catch (e) {
+        setStatus('Validation failed before matrix completed.');
+        logln(e.stack || String(e), 'err');
+    } finally {
+        runBtn.disabled = false;
+    }
+}
+
+runBtn.addEventListener('click', runMatrix);
+
+const params = new URLSearchParams(location.search);
+if (params.get('auto') === '1') {
+    runMatrix();
+}
+</script>
+</body>
+</html>

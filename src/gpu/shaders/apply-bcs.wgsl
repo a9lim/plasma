@@ -126,19 +126,56 @@ fn reflect_y(U0v: vec4<f32>, U1v: vec4<f32>) -> array<vec4<f32>, 2> {
     return array<vec4<f32>, 2>(out_U0, U1v);
 }
 
+struct DrivenPrimBc {
+    rho: f32,
+    vx:  f32,
+    vy:  f32,
+    vz:  f32,
+    bx:  f32,
+    by:  f32,
+    bz:  f32,
+    p:   f32,
+};
+
+fn driven_prim_for_edge(edge: u32) -> DrivenPrimBc {
+    if (edge == EDGE_S_BC) {
+        return DrivenPrimBc(bc.driven_s_rho, bc.driven_s_vx, bc.driven_s_vy, bc.driven_s_vz,
+                            bc.driven_s_bx,  bc.driven_s_by, bc.driven_s_bz, bc.driven_s_p);
+    }
+    if (edge == EDGE_E_BC) {
+        return DrivenPrimBc(bc.driven_e_rho, bc.driven_e_vx, bc.driven_e_vy, bc.driven_e_vz,
+                            bc.driven_e_bx,  bc.driven_e_by, bc.driven_e_bz, bc.driven_e_p);
+    }
+    if (edge == EDGE_W_BC) {
+        return DrivenPrimBc(bc.driven_w_rho, bc.driven_w_vx, bc.driven_w_vy, bc.driven_w_vz,
+                            bc.driven_w_bx,  bc.driven_w_by, bc.driven_w_bz, bc.driven_w_p);
+    }
+    return DrivenPrimBc(bc.driven_n_rho, bc.driven_n_vx, bc.driven_n_vy, bc.driven_n_vz,
+                        bc.driven_n_bx,  bc.driven_n_by, bc.driven_n_bz, bc.driven_n_p);
+}
+
 // Convert driven primitive state to conservative pair (U0, U1).
-fn driven_cons() -> array<vec4<f32>, 2> {
+fn driven_cons(edge: u32) -> array<vec4<f32>, 2> {
+    let D = driven_prim_for_edge(edge);
     var P: MhdPrim;
-    P.rho = max(bc.driven_rho, DENSITY_FLOOR);
-    P.vx  = bc.driven_vx;
-    P.vy  = bc.driven_vy;
-    P.vz  = bc.driven_vz;
-    P.p   = max(bc.driven_p, U_uniforms.pressure_floor);
-    P.bx  = bc.driven_bx;
-    P.by  = bc.driven_by;
-    P.bz  = bc.driven_bz;
+    P.rho = max(D.rho, DENSITY_FLOOR);
+    P.vx  = D.vx;
+    P.vy  = D.vy;
+    P.vz  = D.vz;
+    P.p   = max(D.p, U_uniforms.pressure_floor);
+    P.bx  = D.bx;
+    P.by  = D.by;
+    P.bz  = D.bz;
     let cp = prim_to_cons_pair(P, U_uniforms.gamma, U_uniforms.pressure_floor);
     return array<vec4<f32>, 2>(cp.U0, cp.U1);
+}
+
+fn driven_bx_for_edge(edge: u32) -> f32 {
+    return driven_prim_for_edge(edge).bx;
+}
+
+fn driven_by_for_edge(edge: u32) -> f32 {
+    return driven_prim_for_edge(edge).by;
 }
 
 // Choose the BC mode that "owns" a ghost cell at (ix, iy). For non-corner
@@ -540,18 +577,24 @@ fn nscbc_outflow_ghost(
 fn fill_cell_ghost(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
     let h_mode = horiz_mode_for_col(ix, ghost, n_interior);
     let v_mode = vert_mode_for_row(iy, ghost, n_interior);
+    let h_edge = select(EDGE_E_BC, EDGE_W_BC, ix < ghost);
+    let v_edge = select(EDGE_N_BC, EDGE_S_BC, iy < ghost);
     let in_h_ghost = (ix < ghost) || (ix >= ghost + n_interior);
     let in_v_ghost = (iy < ghost) || (iy >= ghost + n_interior);
     if (!in_h_ghost && !in_v_ghost) { return; }   // interior — never touch.
 
     var mode: u32;
+    var owner_edge: u32;
     if (in_h_ghost && in_v_ghost) {
         // Corner. Prefer non-periodic among horizontal vs vertical.
         mode = pick_corner_mode(h_mode, v_mode);
+        owner_edge = select(v_edge, h_edge, h_mode != BC_PERIODIC);
     } else if (in_h_ghost) {
         mode = h_mode;
+        owner_edge = h_edge;
     } else {
         mode = v_mode;
+        owner_edge = v_edge;
     }
 
     let dst = cell_idx_total(ix, iy, n_total);
@@ -745,7 +788,7 @@ fn fill_cell_ghost(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) 
     }
 
     // BC_DRIVEN
-    let cons = driven_cons();
+    let cons = driven_cons(owner_edge);
     U0[dst] = cons[0];
     U1[dst] = cons[1];
 }
@@ -771,15 +814,21 @@ fn fill_bx_face(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
 
     let h_mode = horiz_mode_for_col(ix, ghost, n_interior);
     let v_mode = vert_mode_for_row(iy, ghost, n_interior);
+    let h_edge = select(EDGE_E_BC, EDGE_W_BC, ix <= ghost);
+    let v_edge = select(EDGE_N_BC, EDGE_S_BC, iy < ghost);
 
     // Choose mode. If on a boundary face (W or E wall), the horizontal
     // mode owns it unconditionally. Otherwise, corner logic.
     var mode: u32;
-    if (on_w_wall) { mode = bc.mode_w; }
-    else if (on_e_wall) { mode = bc.mode_e; }
-    else if (in_h_ghost && in_v_ghost) { mode = pick_corner_mode(h_mode, v_mode); }
-    else if (in_h_ghost) { mode = h_mode; }
-    else                 { mode = v_mode; }
+    var owner_edge: u32;
+    if (on_w_wall) { mode = bc.mode_w; owner_edge = EDGE_W_BC; }
+    else if (on_e_wall) { mode = bc.mode_e; owner_edge = EDGE_E_BC; }
+    else if (in_h_ghost && in_v_ghost) {
+        mode = pick_corner_mode(h_mode, v_mode);
+        owner_edge = select(v_edge, h_edge, h_mode != BC_PERIODIC);
+    }
+    else if (in_h_ghost) { mode = h_mode; owner_edge = h_edge; }
+    else                 { mode = v_mode; owner_edge = v_edge; }
 
     let dst = bx_face_idx(ix, iy, n_total);
 
@@ -884,8 +933,8 @@ fn fill_bx_face(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
         return;
     }
 
-    // BC_DRIVEN — set Bx to the driven inflow Bx everywhere on this strip.
-    Bx_face[dst] = bc.driven_bx;
+    // BC_DRIVEN — set Bx to this edge's driven inflow Bx on the owned strip.
+    Bx_face[dst] = driven_bx_for_edge(owner_edge);
 }
 
 fn fill_by_face(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
@@ -897,13 +946,19 @@ fn fill_by_face(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
 
     let h_mode = horiz_mode_for_col(ix, ghost, n_interior);
     let v_mode = vert_mode_for_row(iy, ghost, n_interior);
+    let h_edge = select(EDGE_E_BC, EDGE_W_BC, ix < ghost);
+    let v_edge = select(EDGE_N_BC, EDGE_S_BC, iy <= ghost);
 
     var mode: u32;
-    if (on_s_wall) { mode = bc.mode_s; }
-    else if (on_n_wall) { mode = bc.mode_n; }
-    else if (in_h_ghost && in_v_ghost) { mode = pick_corner_mode(h_mode, v_mode); }
-    else if (in_v_ghost) { mode = v_mode; }
-    else                 { mode = h_mode; }
+    var owner_edge: u32;
+    if (on_s_wall) { mode = bc.mode_s; owner_edge = EDGE_S_BC; }
+    else if (on_n_wall) { mode = bc.mode_n; owner_edge = EDGE_N_BC; }
+    else if (in_h_ghost && in_v_ghost) {
+        mode = pick_corner_mode(h_mode, v_mode);
+        owner_edge = select(v_edge, h_edge, h_mode != BC_PERIODIC);
+    }
+    else if (in_v_ghost) { mode = v_mode; owner_edge = v_edge; }
+    else                 { mode = h_mode; owner_edge = h_edge; }
 
     let dst = by_face_idx(ix, iy, n_total);
 
@@ -989,7 +1044,7 @@ fn fill_by_face(ix: u32, iy: u32, ghost: u32, n_interior: u32, n_total: u32) {
     }
 
     // BC_DRIVEN
-    By_face[dst] = bc.driven_by;
+    By_face[dst] = driven_by_for_edge(owner_edge);
 }
 
 // Single-pass kernel. We dispatch over the FULL (N_total+1, N_total+1)

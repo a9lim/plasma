@@ -7,6 +7,15 @@
 //   By_out[i,j] = a0·By_n[i,j] + a1·By_other[i,j]
 //               + dt_w·(dt/dx)·(Ez[i+1, j] - Ez[i, j])
 //
+// In cylindrical mode, x is radius r and y is axial z. The Br update is
+// still -∂Eφ/∂z, but the axial field update must be finite-volume weighted:
+//
+//   Bz_out += dt · (r_{i+1/2}Eφ_{i+1/2} - r_{i-1/2}Eφ_{i-1/2}) / (r_i Δr)
+//
+// so the discrete cylindrical divergence
+//   (r_{i+1/2}Br_{i+1/2} - r_{i-1/2}Br_{i-1/2})/(r_i Δr) + ∂Bz/∂z
+// telescopes with the same corner EMFs.
+//
 // Ez is the edge-EMF at corners (LEFT/DOWN face owner convention):
 //   Ez_edge[i, j] sits at the BOTTOM-LEFT corner of cell (i, j).
 //   So x-face Bx_face[i, j] (left face of cell (i, j)) has its bottom
@@ -62,6 +71,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dx         = U_uniforms.dx;
     let dt         = dt_buf[0];
     let coef       = stage_params.dt_w * dt / dx;
+    let geom_cyl   = flag_set(U_uniforms.physics_flags, FLAG_GEOMETRY)
+                  && U_uniforms.geometry_mode == 1u;
 
     let ix = gid.x;
     let iy = gid.y;
@@ -86,9 +97,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dst = by_face_idx(bix, biy, n_total);
         let ez_rgt = Ez_edge[ez_edge_idx(bix + 1u, biy, n_total)];
         let ez_lft = Ez_edge[ez_edge_idx(bix,      biy, n_total)];
+        var curl_e = ez_rgt - ez_lft;
+        if (geom_cyl) {
+            let r_l = max(U_uniforms.geometry_r_min + f32(ix) * dx, 0.0);
+            let r_r = max(U_uniforms.geometry_r_min + (f32(ix) + 1.0) * dx, 0.0);
+            let r_c = max(U_uniforms.geometry_r_min + (f32(ix) + 0.5) * dx, 0.5 * dx);
+            curl_e = (r_r * ez_rgt - r_l * ez_lft) / r_c;
+        }
         By_out[dst] =
             stage_params.a0 * By_n[dst]
           + stage_params.a1 * By_other[dst]
-          + coef * (ez_rgt - ez_lft);
+          + coef * curl_e;
     }
 }

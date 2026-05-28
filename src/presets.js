@@ -36,10 +36,16 @@ import {
     GRID_N, GHOST_WIDTH, DOMAIN_LENGTH, PRESSURE_FLOOR, ETA_DEFAULT,
     BC_PERIODIC, BC_OUTFLOW, BC_DRIVEN, BASE_PHYSICS_FLAGS, EXTENDED_PHYSICS_FLAGS,
     FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
-    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_HEATING,
+    FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_HEATING, FLAG_GEOMETRY,
+    FLAG_RADIATION, FLAG_ELECTRON_INERTIA,
     COOLING_CURVE_TABLE, COOLING_CURVE_TABULATED,
-    GEOMETRY_CARTESIAN,
+    GEOMETRY_CARTESIAN, GEOMETRY_CYLINDRICAL,
+    GRAVITY_BOUNDARY_ISOLATED,
 } from './config.js';
+import {
+    CGS, applyInteractiveBounds, deriveCodePhysicsFromTargets,
+    makePhysicalScale, serializableScale,
+} from './physical-scales.js';
 
 /** Cell-centered flat index in ghost-padded storage. */
 function cellIdx(i, j, nTotal) { return j * nTotal + i; }
@@ -139,7 +145,7 @@ export function makeSodPreset(n = GRID_N) {
         eta: 0,
         bc: {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
-            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
         },
         physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
@@ -286,23 +292,54 @@ export function makeOrszagTangPreset(n = GRID_N) {
  */
 export function makeOrszagTangExtendedPreset(n = GRID_N) {
     const preset = makeOrszagTangPreset(n);
+    const gamma = 5.0 / 3.0;
+    const L = 2.0 * Math.PI;
+    const calibration = deriveCodePhysicsFromTargets({
+        rhoRef: gamma * gamma,
+        pRef: gamma,
+        gamma,
+        velocityRef: 1.0,
+        lengthRef: L,
+        peclet: 2.6e4,
+        reynolds: 1.26e4,
+        bulkReynolds: 3.14e4,
+        shockReynolds: 1.26e4,
+        ambipolarRm: 2.1e4,
+        coolingTimeCrossings: 5.2,
+        heatingBalanceFrac: 0.026,
+        hallLengthFrac: 0.02 / L,
+        biermannFieldGrowthTimeCrossings: 1.6e3,
+    });
+    const coeffs = applyInteractiveBounds(calibration.coefficients, {
+        coolingLambda0: { min: 1e-5, max: 0.05 },
+        conductionKappa: { min: 0, max: 5e-3 },
+        viscosityNu: { min: 0, max: 2e-3 },
+        viscosityBulk: { min: 0, max: 2e-3 },
+        viscosityShock: { min: 0, max: 3e-3 },
+        ambipolarEta: { min: 0, max: 2e-3 },
+        biermannCoeff: { min: 0, max: 5e-4 },
+    });
     return {
         ...preset,
         id: 'orszag-tang-extended',
         label: 'Orszag-Tang + extended physics',
+        calibration: {
+            kind: 'dimensionless-targets',
+            ...calibration.dimensionless,
+        },
         physics: {
             physicsFlags: EXTENDED_PHYSICS_FLAGS,
-            hallDi: 0.02,
+            hallDi: coeffs.hallDi,
             hallSubstepsMax: 8,
-            coolingLambda0: 0.01,
+            coolingLambda0: coeffs.coolingLambda0,
             coolingTFloor: 1.0e-4,
             coolingTRef: 1.0,
             coolingCurveMode: COOLING_CURVE_TABULATED,
             coolingMetallicity: 1.0,
-            heatingGamma0: 2.0e-3,
+            heatingGamma0: coeffs.heatingGamma0,
             heatingDensityExp: 1.0,
             heatingTCut: 8.0,
-            conductionKappa: 1.0e-3,
+            conductionKappa: coeffs.conductionKappa,
             conductionIsoFrac: 0.1,
             conductionSatFrac: 0.3,
             gravityGx: 0.0,
@@ -312,14 +349,14 @@ export function makeOrszagTangExtendedPreset(n = GRID_N) {
             gravitySoftening: 0.05,
             gravityPoissonOmega: 0.8,
             hallElectronPressureFrac: 0.5,
-            ambipolarEta: 3.0e-4,
-            biermannCoeff: 1.0e-4,
+            ambipolarEta: coeffs.ambipolarEta,
+            biermannCoeff: coeffs.biermannCoeff,
             neutralFrac: 0.05,
             ionizationT0: 0.5,
-            viscosityNu: 5.0e-4,
-            viscosityBulk: 2.0e-4,
+            viscosityNu: coeffs.viscosityNu,
+            viscosityBulk: coeffs.viscosityBulk,
             viscosityAnisoFrac: 0.5,
-            viscosityShock: 5.0e-4,
+            viscosityShock: coeffs.viscosityShock,
             sourceSubstepsMax: 12,
             geometryMode: GEOMETRY_CARTESIAN,
             geometryRMin: 0.0,
@@ -353,6 +390,41 @@ export function makeDrivenWindPreset(n = GRID_N) {
         bx: ambient.bx, by: ambient.by, bz: ambient.bz,
     };
     const cloud = { x: 0.85 * L, y: 0.50 * L, sigma: 0.16 * L, contrast: 6.0 };
+    const physicalScale = makePhysicalScale({
+        label: 'warm magnetized ISM cloud, compressed for interactive crossing time',
+        lengthCm: 5.0 * CGS.pc,
+        numberDensityCm3: 1.0,
+        temperatureK: 8.0e3,
+        meanMolecularWeight: 0.62,
+        magneticFieldG: 5.0 * CGS.microGauss,
+    });
+    const calibration = deriveCodePhysicsFromTargets({
+        rhoRef: ambient.rho,
+        pRef: ambient.p,
+        gamma,
+        velocityRef: wind.vx,
+        lengthRef: L,
+        magneticReynolds: 1.15e4,
+        peclet: 2.3e4,
+        reynolds: 2.3e4,
+        bulkReynolds: 4.6e4,
+        shockReynolds: 1.15e4,
+        ambipolarRm: 1.53e4,
+        coolingTimeCrossings: 94.0,
+        heatingBalanceFrac: 1.875,
+        hallLengthFrac: 0.006 / L,
+        biermannFieldGrowthTimeCrossings: 1.92e4,
+    });
+    const coeffs = applyInteractiveBounds(calibration.coefficients, {
+        eta: { min: 1e-5, max: 1e-2 },
+        coolingLambda0: { min: 1e-5, max: 0.02 },
+        conductionKappa: { min: 0, max: 1e-3 },
+        viscosityNu: { min: 0, max: 1e-3 },
+        viscosityBulk: { min: 0, max: 1e-3 },
+        viscosityShock: { min: 0, max: 2e-3 },
+        ambipolarEta: { min: 0, max: 2e-3 },
+        biermannCoeff: { min: 0, max: 2e-4 },
+    });
 
     for (let j = 0; j < nT; j++) {
         for (let i = 0; i < nT; i++) {
@@ -383,11 +455,20 @@ export function makeDrivenWindPreset(n = GRID_N) {
         label: 'Driven wind + cloud',
         gamma,
         domainLength: L,
-        eta: 2.0e-4,
+        eta: coeffs.eta,
+        calibration: {
+            kind: 'physical-scale+dimensionless-targets',
+            scale: serializableScale(physicalScale),
+            ...calibration.dimensionless,
+        },
         bc: {
             modeN: BC_OUTFLOW, modeS: BC_OUTFLOW,
             modeE: BC_OUTFLOW, modeW: BC_DRIVEN,
             driven: {
+                rho: wind.rho, vx: wind.vx, vy: wind.vy, vz: wind.vz,
+                bx: wind.bx, by: wind.by, bz: wind.bz, p: wind.p,
+            },
+            drivenW: {
                 rho: wind.rho, vx: wind.vx, vy: wind.vy, vz: wind.vz,
                 bx: wind.bx, by: wind.by, bz: wind.bz, p: wind.p,
             },
@@ -396,28 +477,28 @@ export function makeDrivenWindPreset(n = GRID_N) {
             physicsFlags: BASE_PHYSICS_FLAGS
                 | FLAG_COOLING | FLAG_HEATING | FLAG_CONDUCTION | FLAG_HALL
                 | FLAG_AMBIPOLAR | FLAG_BIERMANN | FLAG_VISCOSITY,
-            hallDi: 0.006,
+            hallDi: coeffs.hallDi,
             hallSubstepsMax: 8,
             hallElectronPressureFrac: 0.45,
-            coolingLambda0: 8.0e-3,
+            coolingLambda0: coeffs.coolingLambda0,
             coolingTFloor: 2.0e-3,
             coolingTRef: 0.2,
             coolingCurveMode: COOLING_CURVE_TABULATED,
             coolingMetallicity: 0.8,
-            heatingGamma0: 6.0e-4,
+            heatingGamma0: coeffs.heatingGamma0,
             heatingDensityExp: 1.0,
             heatingTCut: 2.0,
-            conductionKappa: 3.0e-5,
+            conductionKappa: coeffs.conductionKappa,
             conductionIsoFrac: 0.05,
             conductionSatFrac: 0.25,
-            ambipolarEta: 1.5e-4,
+            ambipolarEta: coeffs.ambipolarEta,
             neutralFrac: 0.12,
             ionizationT0: 0.18,
-            biermannCoeff: 3.0e-5,
-            viscosityNu: 1.0e-4,
-            viscosityBulk: 5.0e-5,
+            biermannCoeff: coeffs.biermannCoeff,
+            viscosityNu: coeffs.viscosityNu,
+            viscosityBulk: coeffs.viscosityBulk,
             viscosityAnisoFrac: 0.35,
-            viscosityShock: 2.0e-4,
+            viscosityShock: coeffs.viscosityShock,
             sourceSubstepsMax: 16,
         },
         data: { U0, U1, Bx_face, By_face },
@@ -676,7 +757,7 @@ export function makeAlfvenCpawPreset(n = GRID_N) {
         eta: 0,
         bc: {
             modeN: BC_PERIODIC, modeS: BC_PERIODIC,
-            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
         },
         physics: { physicsFlags: BASE_PHYSICS_FLAGS },
         data: { U0, U1, Bx_face, By_face },
@@ -784,21 +865,24 @@ export function makeAcousticWaveHydroPreset(n = GRID_N, amplitudeOverride) {
  * Hall whistler dispersion test (Session 15).
  *
  * Right-hand circularly polarized whistler wave on a uniform background.
- * In pure Hall MHD, the dispersion relation is
+ * In pure Hall MHD, the right-going whistler phase speed is
  *
- *   ω² = k² v_A² (1 + (k · d_i)²)
+ *   c_w = w/2 + sqrt(v_A² + w²/4),    w = d_i · k · |B₀| / ρ
  *
- * (Tóth, Ma, Gombosi 2008, eq 11). With v_A = 1 and k·d_i ~ 1 the whistler
- * branch deviates strongly from the Alfvén branch ω = k·v_A — that's the
- * signature the test is designed to expose.
+ * (Tóth, Ma, Gombosi 2008, eqs. 54-55). With v_A = 1 and k·d_i ~ 1 the
+ * whistler branch deviates strongly from the Alfvén branch c_A — that's the
+ * signature the test is designed to expose. The transverse velocity amplitude
+ * is the corresponding eigenvector ratio |δv|/|δB| = |B₀|/(c_w ρ), not the
+ * ideal-Alfvén ratio.
  *
  * Setup:
  *   ρ = 1, p = 1, γ = 5/3 ⇒ c_s² = 5/3.
  *   B₀ = (1, 0, 0).  v_A = |B|/√ρ = 1.
  *   Perturbation: right-circular in y/z plane carried by a single mode
  *   with k_n wavelengths per box.
- *     δB_y =  A·cos(k·x)        δB_z =  A·sin(k·x)
- *     δv_y = -A·cos(k·x)/√ρ     δv_z = -A·sin(k·x)/√ρ
+ *     δB_y =  A·cos(k·x)        δB_z = -A·sin(k·x)
+ *     δv_y = -R·A·cos(k·x)      δv_z = +R·A·sin(k·x)
+ *     R = |B₀|/(c_w ρ)
  *   A = 1e-3 (deep linear). k_n = 4. d_i = 0.05 ⇒ k·d_i ≈ 1.26 at k_n = 4.
  */
 export function makeHallWhistlerPreset(n = GRID_N) {
@@ -816,7 +900,10 @@ export function makeHallWhistlerPreset(n = GRID_N) {
     const k    = TWO_PI * k_n / L;
     const d_i  = 0.05;
     const v_A  = B0 / Math.sqrt(rho0);
-    const omega_whistler = k * v_A * Math.sqrt(1.0 + (k * d_i) ** 2);
+    const hall_w = d_i * k * Math.abs(B0) / rho0;
+    const c_whistler = 0.5 * hall_w + Math.sqrt(v_A * v_A + 0.25 * hall_w * hall_w);
+    const omega_whistler = k * c_whistler;
+    const velocityRatio = Math.abs(B0) / (c_whistler * rho0);
 
     const xCellOf = (i) => (i - ghost + 0.5) * dx;
     const xFaceOf = (i) => (i - ghost) * dx;
@@ -828,9 +915,9 @@ export function makeHallWhistlerPreset(n = GRID_N) {
             const s = Math.sin(k * x);
             const bx_c = B0;
             const by_c = A * c;
-            const bz   = A * s;
-            const vy   = -A * c / Math.sqrt(rho0);
-            const vz   = -A * s / Math.sqrt(rho0);
+            const bz   = -A * s;
+            const vy   = -velocityRatio * A * c;
+            const vz   =  velocityRatio * A * s;
             writeCell(U0, U1, cellIdx(i, j, nT),
                       rho0, 0, vy, vz, p0, bx_c, by_c, bz, gamma);
         }
@@ -871,7 +958,16 @@ export function makeHallWhistlerPreset(n = GRID_N) {
         viewMode: 3,  // VIEW_BMAG — wave amplitude is visible in |B|
         viewMin: B0 - 3 * A, viewMax: B0 + 3 * A,
         verifyTime: TWO_PI / omega_whistler,
-        whistler: { k, d_i, v_A, omega_alfven: k * v_A, omega_whistler, A, k_n },
+        whistler: {
+            k, d_i, v_A,
+            c_whistler,
+            hall_w,
+            velocityRatio,
+            omega_alfven: k * v_A,
+            omega_whistler,
+            A,
+            k_n,
+        },
     };
 }
 
@@ -886,7 +982,7 @@ export function makeHallWhistlerPreset(n = GRID_N) {
  *
  * Setup:
  *   ρ = 1, B = (1, 0, 0), v = 0, γ = 5/3.
- *   T_cold = 1, T_hot = 2.
+ *   T_cold = 1, T_hot = 1.1.
  *   p(x, y) = ρ · T_cold + (T_hot − T_cold)·exp(−r²/2σ₀²), σ₀ = 0.05·L.
  */
 export function makeConductionFrontPreset(n = GRID_N) {
@@ -897,7 +993,7 @@ export function makeConductionFrontPreset(n = GRID_N) {
 
     const rho0 = 1.0;
     const T_cold = 1.0;
-    const T_hot  = 2.0;
+    const T_hot  = 1.1;
     const sigma0 = 0.05 * L;
     const B0     = 1.0;
     const cx = 0.5 * L;
@@ -940,7 +1036,9 @@ export function makeConductionFrontPreset(n = GRID_N) {
             physicsFlags: BASE_PHYSICS_FLAGS | FLAG_CONDUCTION,
             conductionKappa:   1.0e-2,
             conductionIsoFrac: 0.1,
-            conductionSatFrac: 0.3,
+            // Keep the isolation test in the linear Spitzer regime; extended
+            // and wind/cloud presets exercise the saturated Cowie-McKee limiter.
+            conductionSatFrac: 0.0,
         },
         data: { U0, U1, Bx_face, By_face },
         viewMode: 5,  // VIEW_T — temperature spread is the test signal
@@ -1023,6 +1121,130 @@ export function makeCoolingInstabilityPreset(n = GRID_N) {
 }
 
 /**
+ * Grey radiation relaxation/diffusion test.
+ *
+ * Uniform warm gas is placed out of radiative equilibrium with an
+ * under-filled radiation-energy reservoir. Absorption should transfer
+ * gas internal energy into E_r while the flux-limited diffusion term only
+ * redistributes the small sinusoidal E_r perturbation on the periodic box.
+ */
+export function makeRadiativeRelaxationPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const dx = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+    const radiation = new Float32Array(nT * nT);
+
+    const rho0 = 1.0;
+    const T0 = 1.2;
+    const p0 = rho0 * T0;
+    const aRad = 0.05;
+    const erLte = aRad * T0 ** 4;
+    const TWO_PI = 2.0 * Math.PI;
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, 0, 0, 0, p0, 0, 0, 0, gamma);
+            const x = (i - ghost + 0.5) * dx;
+            const perturb = 1.0 + 0.2 * Math.cos(TWO_PI * x);
+            radiation[cellIdx(i, j, nT)] = 0.35 * erLte * perturb;
+        }
+    }
+
+    return {
+        id: 'radiative-relaxation',
+        label: 'Grey radiation relaxation',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_RADIATION,
+            radiationC: 1.0,
+            radiationKappaAbs: 0.5,
+            radiationKappaScat: 4.0,
+            radiationConst: aRad,
+            radiationFloor: 1.0e-10,
+            sourceSubstepsMax: 16,
+        },
+        data: { U0, U1, Bx_face, By_face, radiation },
+        viewMode: 5,
+        viewMin: 1.0,
+        viewMax: T0,
+        verifyTime: 0.02,
+        radiation: { T0, aRad, erLte },
+    };
+}
+
+/**
+ * Kinetic-scale current smoothing test.
+ *
+ * This keeps the bulk flow static and seeds a high-k transverse magnetic
+ * wave. The electron-inertia closure contributes a hyper-resistive
+ * E_z = -η₄∇²J_z term, so the high-k By mode should decay while the
+ * CT update keeps ∇·B at machine-zero.
+ */
+export function makeKineticCurrentSmoothingPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const dx = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0 = 1.0;
+    const amp = 2.0e-2;
+    const mode = 8;
+    const TWO_PI = 2.0 * Math.PI;
+    const byAtInterior = (iw) => amp * Math.sin(TWO_PI * mode * (iw + 0.5) * dx);
+
+    const primAt = (iw, jw) => ({
+        rho: rho0,
+        vx: 0, vy: 0, vz: 0,
+        p: p0,
+        bx_c: 0,
+        by_c: byAtInterior(iw),
+        bz: 0,
+    });
+    fillCellGhostPeriodic(U0, U1, gamma, nT, ghost, n, primAt);
+
+    for (let j = 0; j <= nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            let iw = i - ghost;
+            iw = ((iw % n) + n) % n;
+            By_face[byFaceIdx(i, j, nT)] = byAtInterior(iw);
+        }
+    }
+
+    return {
+        id: 'kinetic-current-smoothing',
+        label: 'Kinetic current smoothing',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_ELECTRON_INERTIA,
+            electronInertiaLength: 0.025,
+            electronInertiaDamping: 0.05,
+            sourceSubstepsMax: 16,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 4,
+        viewMin: -1.2,
+        viewMax: 1.2,
+        verifyTime: 0.0016,
+        kinetic: { mode, amp },
+    };
+}
+
+/**
  * Jeans instability (Session 15).
  *
  * Small-amplitude density perturbation under self-gravity. Linear
@@ -1092,6 +1314,342 @@ export function makeJeansInstabilityPreset(n = GRID_N) {
     };
 }
 
+/**
+ * Isolated self-gravity potential test.
+ *
+ * Compact central overdensity in a zero-potential exterior. This exercises
+ * the non-periodic Poisson path without subtracting the domain mean density,
+ * so the potential should form a negative central well rather than a periodic
+ * sinusoidal mode.
+ */
+export function makeIsolatedGravityPulsePreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const dx = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rhoBg = 0.05;
+    const rhoAmp = 1.0;
+    const p0 = 1.0;
+    const sigma = 0.09;
+    const G = 6.0;
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            const x = (i - ghost + 0.5) * dx - 0.5 * L;
+            const y = (j - ghost + 0.5) * dx - 0.5 * L;
+            const r2 = x * x + y * y;
+            const rho = rhoBg + rhoAmp * Math.exp(-0.5 * r2 / (sigma * sigma));
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho, 0, 0, 0, p0, 0, 0, 0, gamma);
+        }
+    }
+
+    return {
+        id: 'isolated-gravity-pulse', label: 'Isolated gravity pulse',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_OUTFLOW, modeS: BC_OUTFLOW,
+            modeE: BC_OUTFLOW, modeW: BC_OUTFLOW,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_GRAVITY_SELF,
+            gravityG: G,
+            gravityPoissonIters: 80,
+            gravitySoftening: 0.02,
+            gravityPoissonOmega: 0.8,
+            gravityBoundaryMode: GRAVITY_BOUNDARY_ISOLATED,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 7,
+        viewMin: -0.2,
+        viewMax: 0.0,
+        isolatedGravity: { rhoBg, rhoAmp, sigma, G },
+    };
+}
+
+/**
+ * Cylindrical expansion source test.
+ *
+ * Uniform outward radial velocity in axisymmetric geometry. With the
+ * geometry source isolated, continuity obeys dρ/dt = -ρ v_r/r, so inner
+ * radii should dilute faster than outer radii while density stays positive.
+ */
+export function makeCylindricalExpansionPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const dx = L / n;
+    const { nT, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0 = 1.0;
+    const vr = 0.2;
+    const rMin = 0.25;
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, vr, 0, 0, p0, 0, 0, 0, gamma);
+        }
+    }
+    // B ≡ 0.
+
+    return {
+        id: 'cylindrical-expansion', label: 'Cylindrical expansion source',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_GEOMETRY,
+            geometryMode: GEOMETRY_CYLINDRICAL,
+            geometryRMin: rMin,
+            sourceSubstepsMax: 8,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 0,
+        viewMin: 0.90,
+        viewMax: 1.0,
+        verifyTime: 0.04,
+        cylindrical: { rho0, vr, rMin, dx },
+    };
+}
+
+/**
+ * Cylindrical static equilibrium test.
+ *
+ * Uniform gas pressure plus a uniform axial field should stay static in
+ * cylindrical geometry. The r-weighted radial flux divergence contributes
+ * -p_tot/r to radial momentum; the geometry source contributes +p_tot/r.
+ */
+export function makeCylindricalStaticEquilibriumPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const { nT, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0 = 1.0;
+    const bz0 = 0.4;
+    const rMin = 0.25;
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, 0, 0, 0, p0, 0, bz0, 0, gamma);
+        }
+    }
+    By_face.fill(bz0);
+
+    return {
+        id: 'cylindrical-static-equilibrium',
+        label: 'Cylindrical static equilibrium',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_GEOMETRY,
+            geometryMode: GEOMETRY_CYLINDRICAL,
+            geometryRMin: rMin,
+            sourceSubstepsMax: 8,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 1,
+        viewMin: 0,
+        viewMax: 0.02,
+        verifyTime: 0.02,
+        cylindricalEquilibrium: { rho0, p0, bz0, rMin },
+    };
+}
+
+/**
+ * Cylindrical conduction balance test.
+ *
+ * With isotropic, nearly constant transport, T = T0 + A log(r/r_ref) has
+ * 1/r d(r dT/dr)/dr ≈ 0 away from boundaries. This catches accidentally
+ * using the Cartesian heat-flux divergence in cylindrical geometry.
+ */
+export function makeCylindricalConductionBalancePreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const dx = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const T0 = 1.0;
+    const amp = 0.015;
+    const rMin = 0.3;
+    const rRef = rMin + 0.5 * L;
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            const r = Math.max(rMin + (i - ghost + 0.5) * dx, 0.5 * dx);
+            const T = T0 + amp * Math.log(r / rRef);
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, 0, 0, 0, rho0 * T, 0, 0, 0, gamma);
+        }
+    }
+
+    return {
+        id: 'cylindrical-conduction-balance',
+        label: 'Cylindrical conduction balance',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_GEOMETRY | FLAG_CONDUCTION,
+            geometryMode: GEOMETRY_CYLINDRICAL,
+            geometryRMin: rMin,
+            conductionKappa: 2.0e-2,
+            conductionIsoFrac: 1.0,
+            conductionSatFrac: 0.0,
+            sourceSubstepsMax: 16,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 5,
+        viewMin: T0 - 0.02,
+        viewMax: T0 + 0.02,
+        verifyTime: 0.02,
+        cylindricalConduction: { T0, amp, rMin, rRef },
+    };
+}
+
+/**
+ * Cylindrical CT / magnetic-divergence test.
+ *
+ * A z-varying radial inflow over uniform axial field gives
+ * E_phi = -v_r B_z(z). In cylindrical coordinates, that EMF must update
+ * B_z through 1/r ∂(rE_phi)/∂r even when E_phi has no radial gradient;
+ * otherwise the Br update alone creates ∇·B_cyl error.
+ */
+export function makeCylindricalMagneticCompressionPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const dx = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0 = 1.0;
+    const vrAmp = 0.08;
+    const bz0 = 1.0;
+    const rMin = 0.3;
+    const TWO_PI = 2.0 * Math.PI;
+
+    for (let j = 0; j < nT; j++) {
+        const z = (j - ghost + 0.5) * dx;
+        const vr = vrAmp * Math.sin(TWO_PI * z);
+        for (let i = 0; i < nT; i++) {
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho0, vr, 0, 0, p0, 0, bz0, 0, gamma);
+        }
+    }
+
+    // Uniform axial field lives on By faces in the r-z plane. Br = 0.
+    By_face.fill(bz0);
+
+    return {
+        id: 'cylindrical-magnetic-compression',
+        label: 'Cylindrical magnetic compression',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_OUTFLOW,  modeW: BC_OUTFLOW,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_GEOMETRY,
+            geometryMode: GEOMETRY_CYLINDRICAL,
+            geometryRMin: rMin,
+            sourceSubstepsMax: 8,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 3,
+        viewMin: 0.8,
+        viewMax: 1.2,
+        verifyTime: 0.02,
+        cylindrical: { rho0, vrAmp, bz0, rMin, dx },
+    };
+}
+
+/**
+ * Cylindrical self-gravity operator test.
+ *
+ * Compact axisymmetric mass distribution with an isolated exterior. This
+ * exercises the r-weighted Poisson operator rather than the Cartesian
+ * Laplacian used by planar boxes.
+ */
+export function makeCylindricalGravityColumnPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = 1.0;
+    const dx = L / n;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rhoBg = 0.02;
+    const rhoAmp = 0.8;
+    const p0 = 1.0;
+    const rMin = 0.25;
+    const r0 = rMin + 0.35;
+    const z0 = 0.5;
+    const sigmaR = 0.11;
+    const sigmaZ = 0.13;
+    const G = 4.0;
+
+    for (let j = 0; j < nT; j++) {
+        const z = (j - ghost + 0.5) * dx;
+        for (let i = 0; i < nT; i++) {
+            const r = rMin + (i - ghost + 0.5) * dx;
+            const dr = r - r0;
+            const dz = z - z0;
+            const rho = rhoBg + rhoAmp * Math.exp(-0.5 * (
+                (dr * dr) / (sigmaR * sigmaR)
+              + (dz * dz) / (sigmaZ * sigmaZ)
+            ));
+            writeCell(U0, U1, cellIdx(i, j, nT),
+                      rho, 0, 0, 0, p0, 0, 0, 0, gamma);
+        }
+    }
+
+    return {
+        id: 'cylindrical-gravity-column',
+        label: 'Cylindrical self-gravity column',
+        gamma,
+        domainLength: L,
+        eta: 0,
+        bc: {
+            modeN: BC_OUTFLOW, modeS: BC_OUTFLOW,
+            modeE: BC_OUTFLOW, modeW: BC_OUTFLOW,
+        },
+        physics: {
+            physicsFlags: BASE_PHYSICS_FLAGS | FLAG_GEOMETRY | FLAG_GRAVITY_SELF,
+            geometryMode: GEOMETRY_CYLINDRICAL,
+            geometryRMin: rMin,
+            gravityBoundaryMode: GRAVITY_BOUNDARY_ISOLATED,
+            gravityG: G,
+            gravityPoissonIters: 160,
+            gravityPoissonOmega: 0.8,
+            gravitySoftening: 0.0,
+        },
+        data: { U0, U1, Bx_face, By_face },
+        viewMode: 7,
+        viewMin: -0.08,
+        viewMax: 0,
+        cylindricalGravity: { rhoBg, rhoAmp, rMin, r0, z0, sigmaR, sigmaZ, G },
+    };
+}
+
 export const PRESETS = {
     sod: makeSodPreset,
     'brio-wu': makeBrioWuPreset,
@@ -1104,5 +1662,13 @@ export const PRESETS = {
     'hall-whistler': makeHallWhistlerPreset,
     'conduction-front': makeConductionFrontPreset,
     'cooling-instability': makeCoolingInstabilityPreset,
+    'radiative-relaxation': makeRadiativeRelaxationPreset,
+    'kinetic-current-smoothing': makeKineticCurrentSmoothingPreset,
     'jeans-instability': makeJeansInstabilityPreset,
+    'isolated-gravity-pulse': makeIsolatedGravityPulsePreset,
+    'cylindrical-expansion': makeCylindricalExpansionPreset,
+    'cylindrical-static-equilibrium': makeCylindricalStaticEquilibriumPreset,
+    'cylindrical-conduction-balance': makeCylindricalConductionBalancePreset,
+    'cylindrical-magnetic-compression': makeCylindricalMagneticCompressionPreset,
+    'cylindrical-gravity-column': makeCylindricalGravityColumnPreset,
 };

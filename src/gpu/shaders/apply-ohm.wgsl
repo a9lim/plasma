@@ -9,13 +9,17 @@
 //
 //   E_H  = (d_i / ρ) · (J×B − ∇p_e)       nondissipative
 //   E_AD = η_A · J_perp                  dissipative ion-neutral drift
+//   E_ei = −η₄ ∇²J                       kinetic-length current smoothing
 //   ∂B_z/∂t|Biermann = C_B (∇ρ×∇p_e)_z / ρ²
 //
 // compute_emf evaluates all terms from one frozen state. apply_hall_update
 // applies the Hall part alone, repair_hall_energy restores the total energy
 // by Δ magnetic energy, then apply_dissipative_update applies ambipolar and
 // Biermann terms at fixed total energy so magnetic losses/gains exchange
-// with the gas internal energy budget.
+// with the gas internal energy budget. The electron-inertia path is a
+// single-fluid hyper-resistive closure, not a full two-fluid momentum solve;
+// it regularizes unresolved current sheets at a configurable kinetic scale
+// d_e while preserving the CT curl form.
 
 struct DtUniform {
     dt: f32, _pad0: f32, _pad1: f32, _pad2: f32,
@@ -32,8 +36,8 @@ struct DtUniform {
 @group(0) @binding(8) var<storage, read_write> hall_mb0:   array<f32>;
 @group(0) @binding(9) var<storage, read>       micro:      array<vec4<f32>>;
 
-const MICRO_ION_START: u32 = 16u;
-const MICRO_ION_COUNT: u32 = 16u;
+const MICRO_ION_START: u32 = 24u;
+const MICRO_ION_COUNT: u32 = 24u;
 const INV_LN10_OHM: f32 = 0.4342944819032518;
 
 struct CornerJB {
@@ -45,7 +49,7 @@ struct CornerJB {
 fn micro_log_interp_ohm(start: u32, count: u32, theta: f32) -> f32 {
     let log_theta = log(max(theta, 1.0e-30)) * INV_LN10_OHM;
     var idx = start;
-    for (var i: u32 = 0u; i < 15u; i = i + 1u) {
+    for (var i: u32 = 0u; i < 23u; i = i + 1u) {
         if (i + 1u >= count) { break; }
         let next = micro[start + i + 1u];
         if (log_theta < next.x) {
@@ -175,6 +179,25 @@ fn ambipolar_e_corner_ohm(ix: u32, iy: u32, n_total: u32) -> vec3<f32> {
     return max(U_uniforms.ambipolar_eta, 0.0) * neutral * jperp;
 }
 
+fn electron_inertia_e_corner_ohm(ix: u32, iy: u32, n_total: u32) -> vec3<f32> {
+    if (!flag_set(U_uniforms.physics_flags, FLAG_ELECTRON_INERTIA)
+        || U_uniforms.electron_inertia_length <= 0.0
+        || U_uniforms.electron_inertia_damping <= 0.0) {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
+    let dx = U_uniforms.dx;
+    let j0 = corner_jb_ohm(ix,      iy,      n_total).Jz;
+    let jl = corner_jb_ohm(ix - 1u, iy,      n_total).Jz;
+    let jr = corner_jb_ohm(ix + 1u, iy,      n_total).Jz;
+    let jd = corner_jb_ohm(ix,      iy - 1u, n_total).Jz;
+    let ju = corner_jb_ohm(ix,      iy + 1u, n_total).Jz;
+    let lap_jz = (jl + jr + jd + ju - 4.0 * j0) / max(dx * dx, 1.0e-30);
+    let eta4 = U_uniforms.electron_inertia_damping
+             * U_uniforms.electron_inertia_length
+             * U_uniforms.electron_inertia_length;
+    return vec3<f32>(0.0, 0.0, -eta4 * lap_jz);
+}
+
 fn biermann_cell_ohm(ix: u32, iy: u32, n_total: u32) -> f32 {
     if (!flag_set(U_uniforms.physics_flags, FLAG_BIERMANN)
         || U_uniforms.biermann_coeff == 0.0
@@ -213,11 +236,21 @@ fn load_hall_E(ix: u32, iy: u32, n_total: u32) -> vec3<f32> {
     return vec3<f32>(e.x, e.y, e.z);
 }
 
+fn load_ambipolar_E(ix: u32, iy: u32, n_total: u32) -> vec3<f32> {
+    let idx = ez_edge_idx(ix, iy, n_total);
+    let total = ohm_E[idx];
+    let hall = hall_E[idx];
+    return vec3<f32>(total.x - hall.x, total.y - hall.y, total.z - hall.z);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn compute_emf(@builtin(global_invocation_id) gid: vec3<u32>) {
     let any_on = (flag_set(U_uniforms.physics_flags, FLAG_HALL) && U_uniforms.hall_di > 0.0)
               || (flag_set(U_uniforms.physics_flags, FLAG_AMBIPOLAR) && U_uniforms.ambipolar_eta > 0.0)
-              || (flag_set(U_uniforms.physics_flags, FLAG_BIERMANN) && U_uniforms.biermann_coeff != 0.0);
+              || (flag_set(U_uniforms.physics_flags, FLAG_BIERMANN) && U_uniforms.biermann_coeff != 0.0)
+              || (flag_set(U_uniforms.physics_flags, FLAG_ELECTRON_INERTIA)
+                  && U_uniforms.electron_inertia_length > 0.0
+                  && U_uniforms.electron_inertia_damping > 0.0);
     if (!any_on) { return; }
 
     let n_interior = U_uniforms.grid_n;
@@ -230,12 +263,13 @@ fn compute_emf(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iy = ghost + gid.y;
     let e_hall = hall_e_corner_ohm(ix, iy, n_total);
     let e_ambi = ambipolar_e_corner_ohm(ix, iy, n_total);
+    let e_ei = electron_inertia_e_corner_ohm(ix, iy, n_total);
     var battery = 0.0;
     if (gid.x < n_interior && gid.y < n_interior) {
         battery = biermann_cell_ohm(ix, iy, n_total);
         hall_mb0[cell_idx_total(ix, iy, n_total)] = cell_magnetic_energy_ohm(ix, iy, n_total);
     }
-    let e_total = e_hall + e_ambi;
+    let e_total = e_hall + e_ambi + e_ei;
     ohm_E[ez_edge_idx(ix, iy, n_total)] = vec4<f32>(e_total.x, e_total.y, e_total.z, battery);
     hall_E[ez_edge_idx(ix, iy, n_total)] = vec4<f32>(e_hall.x, e_hall.y, e_hall.z, 0.0);
 }
@@ -307,10 +341,14 @@ fn apply_dissipative_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ambi_on = flag_set(U_uniforms.physics_flags, FLAG_AMBIPOLAR)
                && U_uniforms.ambipolar_eta > 0.0
                && U_uniforms.neutral_frac > 0.0;
+    let electron_inertia_on = flag_set(U_uniforms.physics_flags, FLAG_ELECTRON_INERTIA)
+                           && U_uniforms.electron_inertia_length > 0.0
+                           && U_uniforms.electron_inertia_damping > 0.0;
+    let nonhall_on = ambi_on || electron_inertia_on;
     let biermann_on = flag_set(U_uniforms.physics_flags, FLAG_BIERMANN)
                    && U_uniforms.biermann_coeff != 0.0
                    && U_uniforms.hall_electron_pressure_frac > 0.0;
-    if (!ambi_on && !biermann_on) { return; }
+    if (!nonhall_on && !biermann_on) { return; }
 
     let n_interior = U_uniforms.grid_n;
     let n_total    = U_uniforms.grid_n_total;
@@ -323,16 +361,16 @@ fn apply_dissipative_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dt = dt_buf.dt;
     let dt_dx = dt / U_uniforms.dx;
 
-    if (ambi_on) {
+    if (nonhall_on) {
         if (gid.y < n_interior) {
-            let e0 = load_total_E(ix, iy,      n_total) - load_hall_E(ix, iy,      n_total);
-            let e1 = load_total_E(ix, iy + 1u, n_total) - load_hall_E(ix, iy + 1u, n_total);
+            let e0 = load_ambipolar_E(ix, iy,      n_total);
+            let e1 = load_ambipolar_E(ix, iy + 1u, n_total);
             let bxi = bx_face_idx(ix, iy, n_total);
             Bx_face[bxi] = Bx_face[bxi] - dt_dx * (e1.z - e0.z);
         }
         if (gid.x < n_interior) {
-            let e0 = load_total_E(ix,      iy, n_total) - load_hall_E(ix,      iy, n_total);
-            let e1 = load_total_E(ix + 1u, iy, n_total) - load_hall_E(ix + 1u, iy, n_total);
+            let e0 = load_ambipolar_E(ix,      iy, n_total);
+            let e1 = load_ambipolar_E(ix + 1u, iy, n_total);
             let byi = by_face_idx(ix, iy, n_total);
             By_face[byi] = By_face[byi] + dt_dx * (e1.z - e0.z);
         }
@@ -341,11 +379,11 @@ fn apply_dissipative_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x < n_interior && gid.y < n_interior) {
         let c = cell_idx_total(ix, iy, n_total);
         var u1 = U1[c];
-        if (ambi_on) {
-            let e_sw = load_total_E(ix,      iy,      n_total) - load_hall_E(ix,      iy,      n_total);
-            let e_se = load_total_E(ix + 1u, iy,      n_total) - load_hall_E(ix + 1u, iy,      n_total);
-            let e_nw = load_total_E(ix,      iy + 1u, n_total) - load_hall_E(ix,      iy + 1u, n_total);
-            let e_ne = load_total_E(ix + 1u, iy + 1u, n_total) - load_hall_E(ix + 1u, iy + 1u, n_total);
+        if (nonhall_on) {
+            let e_sw = load_ambipolar_E(ix,      iy,      n_total);
+            let e_se = load_ambipolar_E(ix + 1u, iy,      n_total);
+            let e_nw = load_ambipolar_E(ix,      iy + 1u, n_total);
+            let e_ne = load_ambipolar_E(ix + 1u, iy + 1u, n_total);
             let dEy_dx = 0.5 * ((e_se.y + e_ne.y) - (e_sw.y + e_nw.y)) / U_uniforms.dx;
             let dEx_dy = 0.5 * ((e_nw.x + e_ne.x) - (e_sw.x + e_se.x)) / U_uniforms.dx;
             u1 = vec4<f32>(u1.x, u1.y + (-dEy_dx + dEx_dy) * dt, u1.z, u1.w);

@@ -6,10 +6,9 @@
 //                      r and y as axial coordinate z. The stored components
 //                      map as vx=v_r, vy=v_z, vz=v_phi, and Bz=B_phi.
 //
-// The cylindrical piece is intentionally a source-layer approximation rather
-// than a full finite-volume r-weighted rewrite: enough to capture toroidal
-// curvature/tension and expansion effects in interactive experiments without
-// disturbing the existing CT/HLLD Cartesian core.
+// The hyperbolic conserved update handles the r-weighted radial finite-volume
+// divergence in cylindrical mode. This pass supplies the remaining curvature
+// terms for radial/toroidal momentum, toroidal magnetic field, and sponge.
 //
 // The sponge damps momentum and B_phi near all edges while preserving the
 // local thermal pressure, acting as a crude absorbing layer for open-boundary
@@ -84,32 +83,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let inv_r = 1.0 / r;
         let br = bx;
 
-        // Axisymmetric mass/momentum/toroidal-field source terms. The
-        // conservative r-weighted flux part is approximated as a local
-        // source, which is acceptable for exploratory runs but documented
-        // as a geometry layer rather than a full cylindrical solver.
-        let drho = -rho * vr * inv_r * dt;
-        let radial_force = (rho * vphi * vphi - bphi * bphi) * inv_r;
-        let toroidal_mom = -(rho * vr * vphi - br * bphi) * inv_r;
-        let toroidal_B   = -(vr * bphi - vphi * br) * inv_r;
+        // Axisymmetric curvature terms. Continuity and radial flux
+        // divergence live in the r-weighted finite-volume update; this
+        // pass supplies the complementary T_phi_phi/r source. Including
+        // total pressure here is what cancels the p_tot/r term introduced
+        // by 1/r d(r F_r)/dr for a uniform static cylinder.
+        let total_pressure = p + 0.5 * (br*br + by*by + bphi*bphi);
+        let radial_force = (rho * vphi * vphi + total_pressure - bphi * bphi) * inv_r;
 
-        rho = max(rho + drho, DENSITY_FLOOR);
         let dmx = radial_force * dt;
-        let dmz = toroidal_mom * dt;
-        let dBphi = toroidal_B * dt;
+
+        // The toroidal momentum and B_phi curvature equations contain the
+        // same geometric dilution term, -v_r y/r. Integrate that part
+        // exactly for frozen v_r/r, matching the positivity-preserving
+        // continuity treatment in Session 19 and avoiding first-order
+        // angular-momentum drift near the axis:
+        //   d(m_phi)/dt = -(v_r/r)m_phi + B_r B_phi/r
+        //   d(B_phi)/dt = -(v_r/r)B_phi + v_phi B_r/r
+        let a = vr * inv_r;
+        let decay = exp(-a * dt);
+        var source_factor = dt;
+        if (abs(a) > 1.0e-8) {
+            source_factor = (1.0 - decay) / a;
+        }
+        let mphi_new = u0.w * decay + (br * bphi * inv_r) * source_factor;
+        let bphi_new = bphi * decay + (vphi * br * inv_r) * source_factor;
 
         u0 = vec4<f32>(
             rho,
             u0.y + dmx,
             u0.z,
-            u0.w + dmz,
+            mphi_new,
         );
-        u1 = vec4<f32>(
-            u1.x + radial_force * vr * dt,
-            bphi + dBphi,
-            u1.z,
-            u1.w,
-        );
+        u1 = vec4<f32>(u1.x, bphi_new, u1.z, u1.w);
         rho = max(u0.x, DENSITY_FLOOR);
         vr = u0.y / rho;
         vz = u0.z / rho;

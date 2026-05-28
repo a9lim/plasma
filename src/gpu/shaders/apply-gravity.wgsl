@@ -38,9 +38,20 @@ struct DtUniform {
 @group(0) @binding(5) var<storage, read>       Bx_face:    array<f32>;
 @group(0) @binding(6) var<storage, read>       By_face:    array<f32>;
 
-fn phi_at(gx: u32, gy: u32, n_interior: u32, n_total: u32, ghost: u32) -> f32 {
-    let ix = ghost + (gx % n_interior);
-    let iy = ghost + (gy % n_interior);
+fn phi_at(gx_in: i32, gy_in: i32, n_interior: u32, n_total: u32, ghost: u32) -> f32 {
+    let n = i32(n_interior);
+    var gx = gx_in;
+    var gy = gy_in;
+    if (U_uniforms.gravity_boundary_mode == 1u) {
+        if (gx < 0 || gx >= n || gy < 0 || gy >= n) {
+            return 0.0;
+        }
+    } else {
+        gx = ((gx % n) + n) % n;
+        gy = ((gy % n) + n) % n;
+    }
+    let ix = ghost + u32(gx);
+    let iy = ghost + u32(gy);
     return phi[cell_idx_total(ix, iy, n_total)];
 }
 
@@ -89,22 +100,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // with the 2-point stencil, without changing the Jacobi buffer
         // topology or relying on φ ghost cells.
         let dx = U_uniforms.dx;
-        let gx_m2 = (gid.x + n_interior - 2u) % n_interior;
-        let gx_m1 = (gid.x + n_interior - 1u) % n_interior;
-        let gx_p1 = (gid.x + 1u) % n_interior;
-        let gx_p2 = (gid.x + 2u) % n_interior;
-        let gy_m2 = (gid.y + n_interior - 2u) % n_interior;
-        let gy_m1 = (gid.y + n_interior - 1u) % n_interior;
-        let gy_p1 = (gid.y + 1u) % n_interior;
-        let gy_p2 = (gid.y + 2u) % n_interior;
-        let dphi_dx = (-phi_at(gx_p2, gid.y, n_interior, n_total, ghost)
-                       + 8.0 * phi_at(gx_p1, gid.y, n_interior, n_total, ghost)
-                       - 8.0 * phi_at(gx_m1, gid.y, n_interior, n_total, ghost)
-                       + phi_at(gx_m2, gid.y, n_interior, n_total, ghost)) / (12.0 * dx);
-        let dphi_dy = (-phi_at(gid.x, gy_p2, n_interior, n_total, ghost)
-                       + 8.0 * phi_at(gid.x, gy_p1, n_interior, n_total, ghost)
-                       - 8.0 * phi_at(gid.x, gy_m1, n_interior, n_total, ghost)
-                       + phi_at(gid.x, gy_m2, n_interior, n_total, ghost)) / (12.0 * dx);
+        let gx0 = i32(gid.x);
+        let gy0 = i32(gid.y);
+        let dphi_dx = (-phi_at(gx0 + 2, gy0, n_interior, n_total, ghost)
+                       + 8.0 * phi_at(gx0 + 1, gy0, n_interior, n_total, ghost)
+                       - 8.0 * phi_at(gx0 - 1, gy0, n_interior, n_total, ghost)
+                       + phi_at(gx0 - 2, gy0, n_interior, n_total, ghost)) / (12.0 * dx);
+        let dphi_dy = (-phi_at(gx0, gy0 + 2, n_interior, n_total, ghost)
+                       + 8.0 * phi_at(gx0, gy0 + 1, n_interior, n_total, ghost)
+                       - 8.0 * phi_at(gx0, gy0 - 1, n_interior, n_total, ghost)
+                       + phi_at(gx0, gy0 - 2, n_interior, n_total, ghost)) / (12.0 * dx);
         gx = gx - dphi_dx;
         gy = gy - dphi_dy;
     }

@@ -41,16 +41,6 @@ html, body {
     z-index: 0;
 }
 
-#probeOverlay {
-    position: fixed;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    display: block;
-    z-index: 1;
-    pointer-events: none;
-}
-
 /* ─── Topbar overrides ────────────────────────── */
 
 #topbar {
@@ -156,17 +146,6 @@ html, body {
 
 .spark-canvas {
     display: block;
-}
-
-.probe-spark {
-    display: block;
-    width: 100%;
-    margin-top: var(--sp-2);
-}
-
-.probe-field-select {
-    min-width: 0;
-    flex: 1;
 }
 
 /* ─── Driven inflow reveal (controlled by bindDeps) ── */

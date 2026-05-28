@@ -3,6 +3,51 @@
 Convergence and correctness tests for the plasma MHD engine. WebGPU-only
 (every test instantiates the production `Sim`); run them in a browser.
 
+## physics-validation.html — source-physics validation matrix
+
+Regression gate for the full production engine, including the extended source
+stack. It runs finite-state smoke checks for Sod, Brio-Wu, Orszag-Tang,
+Harris, and the driven wind/cloud preset; a per-edge driven-boundary fill
+check; then source-response checks for SD93-backed microphysics/opacity table
+shape, source substep rate sizing, cooling, anisotropic conduction, Hall
+whistler dispersion, grey radiation energy exchange, electron-inertia
+current smoothing, Jeans growth, isolated gravity potential, Cartesian
+Poisson multigrid convergence, cylindrical r-weighted expansion, cylindrical static
+pressure balance, cylindrical conduction balance, cylindrical CT
+magnetic-divergence preservation, and cylindrical Poisson residual
+convergence. Each
+row reads back the actual GPU state and reports density/pressure ranges,
+divergence, and a case-specific physical metric.
+
+### Run it
+
+```bash
+# from plasma/
+python -m http.server
+# -> http://localhost:8000/tests/physics-validation.html
+```
+
+```bash
+# from a9lim.github.io/ root
+./dev.sh
+# -> http://localhost:8787/plasma/tests/physics-validation.html
+```
+
+The page also supports `?auto=1`; it prints a
+`PHYSICS_VALIDATION_JSON_BEGIN/END` payload to the browser console so a
+Playwright wrapper can turn it into a CI-style gate. This matrix is deliberately
+broader than the smooth convergence tests below: it is meant to catch source
+term sign errors, stale-ghost regressions, divergence leaks, and boundary/source
+interactions before a visual preset looks obviously wrong.
+
+The companion driver can run it as a CI-style browser gate:
+
+```bash
+# from plasma/, with a parent static server already serving a9lim.github.io/
+python3 tests/physics-validation.py --port 8090 --timeout 180 \
+  --out /tmp/plasma-physics-validation.json
+```
+
 ## alfven-convergence.html — circularly polarized Alfvén wave (CPAW)
 
 Canonical MHD convergence test (Tóth 2000; Stone+ 2008 §4.2). Smooth,

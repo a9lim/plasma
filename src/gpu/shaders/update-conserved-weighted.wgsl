@@ -12,6 +12,11 @@
 //   -∂F/∂x ≈ -(flux_x[i+1, j] - flux_x[i, j]) / dx
 //   -∂F/∂y ≈ -(flux_y[i, j+1] - flux_y[i, j]) / dx
 //
+// In cylindrical mode, x is radius and the radial flux divergence is
+// finite-volume weighted:
+//
+//   -1/r · ∂(r F_r)/∂r ≈ -(r_{i+1/2}F_{i+1/2} - r_{i-1/2}F_{i-1/2})/(r_i dx)
+//
 // Dispatch covers interior cells: [ghost, ghost+N) × [ghost, ghost+N).
 //
 // Bindings:
@@ -79,6 +84,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dx   = U_uniforms.dx;
     let scale = stage_params.dt_w * dt / dx;
 
+    let geom_cyl = flag_set(U_uniforms.physics_flags, FLAG_GEOMETRY)
+                && U_uniforms.geometry_mode == 1u;
+
     let dFx_0 = flux_x_0[idx_xhi] - flux_x_0[idx_c];
     let dFy_0 = flux_y_0[idx_yhi] - flux_y_0[idx_c];
     let dFx_1 = flux_x_1[idx_xhi] - flux_x_1[idx_c];
@@ -86,43 +94,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let mask = vec4<f32>(1.0, 1.0, 0.0, 0.0);
 
-    let L0 = -(dFx_0 + dFy_0) / dx;
-    let L1 = -mask * (dFx_1 + dFy_1) / dx;
+    var L0 = -(dFx_0 + dFy_0) / dx;
+    var L1 = -mask * (dFx_1 + dFy_1) / dx;
+    if (geom_cyl) {
+        let r_l = max(U_uniforms.geometry_r_min + f32(gid.x) * dx, 0.0);
+        let r_r = max(U_uniforms.geometry_r_min + (f32(gid.x) + 1.0) * dx, 0.0);
+        let r_c = max(U_uniforms.geometry_r_min + (f32(gid.x) + 0.5) * dx, 0.5 * dx);
+        let div_r_0 = (r_r * flux_x_0[idx_xhi] - r_l * flux_x_0[idx_c]) / (r_c * dx);
+        let div_r_1 = (r_r * flux_x_1[idx_xhi] - r_l * flux_x_1[idx_c]) / (r_c * dx);
+        L0 = -(div_r_0 + dFy_0 / dx);
+        L1 = -mask * (div_r_1 + dFy_1 / dx);
+    }
 
-    var u0_raw =
+    let u0_blend =
         stage_params.a0 * U0_n[idx_c]
-      + stage_params.a1 * U0_other[idx_c]
-      + stage_params.dt_w * dt * L0;
-    var u1_raw =
+      + stage_params.a1 * U0_other[idx_c];
+    let u1_blend =
         stage_params.a0 * U1_n[idx_c]
-      + stage_params.a1 * U1_other[idx_c]
-      + stage_params.dt_w * dt * L1;
+      + stage_params.a1 * U1_other[idx_c];
+    var u0_raw = u0_blend + stage_params.dt_w * dt * L0;
+    var u1_raw = u1_blend + stage_params.dt_w * dt * L1;
 
     // ── Positivity preservation (FLAG_POSITIVITY) ──────────────────
-    // If the unguarded post-update conserved state predicts a
-    // non-positive density or a non-positive thermal energy (E − KE
-    // already negative — magnetic energy adds back later but we
-    // can't see Bx/By here), DROP the L term entirely for this cell
-    // and fall back to the pure SSP blend of U_n and U_other. This is
-    // a cheap first-order positivity guard in the spirit of Hu, Adams
-    // & Shu 2013 §3 — it doesn't recompute the flux with HLL, but it
-    // guarantees the cell never advances through an unphysical state.
+    // If the unguarded post-update state would cross the density or
+    // thermal-energy floor, scale the flux update toward the pure SSP
+    // blend instead of dropping it entirely. This is the local Zhang-Shu
+    // style limiter shape: U = U_blend + θ ΔU, with θ ∈ [0,1] chosen by
+    // the active positivity constraint. We still cannot include face Bx/By
+    // in this shader because it is already at the storage-binding cap; the
+    // follow-up energy-floor pass handles the magnetic-pressure-aware floor.
     if (flag_set(U_uniforms.physics_flags, FLAG_POSITIVITY)) {
-        let rho_pred = u0_raw.x;
-        let mx_p     = u0_raw.y;
-        let my_p     = u0_raw.z;
-        let mz_p     = u0_raw.w;
-        let E_pred   = u1_raw.x;
-        let rho_safe = max(rho_pred, DENSITY_FLOOR);
-        let ke_pred  = 0.5 * (mx_p*mx_p + my_p*my_p + mz_p*mz_p) / rho_safe;
-        let bad = (rho_pred <= DENSITY_FLOOR)
-               || (E_pred - ke_pred <= U_uniforms.pressure_floor / (U_uniforms.gamma - 1.0))
-               || !(rho_pred == rho_pred)
-               || !(E_pred == E_pred);
-        if (bad) {
-            u0_raw = stage_params.a0 * U0_n[idx_c] + stage_params.a1 * U0_other[idx_c];
-            u1_raw = stage_params.a0 * U1_n[idx_c] + stage_params.a1 * U1_other[idx_c];
+        var theta = 1.0;
+        if (!(u0_raw.x == u0_raw.x) || !(u1_raw.x == u1_raw.x)) {
+            theta = 0.0;
+        } else {
+            let rho_floor = DENSITY_FLOOR;
+            if (u0_raw.x < rho_floor && u0_blend.x > rho_floor) {
+                let denom = max(u0_blend.x - u0_raw.x, 1.0e-30);
+                theta = min(theta, clamp((u0_blend.x - rho_floor) / denom, 0.0, 1.0));
+            }
+            var u0_theta = u0_blend + theta * (u0_raw - u0_blend);
+            var u1_theta = u1_blend + theta * (u1_raw - u1_blend);
+
+            let eint_floor = U_uniforms.pressure_floor
+                           / max(U_uniforms.gamma - 1.0, 1.0e-6);
+            let rho_b = max(u0_blend.x, DENSITY_FLOOR);
+            let ke_b = 0.5 * (u0_blend.y*u0_blend.y
+                            + u0_blend.z*u0_blend.z
+                            + u0_blend.w*u0_blend.w) / rho_b;
+            let eint_b = u1_blend.x - ke_b;
+            let rho_t = max(u0_theta.x, DENSITY_FLOOR);
+            let ke_t = 0.5 * (u0_theta.y*u0_theta.y
+                            + u0_theta.z*u0_theta.z
+                            + u0_theta.w*u0_theta.w) / rho_t;
+            let eint_t = u1_theta.x - ke_t;
+            if (eint_t < eint_floor && eint_b > eint_floor) {
+                let denom_e = max(eint_b - eint_t, 1.0e-30);
+                let theta_e = clamp((eint_b - eint_floor) / denom_e, 0.0, 1.0);
+                theta = min(theta, theta_e);
+            }
         }
+        u0_raw = u0_blend + theta * (u0_raw - u0_blend);
+        u1_raw = u1_blend + theta * (u1_raw - u1_blend);
     }
 
     // ── Defensive sanitization ──────────────────────────────────────

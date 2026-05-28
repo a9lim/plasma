@@ -96,10 +96,12 @@ export const EDGE_W = 3;  // left
 //                gravity_gy, gravity_G, gravity_poisson_iters,
 //                physics_flags, emf_mode, cooling_curve_mode,
 //                hall_electron_pressure_frac.
-//   Slots 32-63 (Session 17 128 B): cooling/heating shape, ambipolar and
+//   Slots 32-63 (Session 17+ 128 B): cooling/heating shape, ambipolar and
 //                Biermann terms, viscosity, shared source substep cap,
 //                cylindrical geometry, softened/relaxed Poisson, sponge
-//                layer, and reserved headroom.
+//                layer, grey radiation transfer, electron-inertia smoothing,
+//                Poisson boundary mode,
+//                and reserved headroom.
 // 64 × 4B = 256B.
 //
 // Sweep direction is in two static SweepDir uniform buffers (16 B each)
@@ -124,6 +126,8 @@ export const FLAG_VISCOSITY    = 1 << 9;  // physical/shear/bulk viscosity
 export const FLAG_GEOMETRY     = 1 << 10; // axisymmetric cylindrical source terms
 export const FLAG_SPONGE       = 1 << 11; // boundary sponge layer
 export const FLAG_HEATING      = 1 << 12; // volumetric heating balancing radiative losses
+export const FLAG_RADIATION    = 1 << 13; // grey radiation energy diffusion/coupling
+export const FLAG_ELECTRON_INERTIA = 1 << 14; // kinetic-scale hyper-resistive Ohm closure
 
 // Baseline flags used by the canonical verification presets. Positivity and
 // upwind CT are numerical guards for the ideal/resistive MHD core; cooling,
@@ -139,7 +143,9 @@ export const EXTENDED_SOURCE_FLAGS = FLAG_COOLING
                                    | FLAG_VISCOSITY
                                    | FLAG_GEOMETRY
                                    | FLAG_SPONGE
-                                   | FLAG_HEATING;
+                                   | FLAG_HEATING
+                                   | FLAG_RADIATION
+                                   | FLAG_ELECTRON_INERTIA;
 export const EXTENDED_PHYSICS_FLAGS = BASE_PHYSICS_FLAGS | EXTENDED_SOURCE_FLAGS;
 
 // EMF mode enum (slot 29: emf_mode).
@@ -161,11 +167,21 @@ export const COOLING_CURVE_TABULATED = 3;
 export const GEOMETRY_CARTESIAN   = 0;
 export const GEOMETRY_CYLINDRICAL = 1; // x is cylindrical radius r, y is z
 
+// Self-gravity Poisson boundary selector (slot 59).
+export const GRAVITY_BOUNDARY_PERIODIC = 0; // ∇²φ = 4πG(ρ-ρ̄), periodic box
+export const GRAVITY_BOUNDARY_ISOLATED = 1; // ∇²φ = 4πGρ, zero-φ exterior
+
+// Host-side self-gravity solver selector. This is intentionally not a
+// Uniforms slot: shaders are selected by the orchestrator so the older
+// Jacobi path can remain the cylindrical/fallback implementation.
+export const GRAVITY_SOLVER_MULTIGRID = 0;
+export const GRAVITY_SOLVER_JACOBI    = 1;
+
 // bc_uniforms storage-buffer layout:
 //   u32 mode[4]  — N, S, E, W
-//   f32 driven_rho, driven_vx, driven_vy, driven_vz, driven_bx, driven_by, driven_bz, driven_p
-// 4*4 + 8*4 = 48B, padded to 64B for alignment headroom.
-export const BC_UNIFORM_BUFFER_SIZE = 64;
+//   f32 driven_{edge}_{rho,vx,vy,vz,bx,by,bz,p} for N, S, E, W
+// 4*4 + 4*8*4 = 144B, padded to 160B for alignment headroom.
+export const BC_UNIFORM_BUFFER_SIZE = 160;
 
 // ── LIC (line integral convolution) — Phase 6 ──────────────────────────
 // Animated noise advection along B-field. The noise base is resolution-

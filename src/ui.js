@@ -21,10 +21,12 @@ import {
     VIEW_T, VIEW_QMAG, VIEW_PHI, VIEW_ENTROPY,
     FLAG_COOLING, FLAG_GRAVITY_SELF, FLAG_CONDUCTION, FLAG_HALL,
     FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_HEATING,
-    FLAG_SPONGE, FLAG_GEOMETRY,
+    FLAG_SPONGE, FLAG_GEOMETRY, FLAG_RADIATION, FLAG_ELECTRON_INERTIA,
     FLAG_POSITIVITY, EMF_MODE_BS_MEAN, EMF_MODE_GS_UPWIND,
     COOLING_CURVE_BREMS, COOLING_CURVE_TABLE, COOLING_CURVE_CIE, COOLING_CURVE_TABULATED,
     GEOMETRY_CARTESIAN, GEOMETRY_CYLINDRICAL,
+    GRAVITY_BOUNDARY_PERIODIC, GRAVITY_BOUNDARY_ISOLATED,
+    GRAVITY_SOLVER_MULTIGRID, GRAVITY_SOLVER_JACOBI,
 } from './config.js';
 import { StatsDisplay } from './stats-display.js';
 import { Probe } from './probe.js';
@@ -32,6 +34,18 @@ import { Probe } from './probe.js';
 const SAVE_KEY = 'plasma.state.v1';
 const THEME_KEY = 'plasma-theme';
 const SPEED_OPTIONS = [1, 2, 4, 8, 16];
+
+// ── Pointer perturbation tuning (locked decisions; live in code) ─────
+// Drag = left-click, deposits Gaussian momentum (δv ≈ DRAG_VSCALE × Δcell
+// at the center cell). Excite = right-click, divergence-free B rotation
+// (δB ≈ EXCITE_BSCALE × Δcell). σ is in domain units; defaults to 4 cells
+// at the current resolution so the perturbation footprint is large
+// enough to be visible without dominating the field.
+const PERTURB_SIGMA_CELLS  = 4.0;
+const DRAG_VSCALE          = 0.25;   // cell-velocity per cell-of-drag
+const EXCITE_BSCALE        = 0.20;   // code-B per cell-of-drag
+// Per-event clamp so very fast flicks don't deposit absurd impulses.
+const PERTURB_MAX_DCELL    = 6.0;
 
 const BC_NAME_TO_ID = {
     periodic: BC_PERIODIC,
@@ -62,10 +76,6 @@ export function setupUI(simShell) {
     const panel       = document.getElementById('control-panel');
     const panelClose  = document.getElementById('panelClose');
 
-    // ── Topbar ────────────────────────────────────────────────
-    wireTopbar({ simShell, sim, playBtn, stepBtn, speedBtn, resetBtn,
-                 saveBtn, loadBtn, themeBtn });
-
     if (panelToggle && panel) {
         _toolbar.initSidebar(panelToggle, panel, panelClose);
     }
@@ -73,15 +83,25 @@ export function setupUI(simShell) {
     // ── Stats + Probe (must be built before wireSettings refs them) ──
     const statsRoot = document.getElementById('tab-stats');
     const probeRoot = document.getElementById('tab-probe');
-    const probeOverlay = document.getElementById('probeOverlay');
 
     const stats = new StatsDisplay({ device: sim.device, buffers: sim.buffers, sim }, statsRoot);
     const probe = new Probe({ device: sim.device, buffers: sim.buffers, sim, canvas: simShell.canvas },
-                            probeRoot, probeOverlay);
+                            probeRoot);
     probe.start();
 
+    const uiCtx = {
+        simShell, sim, stats, probe,
+        playBtn, stepBtn, speedBtn, resetBtn, saveBtn, loadBtn, themeBtn,
+    };
+
+    // ── Pointer perturbation (left-drag = grab, right-drag = excite) ──
+    wirePointerPerturbation(uiCtx);
+
     // ── Settings tab controls ─────────────────────────────────
-    wireSettings({ simShell, sim, stats, probe });
+    wireSettings(uiCtx);
+
+    // ── Topbar ────────────────────────────────────────────────
+    wireTopbar(uiCtx);
 
     // ── Stats readback hook into render loop ──────────────────
     const origRender = simShell.render.bind(simShell);
@@ -188,6 +208,21 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'q_sat φ', min: 0, max: 1, step: 0.05,
               value: sim.conductionSatFrac, format: v => (v <= 0 ? 'off' : v.toFixed(2)),
               onChange: v => sim.setConductionSatFrac(v) },
+            epSlider('Radiation c (log10)',
+                () => sim.radiationC, v => sim.setRadiationC(v),
+                FLAG_RADIATION, { lo: -2, hi: 2 }),
+            { type: 'slider', label: 'Radiation κ_abs', min: -4.5, max: 2, step: 0.25,
+              value: sim.radiationKappaAbs > 0 ? Math.log10(sim.radiationKappaAbs) : -4.5,
+              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
+              onChange: v => sim.setRadiationKappaAbs(v <= -4.45 ? 0 : Math.pow(10, v)) },
+            { type: 'slider', label: 'Radiation κ_scat', min: -4.5, max: 2, step: 0.25,
+              value: sim.radiationKappaScat > 0 ? Math.log10(sim.radiationKappaScat) : -4.5,
+              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
+              onChange: v => sim.setRadiationKappaScat(v <= -4.45 ? 0 : Math.pow(10, v)) },
+            { type: 'slider', label: 'Radiation a_r', min: -4, max: 1, step: 0.25,
+              value: Math.log10(Math.max(sim.radiationConst, 1e-30)),
+              format: v => '1e' + v.toFixed(2),
+              onChange: v => sim.setRadiationConst(Math.pow(10, v)) },
             epSlider('Viscosity ν (log10)',
                 () => sim.viscosityNu, v => sim.setViscosityNu(v),
                 FLAG_VISCOSITY, { lo: -7, hi: -1 }),
@@ -214,6 +249,17 @@ export function setupUI(simShell) {
             epSlider('Biermann C_B (log10)',
                 () => Math.abs(sim.biermannCoeff), v => sim.setBiermannCoeff(v),
                 FLAG_BIERMANN, { lo: -8, hi: -1 }),
+            epSlider('Electron d_e (log10)',
+                () => sim.electronInertiaLength, v => sim.setElectronInertiaLength(v),
+                FLAG_ELECTRON_INERTIA, { lo: -5, hi: -1 }),
+            { type: 'slider', label: 'Electron damping', min: -4.5, max: 0, step: 0.25,
+              value: sim.electronInertiaDamping > 0 ? Math.log10(sim.electronInertiaDamping) : -4.5,
+              format: v => (v <= -4.45 ? 'off' : '1e' + v.toFixed(2)),
+              onChange: v => {
+                  sim.setElectronInertiaDamping(v <= -4.45 ? 0 : Math.pow(10, v));
+                  sim.setPhysicsFlag(FLAG_ELECTRON_INERTIA,
+                      sim.electronInertiaLength > 0 && v > -4.45);
+              } },
             epSlider('Self-gravity G (log10)',
                 () => sim.gravityG, v => sim.setGravityG(v),
                 FLAG_GRAVITY_SELF, { lo: -4, hi: 2 }),
@@ -226,6 +272,22 @@ export function setupUI(simShell) {
             { type: 'slider', label: 'Jacobi ω', min: 0.2, max: 1.8, step: 0.05,
               value: sim.gravityPoissonOmega, format: v => v.toFixed(2),
               onChange: v => sim.setGravityPoissonOmega(v) },
+            { type: 'mode', label: 'Gravity boundary', dataAttr: 'gravity-boundary',
+              buttons: [
+                  { value: String(GRAVITY_BOUNDARY_PERIODIC), label: 'periodic',
+                    active: sim.gravityBoundaryMode === GRAVITY_BOUNDARY_PERIODIC },
+                  { value: String(GRAVITY_BOUNDARY_ISOLATED), label: 'isolated',
+                    active: sim.gravityBoundaryMode === GRAVITY_BOUNDARY_ISOLATED },
+              ],
+              onChange: v => sim.setGravityBoundaryMode(v | 0) },
+            { type: 'mode', label: 'Gravity solver', dataAttr: 'gravity-solver',
+              buttons: [
+                  { value: String(GRAVITY_SOLVER_MULTIGRID), label: 'multi',
+                    active: sim.gravitySolverMode === GRAVITY_SOLVER_MULTIGRID },
+                  { value: String(GRAVITY_SOLVER_JACOBI), label: 'jacobi',
+                    active: sim.gravitySolverMode === GRAVITY_SOLVER_JACOBI },
+              ],
+              onChange: v => sim.setGravitySolverMode(v | 0) },
             { type: 'mode', label: 'Geometry', dataAttr: 'geometry-mode',
               buttons: [
                   { value: String(GEOMETRY_CARTESIAN),   label: 'cart', active: sim.geometryMode === GEOMETRY_CARTESIAN },
@@ -274,15 +336,16 @@ export function setupUI(simShell) {
     if (typeof initAboutPanel === 'function') {
         const aboutHandle = initAboutPanel({
             title: 'Plasma',
-            lastUpdated: '2026-05-27',
-            description: 'WebGPU-native 2D resistive MHD plasma simulator. Click to place the probe; use Settings to switch preset, view mode, resistivity, and boundary conditions.',
+            lastUpdated: '2026-05-28',
+            description: 'WebGPU-native 2D resistive MHD plasma simulator. Hover the canvas to sample the local state; left-drag pushes the plasma, right-drag twists the field. Use Settings to switch preset, view mode, resistivity, and boundary conditions.',
             controls: [
-                { label: 'Probe cell',  value: 'Click canvas' },
-                { label: 'Drag probe',  value: 'Shift + drag' },
-                { label: 'Pause/play',  value: 'Space' },
-                { label: 'Step',        value: '/' },
-                { label: 'Reset',       value: 'R' },
-                { label: 'View mode',   value: 'V' },
+                { label: 'Sample cell',  value: 'Hover canvas' },
+                { label: 'Push plasma',  value: 'Left-click drag' },
+                { label: 'Twist field',  value: 'Right-click drag' },
+                { label: 'Pause/play',   value: 'Space' },
+                { label: 'Step',         value: '/' },
+                { label: 'Reset',        value: 'R' },
+                { label: 'View mode',    value: 'V' },
             ],
             shortcuts: _buildShortcuts(simShell, sim, stats, probe),
             repo: 'https://github.com/a9lim/plasma',
@@ -313,7 +376,7 @@ export function setupUI(simShell) {
 
 function wireTopbar(ctx) {
     const { simShell, sim, playBtn, stepBtn, speedBtn, resetBtn,
-            saveBtn, loadBtn, themeBtn } = ctx;
+            saveBtn, loadBtn, themeBtn, stats, probe } = ctx;
 
     // Play / pause
     const togglePause = () => {
@@ -358,8 +421,18 @@ function wireTopbar(ctx) {
     loadBtn.addEventListener('click', () => {
         try {
             const s = localStorage.getItem(SAVE_KEY);
-            if (s) { sim.loadState(s); toast('State loaded'); }
-            else   { toast('No saved state'); }
+            if (s) {
+                const result = sim.loadState(s);
+                if (result && result.buffersChanged) {
+                    stats.bindBuffers(sim.buffers);
+                    probe.bindBuffers(sim.buffers);
+                    ctx._refreshEtaSlider?.();
+                }
+                stats.updatePresetVisibility(sim.presetName);
+                toast(result && result.ok === false ? 'State load failed' : 'State loaded');
+            } else {
+                toast('No saved state');
+            }
         } catch (e) { console.warn('[plasma] load failed:', e); }
     });
 
@@ -477,6 +550,12 @@ function wireSettings(ctx) {
         { target: drivenPanel, show: () => anyDriven() },
     ]);
 
+    function drivenEdges() {
+        return bcDropdowns
+            .map((sel, idx) => sel.value === 'driven' ? bcEdges[idx] : null)
+            .filter(Boolean);
+    }
+
     bcDropdowns.forEach((sel, idx) => {
         sel.addEventListener('change', () => {
             const mode = BC_NAME_TO_ID[sel.value] ?? BC_PERIODIC;
@@ -496,7 +575,12 @@ function wireSettings(ctx) {
         input.addEventListener('input', () => {
             const v = parseFloat(input.value);
             if (label) label.textContent = v.toFixed(3);
-            sim.setDrivenState({ [k]: v });
+            const edges = drivenEdges();
+            if (edges.length === 0) {
+                sim.setDrivenState({ [k]: v });
+            } else {
+                for (const edge of edges) sim.setDrivenState({ [k]: v }, edge);
+            }
         });
     }
 
@@ -506,6 +590,129 @@ function wireSettings(ctx) {
 
     // Expose for testing
     ctx._syncBCDropdowns = syncBCDropdowns;
+}
+
+// ── pointer perturbation ─────────────────────────────────────
+//
+// Left-click drag deposits a Gaussian-weighted momentum bump along the
+// drag vector ("grab the plasma"). Right-click drag launches a curl-of-Az
+// magnetic perturbation in the drag direction ("twist the field"). Both
+// modes use the same WGSL pipeline; only the kind enum and the dvec
+// scaling differ. See plasma/src/gpu/shaders/perturb.wgsl for the math.
+//
+// Coalescing: we don't apply per-pointermove event. Each event records
+// the new position and accumulates a pending Δcell; the actual GPU
+// dispatch fires on the next animation frame. This keeps the per-frame
+// command-buffer count predictable and gives the dispatch a non-tiny
+// drag vector even on high-Hz pointers (240 Hz Magic Trackpad would
+// otherwise see ~Δcell/4 deposits which feel anaemic).
+
+function wirePointerPerturbation(ctx) {
+    const { simShell, sim, probe } = ctx;
+    const canvas = simShell.canvas;
+
+    // Pointer state. `button` follows MouseEvent.button: 0 = left = drag,
+    // 2 = right = excite. `lastFrac` is the previous pointermove position
+    // in canvas-fractional coords ([0, 1] × [0, 1], y already flipped to
+    // sim-up).
+    let active = false;
+    let kind = null;       // 'drag' | 'excite'
+    let lastFrac = null;   // { x, y } in [0, 1]
+    let pending = null;    // { centerFrac, dCellX, dCellY }
+    let rafPending = false;
+
+    const screenToFrac = (clientX, clientY) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = clientX - rect.left;
+        const y = clientY - rect.top;
+        if (x < 0 || x > rect.width || y < 0 || y > rect.height) return null;
+        return { x: x / rect.width, y: 1 - y / rect.height };
+    };
+
+    const flushPending = () => {
+        rafPending = false;
+        if (!pending || !active || !kind) { pending = null; return; }
+        const { centerFrac, dCellX, dCellY } = pending;
+        pending = null;
+        // Clamp huge per-frame drags so flicks don't blow up the cell.
+        const clamp = (v) => Math.max(-PERTURB_MAX_DCELL,
+                                       Math.min(PERTURB_MAX_DCELL, v));
+        const dcx = clamp(dCellX);
+        const dcy = clamp(dCellY);
+        if (Math.abs(dcx) + Math.abs(dcy) < 1e-3) return;
+        const L = sim.domainLength;
+        const cx = centerFrac.x * L;
+        const cy = centerFrac.y * L;
+        const sigma = PERTURB_SIGMA_CELLS * sim.dx;
+        const scale = kind === 'drag' ? DRAG_VSCALE : EXCITE_BSCALE;
+        sim.applyPerturbation({
+            kind,
+            cx, cy,
+            dvec_x: scale * dcx,
+            dvec_y: scale * dcy,
+            sigma,
+            amplitude: 1.0,
+        });
+    };
+
+    const scheduleFlush = () => {
+        if (rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(flushPending);
+    };
+
+    canvas.addEventListener('pointerdown', (e) => {
+        // We only care about primary (button 0) and secondary (button 2).
+        // Middle-click / extra buttons are ignored — let other things use them.
+        if (e.button !== 0 && e.button !== 2) return;
+        const frac = screenToFrac(e.clientX, e.clientY);
+        if (!frac) return;
+        active = true;
+        kind = e.button === 0 ? 'drag' : 'excite';
+        lastFrac = frac;
+        // Capture so pointermove keeps firing if the cursor leaves the
+        // canvas mid-drag.
+        try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* older browsers */ }
+        e.preventDefault();
+    });
+
+    // Right-click would otherwise show the OS context menu. Suppress it
+    // over the canvas so excite-drag works.
+    canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+
+    canvas.addEventListener('pointermove', (e) => {
+        if (!active || !kind || !lastFrac) return;
+        const frac = screenToFrac(e.clientX, e.clientY);
+        if (!frac) return;
+        // Δ in cell units (canvas spans n interior cells).
+        const n = sim.n;
+        const dCellX = (frac.x - lastFrac.x) * n;
+        const dCellY = (frac.y - lastFrac.y) * n;
+        lastFrac = frac;
+        if (pending) {
+            pending.centerFrac = frac;
+            pending.dCellX += dCellX;
+            pending.dCellY += dCellY;
+        } else {
+            pending = { centerFrac: frac, dCellX, dCellY };
+        }
+        scheduleFlush();
+    });
+
+    const endDrag = (e) => {
+        if (!active) return;
+        active = false;
+        kind = null;
+        lastFrac = null;
+        pending = null;
+        try { canvas.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+    };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+
+    // Touch support: a single touch maps to left-drag automatically (the
+    // browser dispatches synthetic pointerdown with button=0). Two-finger
+    // gestures fall through to OS — no excite-on-touch by design.
 }
 
 // ── keyboard shortcuts ───────────────────────────────────────

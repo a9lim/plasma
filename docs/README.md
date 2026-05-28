@@ -35,6 +35,9 @@ for.
 | [`sessions/session-16.md`](sessions/session-16.md) | Transport, cooling, Ohm, and gravity realism pass |
 | [`sessions/session-17.md`](sessions/session-17.md) | Second realism layer: heating, ambipolar, Biermann, viscosity, geometry |
 | [`sessions/session-18.md`](sessions/session-18.md) | Tabulated microphysics, dual energy, unified Ohm, driven wind/cloud |
+| [`sessions/session-19.md`](sessions/session-19.md) | Validation, calibration, and source-coupling hardening |
+| [`sessions/session-20.md`](sessions/session-20.md) | Radiation, opacity, isolated/cylindrical gravity, Cartesian multigrid, and cylindrical balance |
+| [`sessions/session-21.md`](sessions/session-21.md) | Data-backed cooling, source-cap safety, and cylindrical toroidal balance |
 
 Session 1 was the initial scaffold (no retro — see the Phase 1
 commit message instead).

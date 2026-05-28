@@ -90,10 +90,12 @@ export class PlasmaRenderer {
     }
 
     /**
-     * Encode the full render chain into a fresh command encoder and
-     * submit. Caller owns timing; this is fire-and-forget.
+     * Encode the render chain into a fresh command encoder and submit.
+     * When LIC intensity is zero, skip the expensive LIC trace/reduce
+     * passes; the composite shader already treats intensity 0 as a
+     * colormap-only blit.
      */
-    render() {
+    render({ licEnabled = true } = {}) {
         const { device, pipelines } = this;
         // Both view-field and colormap dispatch over interior cells only.
         // Buffers are ghost-padded; the shaders take ghost-w and grid_n
@@ -114,19 +116,13 @@ export class PlasmaRenderer {
             pass.setBindGroup(0, this._colormapBG);
             pass.dispatchWorkgroups(groups, groups, 1);
 
-            // LIC advect — backward-traces along B-field, writes luminance.
-            // Chained in the same compute pass; reads Bx_n / By_n (already
-            // ghost-filled by apply-bcs at the end of the last step) and
-            // writes lic_out.
-            this.lic.encode(pass);
-            // LIC contrast-stretch — reduce lic_out → global (min, max),
-            // then rewrite lic_out in-place via min/max normalization.
-            // Mirrors compute-dt's per-tile shared-atomic reduction. This
-            // pulls residual noise variation out into the full [0, 1]
-            // range in flat field-free regions while leaving strong-field
-            // regions essentially untouched, so composite samples a
-            // higher-contrast LIC texture.
-            this.lic.encodePost(pass);
+            if (licEnabled) {
+                // LIC advect — backward-traces along B-field, writes luminance.
+                this.lic.encode(pass);
+                // LIC contrast-stretch — reduce lic_out → global (min, max),
+                // then rewrite lic_out in-place via min/max normalization.
+                this.lic.encodePost(pass);
+            }
             pass.end();
         }
 

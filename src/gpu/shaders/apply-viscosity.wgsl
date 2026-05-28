@@ -26,9 +26,10 @@ struct DtUniform {
 @group(0) @binding(6) var<storage, read_write> dU_visc:    array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read>       micro:      array<vec4<f32>>;
 
-const MICRO_TRANSPORT_START_VISC: u32 = 48u;
-const MICRO_TRANSPORT_COUNT_VISC: u32 = 16u;
+const MICRO_TRANSPORT_START_VISC: u32 = 72u;
+const MICRO_TRANSPORT_COUNT_VISC: u32 = 24u;
 const INV_LN10_VISC: f32 = 0.4342944819032518;
+const TRANSPORT_SCALE_MAX_VISC: f32 = 1.0e5;
 
 fn cell_bx_visc(ix: u32, iy: u32, n_total: u32) -> f32 {
     return 0.5 * (Bx_face[bx_face_idx(ix,      iy, n_total)]
@@ -43,7 +44,7 @@ fn cell_by_visc(ix: u32, iy: u32, n_total: u32) -> f32 {
 fn micro_log_interp_visc(start: u32, count: u32, theta: f32) -> f32 {
     let log_theta = log(max(theta, 1.0e-30)) * INV_LN10_VISC;
     var idx = start;
-    for (var i: u32 = 0u; i < 15u; i = i + 1u) {
+    for (var i: u32 = 0u; i < 23u; i = i + 1u) {
         if (i + 1u >= count) { break; }
         let next = micro[start + i + 1u];
         if (log_theta < next.x) {
@@ -64,9 +65,10 @@ fn viscosity_transport_scale(ix: u32, iy: u32, n_total: u32) -> f32 {
                                       cell_by_visc(ix, iy, n_total),
                                       U_uniforms.gamma, U_uniforms.pressure_floor);
     let theta = (p / rho) / max(U_uniforms.cooling_T_ref, 1.0e-30);
-    return pow(10.0, micro_log_interp_visc(MICRO_TRANSPORT_START_VISC,
-                                           MICRO_TRANSPORT_COUNT_VISC,
-                                           theta));
+    return clamp(pow(10.0, micro_log_interp_visc(MICRO_TRANSPORT_START_VISC,
+                                                 MICRO_TRANSPORT_COUNT_VISC,
+                                                 theta)),
+                 0.0, TRANSPORT_SCALE_MAX_VISC);
 }
 
 fn velocity_at(ix: u32, iy: u32, n_total: u32) -> vec3<f32> {

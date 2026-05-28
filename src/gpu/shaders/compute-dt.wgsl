@@ -7,7 +7,7 @@
 // diagnostic:
 //
 //   dt            = CFL · dx / max_signal
-//   max_signal    = MHD wave speed plus active Hall/conduction/cooling/gravity
+//   max_signal    = MHD wave speed plus gravity and source-cap safety
 //                   constraints recast as equivalent signal speeds
 //   eta_max       = max over interior of η_local(|J|)
 //   dt_parabolic  = 0.25 · dx² / eta_max          (RKL2 forward-Euler bound)
@@ -15,10 +15,13 @@
 //                   for the host-side RKL2 substep-count calculation.
 //
 // Pre-RKL2 (Sessions 1–7), dt was the min of hyperbolic and parabolic.
-// With RKL2 the parabolic limit is replaced by `s` substeps that cover
-// the hyperbolic Δt within the cell-wise stability bound. We therefore
-// report dt = dt_hyp here; the host reads dt_parabolic from dt_buf[1]
-// to set up RKL2.
+// With RKL2 the resistive parabolic limit is replaced by `s` substeps
+// that cover the hyperbolic Δt within the cell-wise stability bound. Hall
+// and conduction are still source-subcycled, but the macro step now includes
+// a cap-aware safety limiter: if the configured maximum substep count is too
+// low for the current source stiffness, dt_hyp is reduced enough that the
+// source half-step remains stable instead of silently exceeding the explicit
+// bound.
 //
 // Bindings:
 //   0 uniforms   (uniform)
@@ -28,15 +31,17 @@
 //   4 By_face    (ro)
 //   5 wavespeed  (atomic<u32>)  — MHD signal-speed reduction
 //   6 dt_buf     (rw)   — slot 0: dt_hyp;  slot 1: dt_parabolic;
-//                          slot 2: eta_max;  slot 3: hall_speed_max;
-//                          slot 4: cond_speed_max (Session 15)
+//                          slot 2: eta_max;  slot 3: hall_rate_max;
+//                          slot 4: cond_rate_max
 //   7 eta_max_buf(atomic<u32>) — global η_max bit-pattern, reduce target
-//   8 hall_speed_buf (atomic<u32>) — Session 15: max(v_A·d_i/dx) for Hall
-//                                    sub-cycling. Host reads dt_buf[3] to
-//                                    size N_hall.
-//   9 cond_speed_buf (atomic<u32>) — Session 15: max(4·χ/dx) for conduction
-//                                    sub-cycling. Host reads dt_buf[4] to
-//                                    size N_cond.
+//   8 hall_speed_buf (atomic<u32>) — historical host name; stores the
+//                                    whistler inverse-time rate
+//                                    max(v_A·d_i/dx²). Host reads dt_buf[3]
+//                                    to size N_hall.
+//   9 cond_speed_buf (atomic<u32>) — historical host name; stores the
+//                                    explicit heat-diffusion inverse-time
+//                                    rate max(4·χ/dx²). Host reads dt_buf[4]
+//                                    to size N_cond.
 
 @group(0) @binding(0) var<uniform> U_uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read>           U0_in:          array<vec4<f32>>;
@@ -65,12 +70,14 @@ var<workgroup> tile_max_eta:  atomic<u32>;
 var<workgroup> tile_max_hall: atomic<u32>;
 var<workgroup> tile_max_cond: atomic<u32>;
 
+const TRANSPORT_SCALE_MAX_DT: f32 = 1.0e5;
+
 fn transport_scale_dt(theta: f32) -> f32 {
     // Mirrors the default uploaded microphysics transport family
     // (Spitzer/Braginskii T^(5/2)). compute-dt is already at the storage
     // binding ceiling, so the stability estimate uses the analytic default
     // rather than binding the table directly.
-    return pow(max(theta, 1.0e-30), 2.5);
+    return clamp(pow(max(theta, 1.0e-30), 2.5), 0.0, TRANSPORT_SCALE_MAX_DT);
 }
 
 // |J_z(ix, iy)| from face B — same recipe as view-field and the
@@ -128,42 +135,100 @@ fn reduce(
         var s  = sx + sy;
 
         // ── Extended-physics timestep limits ───────────────────────
-        // Recast each local bound as an equivalent speed so the existing
-        // global max reduction still returns one scalar. These terms are only
-        // active when their physics flag and scalar coefficient are active.
+        // Reduce source-operator inverse-time rates so the host can pick
+        // integer Strang-half-step subcycle counts without a readback stall.
+        // These terms do not restrict the macro hyperbolic CFL directly.
         let dx = U_uniforms.dx;
         let cfl_safe = max(U_uniforms.cfl, 1.0e-6);
         let flags = U_uniforms.physics_flags;
         let b2 = P.bx*P.bx + P.by*P.by + P.bz*P.bz;
 
-        // Hall whistler speed — reduced separately so the host can size
-        // a Hall sub-cycle inside one macro Δt. We do NOT add this to the
-        // macro signal-speed sum (Session 15): with sub-cycling the macro
-        // step only needs to respect the hyperbolic CFL, while Hall runs
-        // N_hall times with dt_sub = dt_macro / N_hall.
+        // Hall whistler inverse-time rate — reduced separately so the host can size
+        // sub-cycles. We also add a source-cap limiter to `s`: for a Strang
+        // half-step, dt_macro <= 2 * N_hall * safety / rate. Recast through
+        // dt = CFL * dx / s, that is s >= CFL * dx * rate / (2 N safety).
         if (flag_set(flags, FLAG_HALL) && U_uniforms.hall_di > 0.0) {
             let vA = sqrt(max(b2 / rho, 0.0));
-            let s_hall = vA * U_uniforms.hall_di / max(dx, 1.0e-30);
-            let s_hall_safe = select(0.0, s_hall, s_hall >= 0.0 && s_hall == s_hall);
-            atomicMax(&tile_max_hall, bitcast<u32>(s_hall_safe));
+            let r_hall = vA * U_uniforms.hall_di / max(dx * dx, 1.0e-30);
+            let r_hall_safe = select(0.0, r_hall, r_hall >= 0.0 && r_hall == r_hall);
+            atomicMax(&tile_max_hall, bitcast<u32>(r_hall_safe));
+            let n_hall = max(f32(max(U_uniforms.hall_substeps_max, 1u)), 1.0);
+            let s_hall_cap = cfl_safe * dx * r_hall_safe / (2.0 * n_hall * 0.5);
+            s = s + select(0.0, s_hall_cap, s_hall_cap >= 0.0 && s_hall_cap == s_hall_cap);
         }
 
-        // Conduction parabolic speed — reduced separately so the host
-        // can size a conduction sub-cycle inside one macro Δt. We do
-        // NOT add this to the macro signal-speed sum (Session 15):
-        // sub-cycling means the macro step respects only the
-        // hyperbolic CFL, while conduction runs N_cond times with
-        // dt_sub = dt_macro / N_cond.
+        // Conduction parabolic inverse-time rate — reduced separately so the host can
+        // size sub-cycles. As for Hall, add only the source-cap limiter,
+        // not the raw FE parabolic bound. Typical cases still run at the
+        // hyperbolic dt; very stiff cases shrink the macro step rather than
+        // overrunning the configured source_substeps_max.
         // 2D explicit heat diffusion bound: dt ≤ dx² / (4χ),
-        // χ = (γ-1)·κ(T)/ρ. As an equivalent speed: 4χ/dx.
+        // χ = (γ-1)·κ(T)/ρ. As an inverse-time rate: 4χ/dx².
         if (flag_set(flags, FLAG_CONDUCTION) && U_uniforms.conduction_kappa > 0.0) {
             let theta = (P.p / rho) / max(U_uniforms.cooling_T_ref, 1.0e-30);
             let kappa_T = U_uniforms.conduction_kappa * transport_scale_dt(theta);
             let chi = max(U_uniforms.gamma - 1.0, 1.0e-6)
                     * kappa_T / rho;
-            let s_cond = 4.0 * chi / max(dx, 1.0e-30);
-            let s_cond_safe = select(0.0, s_cond, s_cond >= 0.0 && s_cond == s_cond);
-            atomicMax(&tile_max_cond, bitcast<u32>(s_cond_safe));
+            let r_cond = 4.0 * chi / max(dx * dx, 1.0e-30);
+            let r_cond_safe = select(0.0, r_cond, r_cond >= 0.0 && r_cond == r_cond);
+            atomicMax(&tile_max_cond, bitcast<u32>(r_cond_safe));
+            let n_cond = max(f32(max(U_uniforms.source_substeps_max, 1u)), 1.0);
+            let s_cond_cap = cfl_safe * dx * r_cond_safe / (2.0 * n_cond * 0.5);
+            s = s + select(0.0, s_cond_cap, s_cond_cap >= 0.0 && s_cond_cap == s_cond_cap);
+        }
+
+        let n_src = max(f32(max(U_uniforms.source_substeps_max, 1u)), 1.0);
+
+        // Host-sized diffusion/source closures cannot cheaply reduce their
+        // true cell-wise rate here without more bindings. Use the same
+        // conservative uniform upper bounds as the host sizing path so the
+        // soft sourceSubstepsMax cap still feeds back into the macro dt.
+        if (flag_set(flags, FLAG_VISCOSITY)) {
+            let nu_eff = max(max(U_uniforms.viscosity_nu * TRANSPORT_SCALE_MAX_DT,
+                                 U_uniforms.viscosity_bulk * TRANSPORT_SCALE_MAX_DT),
+                             U_uniforms.viscosity_shock);
+            let r_visc = 4.0 * max(nu_eff, 0.0) / max(dx * dx, 1.0e-30);
+            let s_visc_cap = cfl_safe * dx * r_visc / (2.0 * n_src * 0.45);
+            s = s + select(0.0, s_visc_cap, s_visc_cap >= 0.0 && s_visc_cap == s_visc_cap);
+        }
+
+        var r_nonideal = 0.0;
+        if (flag_set(flags, FLAG_AMBIPOLAR) && U_uniforms.ambipolar_eta > 0.0 && U_uniforms.neutral_frac > 0.0) {
+            r_nonideal = r_nonideal
+                + 4.0 * U_uniforms.ambipolar_eta * max(U_uniforms.neutral_frac, 0.0)
+                / max(dx * dx, 1.0e-30);
+        }
+        if (flag_set(flags, FLAG_BIERMANN) && U_uniforms.biermann_coeff != 0.0
+            && U_uniforms.hall_electron_pressure_frac > 0.0) {
+            r_nonideal = r_nonideal + abs(U_uniforms.biermann_coeff) / max(dx, 1.0e-30);
+        }
+        if (flag_set(flags, FLAG_ELECTRON_INERTIA)
+            && U_uniforms.electron_inertia_length > 0.0
+            && U_uniforms.electron_inertia_damping > 0.0) {
+            let eta4 = U_uniforms.electron_inertia_damping
+                * U_uniforms.electron_inertia_length
+                * U_uniforms.electron_inertia_length;
+            r_nonideal = r_nonideal + 16.0 * eta4 / max(dx * dx * dx * dx, 1.0e-30);
+        }
+        let s_nonideal_cap = cfl_safe * dx * r_nonideal / (2.0 * n_src * 0.45);
+        s = s + select(0.0, s_nonideal_cap, s_nonideal_cap >= 0.0 && s_nonideal_cap == s_nonideal_cap);
+
+        if (flag_set(flags, FLAG_RADIATION) && U_uniforms.radiation_c > 0.0
+            && (U_uniforms.radiation_kappa_abs > 0.0 || U_uniforms.radiation_kappa_scat > 0.0)) {
+            let kappa = max(U_uniforms.radiation_kappa_abs, 0.0)
+                      + max(U_uniforms.radiation_kappa_scat, 0.0);
+            let opacity_min = 0.01;
+            let opacity_max_abs = 32.0;
+            let r_rad_diff = select(0.0,
+                                    4.0 * U_uniforms.radiation_c
+                                      / max(kappa * opacity_min * dx * dx, 1.0e-30),
+                                    kappa > 0.0);
+            let r_rad_exchange = U_uniforms.radiation_c
+                * max(U_uniforms.radiation_kappa_abs, 0.0)
+                * opacity_max_abs;
+            let r_rad = r_rad_diff + r_rad_exchange;
+            let s_rad_cap = cfl_safe * dx * r_rad / (2.0 * n_src * 0.35);
+            s = s + select(0.0, s_rad_cap, s_rad_cap >= 0.0 && s_rad_cap == s_rad_cap);
         }
 
         // Cooling no longer contributes a Δt bound — Session 15's
@@ -267,13 +332,13 @@ fn finalize() {
     dt_buf[1] = dt_par;
     dt_buf[2] = eta_max;     // diagnostic for the host / stats panel
 
-    // hall_speed_max — Session 15. Reduces v_A·d_i/dx over interior
-    // cells; host divides dt_hyp by this to size the Hall sub-cycle.
+    // hall_rate_max — reduces v_A·d_i/dx² over interior cells; host
+    // multiplies by the Strang half-step to size the Hall sub-cycle.
     let h_bits = atomicLoad(&hall_speed_buf);
     dt_buf[3] = max(bitcast<f32>(h_bits), 0.0);
 
-    // cond_speed_max — Session 15. Reduces 4·χ/dx over interior cells;
-    // host uses dt_hyp·cond_speed_max to size the conduction sub-cycle.
+    // cond_rate_max — reduces 4·χ/dx² over interior cells; host
+    // multiplies by the Strang half-step to size the conduction sub-cycle.
     let c_bits = atomicLoad(&cond_speed_buf);
     dt_buf[4] = max(bitcast<f32>(c_bits), 0.0);
 }

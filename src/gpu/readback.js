@@ -46,6 +46,7 @@ export class ReadbackPool {
         this._free = new Map();
         /** @type {Set<GPUBuffer>} */
         this._inUse = new Set();
+        this._disposed = false;
     }
 
     /**
@@ -75,11 +76,36 @@ export class ReadbackPool {
     release(buf) {
         if (!this._inUse.has(buf)) return;
         this._inUse.delete(buf);
+        if (this._disposed) {
+            safeDestroyBuffer(buf);
+            return;
+        }
         const sz = buf.size;
         let list = this._free.get(sz);
         if (!list) { list = []; this._free.set(sz, list); }
         list.push(buf);
     }
+
+    /** Destroy all currently free staging buffers. In-use buffers retire on release. */
+    destroyFree() {
+        for (const list of this._free.values()) {
+            for (const buf of list) safeDestroyBuffer(buf);
+        }
+        this._free.clear();
+    }
+
+    /** Destroy this pool. Safe to call during resolution/device teardown. */
+    destroy() {
+        this._disposed = true;
+        this.destroyFree();
+        // In-flight mapAsync calls are allowed to finish normally; release()
+        // will destroy those buffers instead of returning them to the pool.
+    }
+}
+
+function safeDestroyBuffer(buf) {
+    if (!buf || typeof buf.destroy !== 'function') return;
+    try { buf.destroy(); } catch (e) { /* ignore */ }
 }
 
 /**
@@ -110,6 +136,9 @@ export async function readbackSlice(device, pool, src, byteOffset, byteSize) {
         staging.unmap();
         return out;
     } finally {
+        if (staging.mapState === 'mapped') {
+            try { staging.unmap(); } catch (e) { /* ignore */ }
+        }
         pool.release(staging);
     }
 }
@@ -138,9 +167,11 @@ export async function readbackBatch(device, pool, specs) {
     device.queue.submit([encoder.finish()]);
 
     try {
-        await Promise.all(stagings.map(s =>
+        const maps = await Promise.allSettled(stagings.map(s =>
             s.staging.mapAsync(GPUMapMode.READ, 0, s.sz)
         ));
+        const failed = maps.find(r => r.status === 'rejected');
+        if (failed) throw failed.reason;
         const out = stagings.map(s => {
             const view = s.staging.getMappedRange(0, s.sz);
             const copy = view.slice(0);
@@ -149,6 +180,11 @@ export async function readbackBatch(device, pool, specs) {
         });
         return out;
     } finally {
-        for (const s of stagings) pool.release(s.staging);
+        for (const s of stagings) {
+            if (s.staging.mapState === 'mapped') {
+                try { s.staging.unmap(); } catch (e) { /* ignore */ }
+            }
+            pool.release(s.staging);
+        }
     }
 }

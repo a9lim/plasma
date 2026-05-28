@@ -81,13 +81,13 @@ struct CoolingSeg {
 
 const COOLING_CURVE_TABULATED: u32 = 3u;
 const MICRO_COOL_START: u32 = 0u;
-const MICRO_COOL_COUNT: u32 = 16u;
+const MICRO_COOL_COUNT: u32 = 24u;
 const INV_LN10: f32 = 0.4342944819032518;
 
 fn micro_segment(start: u32, count: u32, theta: f32) -> CoolingSeg {
     let log_theta = log(max(theta, 1.0e-30)) * INV_LN10;
     var idx = start;
-    for (var i: u32 = 0u; i < 15u; i = i + 1u) {
+    for (var i: u32 = 0u; i < 23u; i = i + 1u) {
         if (i + 1u >= count) { break; }
         let next = micro[start + i + 1u];
         if (log_theta < next.x) {
@@ -229,7 +229,7 @@ fn time_to_theta(theta0: f32, theta1: f32, rate: f32, seg: CoolingSeg) -> f32 {
 fn cool_table_theta(theta0: f32, theta_floor: f32, dt: f32, rate: f32) -> f32 {
     var theta = max(theta0, theta_floor);
     var rem = dt;
-    for (var iter: u32 = 0u; iter < 16u; iter = iter + 1u) {
+    for (var iter: u32 = 0u; iter < 24u; iter = iter + 1u) {
         if (rem <= 0.0 || theta <= theta_floor) { break; }
         let seg0 = cooling_segment(theta);
         let seg = CoolingSeg(seg0.theta_lo,
