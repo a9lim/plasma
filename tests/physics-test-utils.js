@@ -91,14 +91,27 @@ export async function readDt(device, pool, sim) {
 }
 
 export function mirrorDtReadbackIntoSim(sim, dt) {
+    if (sim && typeof sim.syncDtFeedback === 'function') {
+        sim.syncDtFeedback(dt);
+        return;
+    }
     if (Number.isFinite(dt[0]) && dt[0] > 0) {
         sim._lastDtHyp = dt[0];
         sim.lastDt = dt[0];
     }
     if (Number.isFinite(dt[1]) && dt[1] > 0) sim._lastDtParabolic = dt[1];
-    if (Number.isFinite(dt[2])) sim._lastEtaMax = dt[2];
-    if (Number.isFinite(dt[3]) && dt[3] >= 0) sim._lastHallRateMax = dt[3];
-    if (Number.isFinite(dt[4]) && dt[4] >= 0) sim._lastCondRateMax = dt[4];
+    if (Number.isFinite(dt[2])) {
+        sim._lastEtaMax = dt[2];
+        sim._lastEtaMaxValid = true;
+    }
+    if (Number.isFinite(dt[3]) && dt[3] >= 0) {
+        sim._lastHallRateMax = dt[3];
+        sim._lastHallRateValid = true;
+    }
+    if (Number.isFinite(dt[4]) && dt[4] >= 0) {
+        sim._lastCondRateMax = dt[4];
+        sim._lastCondRateValid = true;
+    }
 }
 
 export async function runForSteps(device, pool, sim, steps, onSample) {

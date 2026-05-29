@@ -274,16 +274,33 @@ async function runSourceSizingCase(device, format) {
             sim.hallSubstepsMax = 10000;
             sim.sourceSubstepsMax = 10000;
             sim._lastHallRateMax = rate;
+            sim._lastHallRateValid = true;
             sim._lastCondRateMax = rate;
+            sim._lastCondRateValid = true;
 
             const hall = sim._hallSizing(dtMacro);
             const cond = sim._conductionSizing(dtMacro);
+            sim._lastHallRateValid = false;
+            sim._lastCondRateValid = false;
+            sim.hallSubstepsMax = 7;
+            sim.sourceSubstepsMax = 9;
+            const coldHall = sim._hallSizing(dtMacro);
+            const coldCond = sim._conductionSizing(dtMacro);
+            sim.setEta(0.0);
+            sim.setEtaAnomAlpha(1.0);
+            sim._lastEtaMaxValid = false;
+            const rkl2Bounds = sim._resistiveSizingBounds();
+            const rkl2 = sim._computeRKL2Coeffs(
+                rkl2Bounds.dtSuper, rkl2Bounds.dtParabolic, sim.buffers.sts_coeffs_max_s,
+            );
             const ok = hall.nSubsteps === expected && cond.nSubsteps === expected
-                && hall.dtSub <= 0.5 / rate && cond.dtSub <= 0.5 / rate;
+                && hall.dtSub <= 0.5 / rate && cond.dtSub <= 0.5 / rate
+                && coldHall.nSubsteps === 7 && coldCond.nSubsteps === 9
+                && rkl2.s === sim.buffers.sts_coeffs_max_s;
 
             return {
                 ok, steps: 0, t: 0, summary: null,
-                metric: `expected ${expected}, Hall=${hall.nSubsteps}, cond=${cond.nSubsteps}`,
+                metric: `expected ${expected}, Hall=${hall.nSubsteps}, cond=${cond.nSubsteps}, cold=${coldHall.nSubsteps}/${coldCond.nSubsteps}, RKL2=${rkl2.s}`,
             };
         });
         finishRow(row, result);

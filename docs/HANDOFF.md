@@ -724,6 +724,9 @@ What landed:
   user-facing source substep caps soft performance targets: the host takes the
   required explicit substeps up to an internal hard ceiling, while
   `compute-dt.wgsl` feeds source-cap backpressure into the next macro step.
+  The host now treats cold or invalidated Hall/conduction rate hints as
+  soft-cap requests for the first step, and anomalous-η cold starts size RKL2
+  at the STS hard ceiling until the fresh η reduction arrives.
 * **Positivity:** the conserved update uses a theta limiter instead of
   dropping the whole local flux update whenever a positivity constraint
   would be crossed.

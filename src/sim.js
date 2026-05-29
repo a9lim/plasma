@@ -29,7 +29,9 @@
  * across all three stages — required for SSP. We include the parabolic
  * resistive CFL inside compute-dt (dt_res = 0.5·dx²/η; min'd with dt_hyp).
  *
- * Submit structure (ONE submit per physics step, two compute passes):
+ * Submit structure: one primary physics command buffer per step, plus an
+ * optional tiny dt-feedback readback at a reduced cadence unless source/RKL2
+ * feedback needs per-step reductions.
  *   pass 1: compute_dt on U(n).
  *   pass 2: three RK3 stages chained, each with the 9 sub-steps above.
  *
@@ -62,11 +64,12 @@ import {
     EXTENDED_SOURCE_FLAGS,
     GEOMETRY_CYLINDRICAL,
     GRAVITY_SOLVER_MULTIGRID, GRAVITY_SOLVER_JACOBI,
-    DEFAULT_PHYSICS_STATE, SOURCE_SUBSTEPS_HARD_MAX, VIEW_RANGES,
+    DEFAULT_PHYSICS_STATE, SOURCE_SUBSTEPS_HARD_MAX, STS_COEFFS_MAX_S, VIEW_RANGES,
     ETA_ANOM_JCRIT_DEFAULT,
 } from './config.js';
 
 const WG = WORKGROUP;
+const DT_READBACK_IDLE_STRIDE = 16;
 
 function defaultBCConfig() {
     return {
@@ -112,18 +115,19 @@ export class Sim {
         this.simTime   = 0;
         this.lastDt    = 0;
 
-        // RKL2 super-step state — see _encodeResistivitySuperStep.
-        // The substep count is computed CPU-side from dt_hyp and
-        // dt_parabolic; we read both back async-1-step-lagged from
-        // dt_buf to avoid stalling the encode chain. Initial values
-        // assume a tiny ratio (s = 1) — corrected after the first
-        // post-step readback completes.
+        // RKL2/source feedback state — see _encodeResistivitySuperStep and
+        // _prepareSourceSubsteps. GPU reductions arrive asynchronously, so
+        // cold/invalid hints are treated conservatively by the sizing paths
+        // rather than optimistically taking a single source substep.
         this._lastDtHyp        = 1.0e-4;
         this._lastDtParabolic  = 1.0e30;
         this._lastEtaMax       = 0;
+        this._lastEtaMaxValid  = false;
         this._lastHallRateMax = 0;
+        this._lastHallRateValid = false;
         this._lastHallSubsteps = 1;
         this._lastCondRateMax = 0;
+        this._lastCondRateValid = false;
         this._lastCondSubsteps = 1;
         this._lastViscSubsteps = 1;
         this._lastNonidealSubsteps = 1;
@@ -132,6 +136,7 @@ export class Sim {
         this._dtReadbackBusy   = false;
         this._dtReadbackPool   = null;  // lazy-init in init()
         this._pendingTimeSteps = 0;
+        this._bufferGeneration = 0;
 
         // ── Extended physics state. Canonical verification presets run the
         // ideal/resistive MHD core with numerical guards only; cooling,
@@ -259,6 +264,8 @@ export class Sim {
         if (physics.radiationFloor !== undefined)      this.radiationFloor = Math.max(0, +physics.radiationFloor || 0);
         if (physics.electronInertiaLength !== undefined)  this.electronInertiaLength = Math.max(0, +physics.electronInertiaLength || 0);
         if (physics.electronInertiaDamping !== undefined) this.electronInertiaDamping = Math.max(0, +physics.electronInertiaDamping || 0);
+        this._invalidateSourceRateHints();
+        this._invalidateEtaMaxHint();
     }
 
     loadPreset(preset) {
@@ -287,9 +294,12 @@ export class Sim {
         this._lastDtHyp       = 1.0e-4;
         this._lastDtParabolic = 1.0e30;
         this._lastEtaMax      = 0;
+        this._lastEtaMaxValid = false;
         this._lastHallRateMax = 0;
+        this._lastHallRateValid = false;
         this._lastHallSubsteps = 1;
         this._lastCondRateMax = 0;
+        this._lastCondRateValid = false;
         this._lastCondSubsteps = 1;
         this._lastViscSubsteps = 1;
         this._lastNonidealSubsteps = 1;
@@ -297,6 +307,27 @@ export class Sim {
         this._pendingTimeSteps = 0;
         this._pushUniforms();
         this.buffers.pushBC(this.bcConfig);
+    }
+
+    _invalidateHallRateHint() {
+        this._lastHallRateValid = false;
+        this._lastHallRateMax = 0;
+    }
+
+    _invalidateCondRateHint() {
+        this._lastCondRateValid = false;
+        this._lastCondRateMax = 0;
+    }
+
+    _invalidateEtaMaxHint() {
+        this._lastEtaMaxValid = false;
+        this._lastEtaMax = 0;
+        this._lastDtParabolic = 1.0e30;
+    }
+
+    _invalidateSourceRateHints() {
+        this._invalidateHallRateHint();
+        this._invalidateCondRateHint();
     }
 
     /**
@@ -367,6 +398,7 @@ export class Sim {
      */
     setEta(eta) {
         this.eta = Math.max(eta, this.getEtaMin());
+        if (this.etaAnomAlpha > 0) this._invalidateEtaMaxHint();
         this._pushUniforms();
     }
 
@@ -378,6 +410,7 @@ export class Sim {
      */
     setEtaAnomAlpha(alpha) {
         this.etaAnomAlpha = Math.max(0, +alpha || 0);
+        this._invalidateEtaMaxHint();
         this._pushUniforms();
     }
 
@@ -387,6 +420,7 @@ export class Sim {
      */
     setEtaAnomJcrit(jcrit) {
         this.etaAnomJcrit = Math.max(1e-6, +jcrit || 1e-6);
+        this._invalidateEtaMaxHint();
         this._pushUniforms();
     }
 
@@ -405,23 +439,25 @@ export class Sim {
     }
 
     setCFL(cfl)         { this.cfl = cfl; this._pushUniforms(); }
-    setGamma(g)         { this.gamma = g; this._pushUniforms(); }
+    setGamma(g)         { this.gamma = g; this._invalidateCondRateHint(); this._pushUniforms(); }
     setPressureFloor(p) { this.pressureFloor = p; this._pushUniforms(); }
 
     // ── Extended physics setters (breadth pass) ────────────────────
     setPhysicsFlag(flag, on) {
         if (on) this.physicsFlags |=  flag;
         else    this.physicsFlags &= ~flag;
+        if ((flag & FLAG_HALL) !== 0) this._invalidateHallRateHint();
+        if ((flag & FLAG_CONDUCTION) !== 0) this._invalidateCondRateHint();
         this._pushUniforms();
     }
     setEmfMode(mode)             { this.emfMode = mode | 0; this._pushUniforms(); }
-    setHallDi(d)                 { this.hallDi = +d || 0; this._pushUniforms(); }
+    setHallDi(d)                 { this.hallDi = +d || 0; this._invalidateHallRateHint(); this._pushUniforms(); }
     setHallSubstepsMax(n)        { this.hallSubstepsMax = Math.max(1, n | 0); this._pushUniforms(); }
     setCoolingLambda0(v)         { this.coolingLambda0 = Math.max(0, +v || 0); this._pushUniforms(); }
     setCoolingTFloor(v)          { this.coolingTFloor = Math.max(0, +v || 0); this._pushUniforms(); }
-    setCoolingTRef(v)            { this.coolingTRef = Math.max(1e-30, +v || 1); this._pushUniforms(); }
+    setCoolingTRef(v)            { this.coolingTRef = Math.max(1e-30, +v || 1); this._invalidateCondRateHint(); this._pushUniforms(); }
     setCoolingCurveMode(mode)    { this.coolingCurveMode = Math.max(0, mode | 0); this._pushUniforms(); }
-    setConductionKappa(v)        { this.conductionKappa = Math.max(0, +v || 0); this._pushUniforms(); }
+    setConductionKappa(v)        { this.conductionKappa = Math.max(0, +v || 0); this._invalidateCondRateHint(); this._pushUniforms(); }
     setConductionIsoFrac(v)      { this.conductionIsoFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
     setConductionSatFrac(v)      { this.conductionSatFrac = Math.max(0, +v || 0); this._pushUniforms(); }
     setHallElectronPressureFrac(v) { this.hallElectronPressureFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
@@ -482,33 +518,68 @@ export class Sim {
      * submitted work drains so repeated resolution toggles do not rely on GC.
      */
     setResolution(n) {
-        if (n === this.n) return;
+        if (n === this.n) return true;
         if (n !== 256 && n !== 512 && n !== 1024) {
             console.warn(`[plasma] setResolution: unsupported n=${n}`);
-            return;
+            return false;
         }
-        const oldBuffers = this.buffers;
-        this.n       = n;
-        this.n_total = n + 2 * this.ghost;
-        this.dx      = this.domainLength / n;
-        this.buffers = new PlasmaBuffers(this.device, n);
-        // Re-bind the renderer at the new buffer set.
-        this.renderer = new PlasmaRenderer(this.device, this.context, this.pipelines, this.buffers);
-        this.buffers.uploadLUT(VIRIDIS);
-        const seed = new Float32Array([1e-4]);
-        this.device.queue.writeBuffer(this.buffers.dt, 0, seed.buffer);
-        this._pushUniforms();
-        this._pushLicUniforms();
-        // Re-load whichever preset is current.
-        this.setPreset(this.presetName);
-        // All GPU buffers changed identity — rebuild the bind-group cache
-        // (and via _buildBindGroupCache, the renderer/LIC side caches).
-        this._buildBindGroupCache();
-        if (oldBuffers && typeof oldBuffers.destroy === 'function') {
+        const old = {
+            n: this.n,
+            n_total: this.n_total,
+            dx: this.dx,
+            buffers: this.buffers,
+            renderer: this.renderer,
+            bgCache: this._bgCache,
+            dynamicBGCache: this._dynamicBGCache,
+            rkl2BGCache: this._rkl2BGCache,
+            sourceBGCache: this._sourceBGCache,
+            bufferGeneration: this._bufferGeneration,
+        };
+        let nextBuffers = null;
+        try {
+            nextBuffers = new PlasmaBuffers(this.device, n);
+            const nextRenderer = new PlasmaRenderer(this.device, this.context, this.pipelines, nextBuffers);
+            nextBuffers.uploadLUT(VIRIDIS);
+            const seed = new Float32Array([1e-4]);
+            this.device.queue.writeBuffer(nextBuffers.dt, 0, seed.buffer);
+
+            this.n       = n;
+            this.n_total = n + 2 * this.ghost;
+            this.dx      = this.domainLength / n;
+            this.buffers = nextBuffers;
+            this.renderer = nextRenderer;
+            this._bufferGeneration += 1;
+
+            this._pushUniforms();
+            this._pushLicUniforms();
+            // All GPU buffers changed identity — rebuild the bind-group cache
+            // (and via _buildBindGroupCache, the renderer/LIC side caches).
+            this._buildBindGroupCache();
+            // Re-load whichever preset is current.
+            this.setPreset(this.presetName);
+        } catch (e) {
+            if (nextBuffers && nextBuffers !== old.buffers && typeof nextBuffers.destroy === 'function') {
+                nextBuffers.destroy();
+            }
+            this.n = old.n;
+            this.n_total = old.n_total;
+            this.dx = old.dx;
+            this.buffers = old.buffers;
+            this.renderer = old.renderer;
+            this._bgCache = old.bgCache;
+            this._dynamicBGCache = old.dynamicBGCache;
+            this._rkl2BGCache = old.rkl2BGCache;
+            this._sourceBGCache = old.sourceBGCache;
+            this._bufferGeneration = old.bufferGeneration;
+            console.warn(`[plasma] setResolution failed for n=${n}:`, e);
+            return false;
+        }
+        if (old.buffers && typeof old.buffers.destroy === 'function') {
             this.device.queue.onSubmittedWorkDone()
-                .then(() => oldBuffers.destroy())
-                .catch(() => oldBuffers.destroy());
+                .then(() => old.buffers.destroy())
+                .catch(() => old.buffers.destroy());
         }
+        return true;
     }
 
     /**
@@ -590,7 +661,9 @@ export class Sim {
         try { obj = JSON.parse(s); } catch (e) { console.warn('[plasma] loadState parse:', e); return { ok: false, buffersChanged: false }; }
         if (!obj || obj.v !== 1) return { ok: false, buffersChanged: false };
         const oldBuffers = this.buffers;
-        if (obj.n && obj.n !== this.n) this.setResolution(obj.n);
+        if (obj.n && obj.n !== this.n && this.setResolution(obj.n) === false) {
+            return { ok: false, buffersChanged: false };
+        }
         if (obj.preset) this.setPreset(obj.preset);
         if (obj.viewMode !== undefined) this.setViewMode(obj.viewMode);
         if (obj.eta !== undefined)          this.setEta(obj.eta);
@@ -2248,6 +2321,11 @@ export class Sim {
         if (this.eta <= 0 && alpha <= 0) {
             return { dtSuper: 0, dtParabolic: 1.0e30 };
         }
+        if (alpha > 0 && !this._lastEtaMaxValid) {
+            const sMax = this.buffers?.sts_coeffs_max_s ?? STS_COEFFS_MAX_S;
+            const maxRatio = Math.max(1, (sMax * sMax + sMax - 2) / 2);
+            return { dtSuper: DT_MAX, dtParabolic: DT_MAX / maxRatio };
+        }
         const etaMax = Math.max(this.eta || 0, this._lastEtaMax || 0);
         const hostDtPar = etaMax > 1.0e-30
             ? 0.25 * this.dx * this.dx / etaMax
@@ -2272,8 +2350,8 @@ export class Sim {
      *
      * Inputs:
      *   - `_lastHallRateMax` from the previous step's `compute-dt`
-     *     reduction (one-frame-stale, fine because Hall speed evolves
-     *     slowly compared to one step).
+     *     reduction. Cold or invalidated hints use the configured soft cap
+     *     for one step so fresh GPU dt source-cap feedback is respected.
      *   - `_lastDtHyp` from same readback.
      *   - `hallSubstepsMax` user-supplied soft cap (uniform). The GPU dt
      *     reducer now shrinks future macro steps when that soft cap would be
@@ -2287,15 +2365,22 @@ export class Sim {
         if ((this.physicsFlags & FLAG_HALL) === 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
-        if (this.hallDi <= 0 || this._lastHallRateMax <= 0) {
+        if (this.hallDi <= 0) {
+            return { nSubsteps: 1, dtSub: dtMacro };
+        }
+        const safety = 0.5;
+        const dtHalf = 0.5 * Math.max(dtMacro, 0);
+        const softCap = Math.max(1, this.hallSubstepsMax | 0);
+        if (!this._lastHallRateValid) {
+            const n = Math.min(this._sourceSubstepHardCap(), softCap);
+            return { nSubsteps: n, dtSub: dtHalf / n };
+        }
+        if (this._lastHallRateMax <= 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
         // Each Strang half-step sub-step must satisfy dt_sub · rate ≤ safety.
         // Add a 50% safety margin and cap by user-configured max.
-        const safety = 0.5;
-        const dtHalf = 0.5 * Math.max(dtMacro, 0);
         const ideal = dtHalf * this._lastHallRateMax / safety;
-        const softCap = Math.max(1, this.hallSubstepsMax | 0);
         const required = Math.max(1, Math.ceil(ideal));
         const n = Math.min(this._sourceSubstepHardCap(), required);
         this._lastSourceSoftCapExceeded ||= required > softCap;
@@ -2324,19 +2409,27 @@ export class Sim {
      * a stability override. If the previous-step source rate says more
      * substeps are needed, we take them up to SOURCE_SUBSTEPS_HARD_MAX; the
      * compute-dt shader adds a source-cap macro limiter so steady workloads
-     * come back under the configured soft cap.
+     * come back under the configured soft cap. Cold/invalidated rate hints
+     * use the soft cap immediately instead of a single optimistic substep.
      */
     _conductionSizing(dtMacro) {
         if ((this.physicsFlags & FLAG_CONDUCTION) === 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
-        if (this.conductionKappa <= 0 || this._lastCondRateMax <= 0) {
+        if (this.conductionKappa <= 0) {
             return { nSubsteps: 1, dtSub: dtMacro };
         }
         const safety = 0.5;
         const dtHalf = 0.5 * Math.max(dtMacro, 0);
-        const ideal = dtHalf * this._lastCondRateMax / safety;
         const softCap = this._sourceSubstepCap();
+        if (!this._lastCondRateValid) {
+            const n = Math.min(this._sourceSubstepHardCap(), softCap);
+            return { nSubsteps: n, dtSub: dtHalf / n };
+        }
+        if (this._lastCondRateMax <= 0) {
+            return { nSubsteps: 1, dtSub: dtMacro };
+        }
+        const ideal = dtHalf * this._lastCondRateMax / safety;
         const required = Math.max(1, Math.ceil(ideal));
         const n = Math.min(this._sourceSubstepHardCap(), required);
         this._lastSourceSoftCapExceeded ||= required > softCap;
@@ -2611,51 +2704,80 @@ export class Sim {
 
         device.queue.submit([encoder.finish()]);
 
-        // Kick off async readback of dt_buf (dt_hyp, dt_parabolic,
-        // eta_max). Used for diagnostics, approximate physical-time
-        // accounting, and anomalous-eta sizing hints. Skip if a previous
-        // readback is still in-flight.
+        // Track approximate physical time for any skipped/busy dt readbacks.
+        // Base-MHD frames do not need a copy/map after every step; source and
+        // RKL2 feedback still ask for per-step reductions when active.
         this._pendingTimeSteps += 1;
-        this._maybeReadbackDt();
+        if (this._shouldReadbackDt()) this._maybeReadbackDt();
 
         b.swap();
         this.stepCount += 1;
-        // simTime is advanced by the actual GPU-computed dt, which we
-        // don't read back here; UI presents `stepCount * estimated_dt`
-        // when needed, and stats-display.js does its own readback of
-        // the dt buffer for accurate clock reporting.
+        // simTime advances when the next dt feedback packet lands. If idle
+        // readback is cadence-limited, _pendingTimeSteps folds the skipped
+        // steps into that later update.
     }
 
     /**
-     * Fire an async readback of dt_buf (3 f32 slots: dt_hyp, dt_parabolic,
-     * eta_max). Latest values populate _lastDtHyp / _lastDtParabolic /
-     * _lastEtaMax for the next step's RKL2 substep-count computation.
-     * Skips silently if a previous readback hasn't completed — at 60 fps
-     * the GPU finishes a 256² step in ~1–3 ms vs readback latency
-     * ~1–2 ms, so back-to-back submits sometimes overlap.
+     * Merge a dt_buf readback into the host-side feedback cache. StatsDisplay
+     * also calls this when it already has the dt packet, which lets idle
+     * base-MHD runs avoid a dedicated copy submit on every physics step.
+     */
+    syncDtFeedback(dt) {
+        const pending = this._pendingTimeSteps;
+        if (Number.isFinite(dt[0]) && dt[0] > 0) {
+            this._lastDtHyp = dt[0];
+            this.lastDt = dt[0];
+            if (pending > 0) this.simTime += dt[0] * pending;
+            this._pendingTimeSteps = 0;
+        } else if (pending > 0 && Number.isFinite(this._lastDtHyp) && this._lastDtHyp > 0) {
+            this.simTime += this._lastDtHyp * pending;
+            this._pendingTimeSteps = 0;
+        }
+        if (Number.isFinite(dt[1]) && dt[1] > 0) this._lastDtParabolic = dt[1];
+        if (Number.isFinite(dt[2])) {
+            this._lastEtaMax = dt[2];
+            this._lastEtaMaxValid = true;
+        }
+        if (Number.isFinite(dt[3]) && dt[3] >= 0) {
+            this._lastHallRateMax = dt[3];
+            this._lastHallRateValid = true;
+        }
+        if (Number.isFinite(dt[4]) && dt[4] >= 0) {
+            this._lastCondRateMax = dt[4];
+            this._lastCondRateValid = true;
+        }
+    }
+
+    _needsPerStepDtFeedback() {
+        const flags = this.physicsFlags || 0;
+        if ((flags & FLAG_HALL) !== 0 && this.hallDi > 0) return true;
+        if ((flags & FLAG_CONDUCTION) !== 0 && this.conductionKappa > 0) return true;
+        if ((this.eta || 0) > 0 || (this.etaAnomAlpha || 0) > 0) return true;
+        return false;
+    }
+
+    _shouldReadbackDt() {
+        if (this._needsPerStepDtFeedback()) return true;
+        return (this.stepCount % DT_READBACK_IDLE_STRIDE) === 0;
+    }
+
+    /**
+     * Fire an async readback of dt_buf (5 f32 slots: dt_hyp, dt_parabolic,
+     * eta_max, hall_rate_max, cond_rate_max). Skips silently if a previous
+     * readback hasn't completed.
      */
     _maybeReadbackDt() {
         if (this._dtReadbackBusy) return;
         if (!this._dtReadbackPool) return;
         this._dtReadbackBusy = true;
+        const generation = this._bufferGeneration;
+        const dtBuffer = this.buffers.dt;
         readbackSlice(this.device, this._dtReadbackPool,
-                      this.buffers.dt, 0, 20)
+                      dtBuffer, 0, 20)
             .then(ab => {
+                if (generation !== this._bufferGeneration || dtBuffer !== this.buffers.dt) return;
                 const arr = new Float32Array(ab);
-                const pending = this._pendingTimeSteps;
-                if (Number.isFinite(arr[0]) && arr[0] > 0) {
-                    this._lastDtHyp = arr[0];
-                    this.lastDt = arr[0];
-                    if (pending > 0) this.simTime += arr[0] * pending;
-                    this._pendingTimeSteps = 0;
-                } else if (pending > 0 && Number.isFinite(this._lastDtHyp) && this._lastDtHyp > 0) {
-                    this.simTime += this._lastDtHyp * pending;
-                    this._pendingTimeSteps = 0;
-                }
-                if (Number.isFinite(arr[1]) && arr[1] > 0) this._lastDtParabolic = arr[1];
-                if (Number.isFinite(arr[2])) this._lastEtaMax = arr[2];
-                if (Number.isFinite(arr[3]) && arr[3] >= 0) this._lastHallRateMax = arr[3];
-                if (Number.isFinite(arr[4]) && arr[4] >= 0) this._lastCondRateMax = arr[4];
+                this.syncDtFeedback(arr);
             })
             .catch(e => {
                 // Validation errors on stale buffers can fire during

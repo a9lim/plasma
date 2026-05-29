@@ -223,7 +223,7 @@ export class StatsDisplay {
         const F32 = 4;
 
         const specs = [
-            { buf: b.dt,   byteOffset: 0, byteSize: F32 },
+            { buf: b.dt,   byteOffset: 0, byteSize: 5 * F32 },
             { buf: b.cons_out, byteOffset: 0, byteSize: 24 * F32 },
         ];
 
@@ -237,6 +237,9 @@ export class StatsDisplay {
         if (generation !== this._bufferGeneration) return;
         const dtArr = new Float32Array(bufs[0]);
         const statsArr = new Float32Array(bufs[1]);
+        if (this.sim && typeof this.sim.syncDtFeedback === 'function') {
+            this.sim.syncDtFeedback(dtArr);
+        }
 
         this._compute(dtArr[0], statsArr);
     }

@@ -46,6 +46,24 @@ function toast(msg) {
     else console.log('[plasma]', msg);
 }
 
+function loadSavedState(ctx) {
+    const { sim, stats, probe } = ctx;
+    const s = localStorage.getItem(SAVE_KEY);
+    if (!s) {
+        toast('No saved state');
+        return { ok: false, buffersChanged: false };
+    }
+    const result = sim.loadState(s);
+    if (result && result.buffersChanged) {
+        stats.bindBuffers(sim.buffers);
+        probe.bindBuffers(sim.buffers);
+        ctx._refreshEtaSlider?.();
+    }
+    stats.updatePresetVisibility(sim.presetName);
+    toast(result && result.ok === false ? 'State load failed' : 'State loaded');
+    return result;
+}
+
 export function setupUI(simShell) {
     const sim = simShell.sim;
     const playBtn   = document.getElementById('playBtn');
@@ -111,7 +129,7 @@ export function setupUI(simShell) {
                 { label: 'Reset',        value: 'R' },
                 { label: 'View mode',    value: 'V' },
             ],
-            shortcuts: _buildShortcuts(simShell, sim, stats, probe),
+            shortcuts: _buildShortcuts(uiCtx),
             repo: 'https://github.com/a9lim/plasma',
         });
         if (aboutBtn) aboutBtn.addEventListener('click', () => aboutHandle.show && aboutHandle.show());
@@ -119,7 +137,7 @@ export function setupUI(simShell) {
 
     // ── Keyboard shortcuts ────────────────────────────────────
     if (typeof initShortcuts === 'function') {
-        initShortcuts(_buildShortcuts(simShell, sim, stats, probe),
+        initShortcuts(_buildShortcuts(uiCtx),
                       { helpTitle: 'Keyboard Shortcuts' });
     }
 
@@ -184,19 +202,7 @@ function wireTopbar(ctx) {
     });
     loadBtn.addEventListener('click', () => {
         try {
-            const s = localStorage.getItem(SAVE_KEY);
-            if (s) {
-                const result = sim.loadState(s);
-                if (result && result.buffersChanged) {
-                    stats.bindBuffers(sim.buffers);
-                    probe.bindBuffers(sim.buffers);
-                    ctx._refreshEtaSlider?.();
-                }
-                stats.updatePresetVisibility(sim.presetName);
-                toast(result && result.ok === false ? 'State load failed' : 'State loaded');
-            } else {
-                toast('No saved state');
-            }
+            loadSavedState(ctx);
         } catch (e) { console.warn('[plasma] load failed:', e); }
     });
 
@@ -274,7 +280,22 @@ function wireSettings(ctx) {
     const resGroup = root.querySelector('#ctrl-res-toggles');
     _forms.bindModeGroup(resGroup, 'res', (val) => {
         const n = parseInt(val, 10);
-        sim.setResolution(n);
+        const ok = sim.setResolution(n);
+        if (ok === false) {
+            const active = resGroup.querySelector(`.mode-btn[data-res="${sim.n}"]`);
+            resGroup.querySelectorAll('.mode-btn').forEach((btn) => {
+                const isActive = btn === active;
+                btn.classList.toggle('active', isActive);
+                btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+            });
+            const indicator = resGroup.querySelector('.mode-indicator');
+            if (indicator && active) {
+                indicator.style.width = `${active.offsetWidth}px`;
+                indicator.style.transform = `translateX(${active.offsetLeft}px)`;
+            }
+            toast('Resolution change failed');
+            return;
+        }
         stats.bindBuffers(sim.buffers);
         probe.bindBuffers(sim.buffers);
         // After re-instantiation, the renderer was rebuilt inside
@@ -554,7 +575,8 @@ function wirePointerPerturbation(ctx) {
 
 // ── keyboard shortcuts ───────────────────────────────────────
 
-function _buildShortcuts(simShell, sim, stats, probe) {
+function _buildShortcuts(ctx) {
+    const { simShell, sim } = ctx;
     const togglePause = () => {
         sim.setRunning(!sim.running);
         if (sim.running) simShell.lastTime = performance.now();
@@ -575,7 +597,7 @@ function _buildShortcuts(simShell, sim, stats, probe) {
     };
     const resetPreset = () => { sim.setPreset(sim.presetName); };
     const saveState = () => { try { localStorage.setItem(SAVE_KEY, sim.saveState()); toast('State saved'); } catch (e) {} };
-    const loadState = () => { try { const s = localStorage.getItem(SAVE_KEY); if (s) { sim.loadState(s); toast('State loaded'); } } catch (e) {} };
+    const loadState = () => { try { loadSavedState(ctx); } catch (e) {} };
     const switchTab = (tabName) => {
         const btn = document.querySelector(`.sidebar-tabs .tab-btn[data-tab="${tabName}"]`);
         if (btn) btn.click();
