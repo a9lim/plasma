@@ -56,13 +56,14 @@ plasma/
 ├── LICENSE                 ← AGPL-3.0
 ├── tests/                  ← physics-validation.{html,py} (21-row production matrix), physics-test-utils.js, alfven-convergence.html (CPAW), acoustic-convergence.html (linear acoustic), harris-diagnostic.{html,py}, README.md
 └── src/
-    ├── config.js           ← grid size, CFL, γ, η, ghost width, BC enums, uniform layout, FLAG_* bits, LIC constants
+    ├── config.js           ← single constants source: grid size, CFL, γ, η, ghost width, BC enums, uniform layout, FLAG_* bits, LIC constants, VIEW_RANGES, DEFAULT_PHYSICS_STATE, safety caps (SOURCE_SUBSTEPS_HARD_MAX / STS_COEFFS_MAX_S), pointer/playback/readback tuning, and the SLIDER_BOUNDS UI-range table
     ├── sim.js              ← orchestrator: dt → preStrang sources → RK3×3 → RKL2 → postStrang sources
     ├── presets.js          ← canonical tests + extended OT + driven wind/cloud + Session-15 validation presets
     ├── microphysics.js     ← uploaded cooling/heating/transport/opacity table (Sessions 18/20/21)
     ├── physical-scales.js  ← dimensioned ↔ code-unit calibration helpers (Session 19)
     ├── colormaps.js        ← viridis LUT (7-stop polynomial fit, sampled at 256 stops)
-    ├── ui.js               ← shared-* module wiring (Phase 5; Session 22 coherence trim moved extended physics out of the gear dropdown)
+    ├── panel-ui.js          ← shared sidebar control builders (section / sliderRow / epSlider / modeRow / toggleRow) used by ui.js + physics-panel.js
+    ├── ui.js               ← shared-* module wiring (Phase 5; Session 22+ coherence: gear dropdown removed, its knobs folded into the Settings tab Numerics + Render sections)
     ├── physics-panel.js    ← Physics sidebar tab: 8 extended-physics sections (Session 22)
     ├── stats-display.js    ← Stats tab: energy / β / maxima / ∇·B / reconnection / conservation drift — Session 22 trim removed Health + Clock; NaN auto-pause kept as safety
     ├── probe.js            ← Probe tab: cell sampling + mini time-series
@@ -351,6 +352,7 @@ extended-physics flags via `preset.physics`):
 
 | Key                     | Physics opt-in                                                                       | Purpose                                                          |
 |-------------------------|--------------------------------------------------------------------------------------|------------------------------------------------------------------|
+| `sandbox`               | **Full stack** (`EXTENDED_PHYSICS_FLAGS`) on a uniform ρ=p=1, B_x=1, v=0 medium — **the default landing preset** | All-physics blank canvas: quiescent until the pointer perturbs it, then every term responds. Shear/bulk ν=0 and radiation c=0.01 keep dt ~1e-4 (see note below). |
 | `orszag-tang-extended`  | Full extended stack (cooling/heating, Hall, conduction, gravity, ambipolar, etc.)    | Representative source-physics demo on top of OT IC               |
 | `driven-wind-cloud`     | Driven west inflow + tabulated cooling/heating + conduction + Hall + ambipolar + Biermann + viscosity | Open-boundary realism exercise                            |
 | `hall-whistler`         | Hall only (`p_e/p = 0`)                                                              | Right-going whistler branch, eigenmode IC (Tóth/Ma/Gombosi)      |
@@ -387,13 +389,19 @@ Called from `main.js` after `sim.init()`. Mounts the topbar, four-tab
 sidebar (Settings / Physics / Stats / Probe), and the stats/probe
 readback paths.
 
-The Settings tab carries the universal user-facing controls (preset,
-view mode, η + grid Reynolds floor, resolution, per-edge BCs + driven
-inflow state). The Physics tab carries the extended source layer
+The Settings tab carries the universal user-facing controls, in this
+order: preset, view mode, Resistivity η (η + grid Reynolds floor +
+anomalous α + J_crit), Numerics (CFL / γ / p-floor / source-substep cap
+/ EMF mode / positivity guard), Render (LIC intensity + drift),
+resolution, per-edge BCs + driven inflow state. The static preset / view
+/ η / resolution / BC blocks live in `index.html`; the Numerics + Render
+sections and the η-anomalous rows are built in JS by `wireSettings`
+(ui.js) and inserted between the Resistivity and Resolution sections,
+using the shared builders in `panel-ui.js`. The Physics tab carries the
+extended source layer
 (Hall / Cooling & Heating / Conduction / Radiation / Viscosity /
 Non-ideal Ohm / Gravity / Geometry & sponge) — built by
-`buildPhysicsPanel(root, sim)` using the same `.panel-section` +
-`.group-label` idioms as the Settings tab. The Stats tab carries
+`buildPhysicsPanel(root, sim)` from the same `panel-ui.js` builders. The Stats tab carries
 energy / β / maxima / ∇·B / reconnection (Harris only) / conservation
 drift; per the Session 22 coherence pass it no longer surfaces the
 NaN-cell / floor-cell / dt-min counters (Health) or the per-step
@@ -401,12 +409,27 @@ substep counts and GPU step time (Clock) — those were debug surface
 during the Session 14–21 hardening pass. The NaN auto-pause is
 preserved as a safety mechanism. The Probe tab is unchanged.
 
-The settings gear dropdown is trimmed to the universal numerics +
-render knobs (CFL / γ / p-floor / η-anom α + J_crit / source-substep
-cap / EMF mode / positivity guard / LIC intensity + drift). Keyboard
-shortcuts: 1=Settings, 2=Physics, 3=Stats, 4=Probe.
+There is no topbar settings gear dropdown — the Session 22+ coherence
+pass removed it and folded its numerics + render knobs into the
+Settings tab (Numerics + Render sections above), so every control lives
+in a sidebar tab and `shared-settings.js` is no longer a dependency.
+Keyboard shortcuts: 1=Settings, 2=Physics, 3=Stats, 4=Probe.
 
-The preset dropdown surfaces 10 starting points; nine validation /
+`sandbox` is the default landing preset (`sim.presetName` / the
+constructor load both point at it). It enables every `FLAG_*` bit on a
+uniform medium so the Physics tab shows the whole stack armed, but two
+diffusive terms are deliberately gentled so the macro timestep stays
+interactive at 256²: **shear/bulk viscosity = 0** (the conservative
+Spitzer `T^(5/2)` dt-sizing, `MICRO_TRANSPORT_MAX_SCALE = 1e5`, collapses
+dt to ~3e-7 at ν=1e-3 — shock viscosity carries the enabled-viscosity
+demo instead) and **radiation `c = 0.01`** (FLD diffusion is stiff; c=1
+drives dt to ~1e-6). With those, dt ≈ 1e-4 — 3× the `orszag-tang-extended`
+full-stack preset. Everything else (Hall d_i=0.02, conduction, ambipolar,
+Biermann, electron inertia, cooling/heating, gravity, shock viscosity)
+runs at meaningful values; the uniform LTE background stays exactly steady
+until the pointer creates the gradients the source terms act on.
+
+The preset dropdown surfaces 11 starting points; nine validation /
 cylindrical presets stay in `src/presets.js` for the validation
 matrix and are reachable via `sim.setPreset('...')` — see
 `about.md` for the full list.
@@ -493,7 +516,7 @@ runs once per displayed frame. Render chain:
   blue-noise upgrade (void-and-cluster).
 * Phase animation: wall-clock dt (not sim time), clamped to 100 ms to
   handle tab refocus.
-* UI: LIC intensity + drift sliders in the advanced settings dropdown.
+* UI: LIC intensity + drift sliders in the Settings tab Render section.
 
 ### LIC bind-group layout
 
@@ -888,9 +911,10 @@ clause.
 Compute path: `shared-tokens.js`, `shared-base.css`, `shared-utils.js`.
 
 UI: `shared-toolbar.js`, `shared-forms.js`, `shared-dropdown.js`,
-`shared-settings.js`, `shared-about.js`, `shared-tabs.js`,
+`shared-about.js`, `shared-tabs.js`,
 `shared-icons.js`, `shared-shortcuts.js`, `shared-sparkline.js`,
-`shared-touch.js`, `shared-haptics.js`.
+`shared-touch.js`, `shared-haptics.js`. (`shared-settings.js` was
+dropped with the gear dropdown — all controls now live in sidebar tabs.)
 
 `shared-touch.js` is loaded only so `_toolbar.initSidebar` can wire
 swipe-to-dismiss on the sidebar's `.sheet-handle`; plasma calls no

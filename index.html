@@ -48,7 +48,6 @@
     <script defer src="/shared-icons.js"></script>
     <script defer src="/shared-toolbar.js"></script>
     <script defer src="/shared-forms.js"></script>
-    <script defer src="/shared-settings.js"></script>
     <script defer src="/shared-dropdown.js"></script>
     <script defer src="/shared-touch.js"></script>
     <script defer src="/shared-sparkline.js"></script>
@@ -307,7 +306,6 @@
             <button id="loadBtn" class="tool-btn" title="Load state" aria-label="Load state" data-icon="load"></button>
             <div class="tool-sep"></div>
             <button id="themeToggleBtn" class="tool-btn" title="Toggle Theme" aria-label="Toggle theme" data-icon="theme"></button>
-            <button id="settings-btn" class="tool-btn" title="Settings" aria-label="Settings" data-icon="gear"></button>
             <button id="about-btn" class="tool-btn" aria-label="About" title="About" data-icon="about"></button>
             <button id="panelToggle" class="tool-btn" title="Toggle sidebar" aria-label="Toggle settings panel" aria-expanded="false" data-icon="menu"></button>
         </div>
@@ -331,7 +329,8 @@
                     <div class="panel-section">
                         <h2 class="group-label">Preset</h2>
                         <select id="ctrl-preset" class="sim-select" aria-label="Preset">
-                            <option value="orszag-tang" selected>Orszag-Tang vortex</option>
+                            <option value="sandbox" selected>Sandbox (all physics)</option>
+                            <option value="orszag-tang">Orszag-Tang vortex</option>
                             <option value="orszag-tang-extended">Orszag-Tang + extended physics</option>
                             <option value="driven-wind-cloud">Driven wind + cloud</option>
                             <option value="harris">Harris current sheet</option>

@@ -49,7 +49,7 @@ import { PlasmaBuffers } from './gpu/buffers.js';
 import { createPipelines } from './gpu/pipelines.js';
 import { PlasmaRenderer } from './gpu/render.js';
 import { ReadbackPool, readbackSlice } from './gpu/readback.js';
-import { makeOrszagTangPreset, PRESETS } from './presets.js';
+import { makeSandboxPreset, PRESETS } from './presets.js';
 import { VIRIDIS } from './colormaps.js';
 import { MICRO_TRANSPORT_MAX_SCALE } from './microphysics.js';
 import {
@@ -59,62 +59,14 @@ import {
     FLAG_COOLING, FLAG_GRAVITY_EXT, FLAG_GRAVITY_SELF, FLAG_HALL, FLAG_CONDUCTION,
     FLAG_AMBIPOLAR, FLAG_BIERMANN, FLAG_VISCOSITY, FLAG_GEOMETRY,
     FLAG_SPONGE, FLAG_HEATING, FLAG_RADIATION, FLAG_ELECTRON_INERTIA,
-    BASE_PHYSICS_FLAGS, EXTENDED_SOURCE_FLAGS,
-    EMF_MODE_GS_UPWIND, COOLING_CURVE_TABULATED,
-    GEOMETRY_CARTESIAN, GEOMETRY_CYLINDRICAL,
-    GRAVITY_BOUNDARY_PERIODIC,
+    EXTENDED_SOURCE_FLAGS,
+    GEOMETRY_CYLINDRICAL,
     GRAVITY_SOLVER_MULTIGRID, GRAVITY_SOLVER_JACOBI,
+    DEFAULT_PHYSICS_STATE, SOURCE_SUBSTEPS_HARD_MAX, VIEW_RANGES,
+    ETA_ANOM_JCRIT_DEFAULT,
 } from './config.js';
 
 const WG = WORKGROUP;
-const SOURCE_SUBSTEPS_HARD_MAX = 128;
-const DEFAULT_PHYSICS_STATE = Object.freeze({
-    physicsFlags: BASE_PHYSICS_FLAGS,
-    emfMode: EMF_MODE_GS_UPWIND,
-    hallDi: 0.02,
-    hallSubstepsMax: 8,
-    coolingLambda0: 0.01,
-    coolingTFloor: 1.0e-4,
-    coolingTRef: 1.0,
-    coolingCurveMode: COOLING_CURVE_TABULATED,
-    conductionKappa: 1.0e-3,
-    conductionIsoFrac: 0.1,
-    conductionSatFrac: 0.0,
-    gravityGx: 0.0,
-    gravityGy: 0.0,
-    gravityG: 1.0e-3,
-    gravityPoissonIters: 30,
-    gravityBoundaryMode: GRAVITY_BOUNDARY_PERIODIC,
-    gravitySolverMode: GRAVITY_SOLVER_MULTIGRID,
-    hallElectronPressureFrac: 0.0,
-    coolingMetallicity: 1.0,
-    heatingGamma0: 0.0,
-    heatingDensityExp: 1.0,
-    heatingTCut: 0.0,
-    ambipolarEta: 0.0,
-    biermannCoeff: 0.0,
-    neutralFrac: 0.0,
-    ionizationT0: 1.0,
-    viscosityNu: 0.0,
-    viscosityBulk: 0.0,
-    viscosityAnisoFrac: 0.0,
-    viscosityShock: 0.0,
-    sourceSubstepsMax: 8,
-    geometryMode: GEOMETRY_CARTESIAN,
-    geometryRMin: 0.0,
-    gravitySoftening: 0.0,
-    gravityPoissonOmega: 1.0,
-    spongeWidth: 0.0,
-    spongeStrength: 0.0,
-    coolingTableMix: 0.0,
-    radiationC: 0.0,
-    radiationKappaAbs: 0.0,
-    radiationKappaScat: 0.0,
-    radiationConst: 1.0,
-    radiationFloor: 1.0e-12,
-    electronInertiaLength: 0.0,
-    electronInertiaDamping: 0.0,
-});
 
 function defaultBCConfig() {
     return {
@@ -148,7 +100,7 @@ export class Sim {
         // η(|J|) = η_0 + α · max(0, |J|/J_crit − 1)² closure. J_crit is
         // in code-units (J_z is computed from face B via central diff).
         this.etaAnomAlpha = 0;
-        this.etaAnomJcrit = 10.0;
+        this.etaAnomJcrit = ETA_ANOM_JCRIT_DEFAULT;
         // Per-preset η floor coefficient — η_min = etaFloorCoeff · dx
         // enforces a grid magnetic Reynolds limit so current-sheet
         // thinning can't outrun dissipation and NaN-cascade. 0 disables
@@ -190,7 +142,7 @@ export class Sim {
         // UI integration state — owned by Sim so save/load can capture it.
         this.running     = true;
         this.speedScale  = 1;
-        this.presetName  = 'orszag-tang';
+        this.presetName  = 'sandbox';
 
         // LIC state — phase animates per render frame in wall-clock time;
         // intensity is UI-controlled. Drift constants stay fixed for now
@@ -240,7 +192,7 @@ export class Sim {
 
         // Phase 4 default preset still Orszag-Tang for smoke check;
         // Phase 5 wires the dropdown for Harris/etc.
-        this.loadPreset(makeOrszagTangPreset(this.n));
+        this.loadPreset(makeSandboxPreset(this.n));
         this.buffers.uploadLUT(VIRIDIS);
 
         const seed = new Float32Array([1e-4]);
@@ -442,20 +394,12 @@ export class Sim {
     setViewMode(mode) {
         this.viewMode = mode;
         // Pick a sensible default colormap window per view if the caller
-        // hasn't overridden. The Sim does not own a colormap-LUT switch
-        // yet; that lands in Phase 6 alongside LIC. For now we just set
-        // the linear-window endpoints.
-        switch (mode) {
-            case 0: this.viewMin = 0.05; this.viewMax = 1.10; break; // ρ
-            case 1: this.viewMin = 0.01; this.viewMax = 1.00; break; // p
-            case 2: this.viewMin = 0.0;  this.viewMax = 1.5;  break; // |v|
-            case 3: this.viewMin = 0.0;  this.viewMax = 2.0;  break; // |B|
-            case 4: this.viewMin = -3.0; this.viewMax = 3.0;  break; // Jz (signed)
-            case 5: this.viewMin = 0.0;  this.viewMax = 1.0;  break; // T (p/ρ)
-            case 6: this.viewMin = 0.0;  this.viewMax = 1.0e-3; break; // |q| (κ_∥·dT/dx scale)
-            case 7: this.viewMin = -5e-3; this.viewMax = 5e-3; break; // φ (signed)
-            case 8: this.viewMin = 0.0; this.viewMax = 1.0; break; // entropy proxy
-            default: break;
+        // hasn't overridden. Windows live in config.js VIEW_RANGES, keyed
+        // by the VIEW_* enum. Unknown modes leave the current window.
+        const range = VIEW_RANGES[mode];
+        if (range) {
+            this.viewMin = range.min;
+            this.viewMax = range.max;
         }
         this._pushUniforms();
     }

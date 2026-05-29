@@ -222,3 +222,207 @@ export const LIC_DRIFT_Y = 0.0;
 // Epsilon below which |B| is treated as effectively zero (trace halts).
 // Prevents runaway sampling in field-free regions.
 export const LIC_B_EPS = 1.0e-8;
+
+// ── View colormap windows ──────────────────────────────────────────────
+// Default linear (view_min, view_max) normalization endpoints per view
+// mode, keyed by the VIEW_* enum above. Presets may override via
+// preset.viewMin / preset.viewMax; sim.setViewMode falls back to these.
+// Signed fields (Jz, φ) use symmetric windows. Moved out of a switch in
+// sim.js so all visualization clamps live next to the enum they key on.
+export const VIEW_RANGES = {
+    [VIEW_DENSITY]:  { min: 0.05,  max: 1.10 },   // ρ
+    [VIEW_PRESSURE]: { min: 0.01,  max: 1.00 },   // p
+    [VIEW_VMAG]:     { min: 0.0,   max: 1.5 },    // |v|
+    [VIEW_BMAG]:     { min: 0.0,   max: 2.0 },    // |B|
+    [VIEW_JZ]:       { min: -3.0,  max: 3.0 },    // J_z (signed)
+    [VIEW_T]:        { min: 0.0,   max: 1.0 },    // T = p/ρ
+    [VIEW_QMAG]:     { min: 0.0,   max: 1.0e-3 }, // |q| (κ_∥·dT/dx scale)
+    [VIEW_PHI]:      { min: -5e-3, max: 5e-3 },   // φ (signed)
+    [VIEW_ENTROPY]:  { min: 0.0,   max: 1.0 },    // K = p/ρ^γ
+};
+
+// ── Solver safety caps ──────────────────────────────────────────────────
+// Hard ceiling on explicit source sub-cycles within one macro Δt. The
+// user-facing soft caps (hallSubstepsMax / sourceSubstepsMax) are
+// performance targets; this is the stability backstop the host clamps to
+// when an estimate would exceed it. See sim.js _sourceSubsteps.
+export const SOURCE_SUBSTEPS_HARD_MAX = 128;
+
+// Max RKL2 super-step length we will allocate coefficient/meta buffers
+// for. Caps a single resistive super-step so it never blocks the UI
+// thread; the host clamps s to this. See gpu/buffers.js.
+export const STS_COEFFS_MAX_S = 100;
+
+// ── Extended-physics default state ──────────────────────────────────────
+// Fallback scalars + flags applied on every loadPreset for fields a preset
+// doesn't override. Canonical verification presets keep these values but
+// leave the source-flag bits clear (extended physics is opt-in). Lives here
+// (not sim.js) so every tunable default sits in one file; references the
+// flag / enum constants defined above. The `physics` block is part of the
+// save/load schema — see sim.js _applyPhysicsConfig.
+export const DEFAULT_PHYSICS_STATE = Object.freeze({
+    physicsFlags: BASE_PHYSICS_FLAGS,
+    emfMode: EMF_MODE_GS_UPWIND,
+    hallDi: 0.02,
+    hallSubstepsMax: 8,
+    coolingLambda0: 0.01,
+    coolingTFloor: 1.0e-4,
+    coolingTRef: 1.0,
+    coolingCurveMode: COOLING_CURVE_TABULATED,
+    conductionKappa: 1.0e-3,
+    conductionIsoFrac: 0.1,
+    conductionSatFrac: 0.0,
+    gravityGx: 0.0,
+    gravityGy: 0.0,
+    gravityG: 1.0e-3,
+    gravityPoissonIters: 30,
+    gravityBoundaryMode: GRAVITY_BOUNDARY_PERIODIC,
+    gravitySolverMode: GRAVITY_SOLVER_MULTIGRID,
+    hallElectronPressureFrac: 0.0,
+    coolingMetallicity: 1.0,
+    heatingGamma0: 0.0,
+    heatingDensityExp: 1.0,
+    heatingTCut: 0.0,
+    ambipolarEta: 0.0,
+    biermannCoeff: 0.0,
+    neutralFrac: 0.0,
+    ionizationT0: 1.0,
+    viscosityNu: 0.0,
+    viscosityBulk: 0.0,
+    viscosityAnisoFrac: 0.0,
+    viscosityShock: 0.0,
+    sourceSubstepsMax: 8,
+    geometryMode: GEOMETRY_CARTESIAN,
+    geometryRMin: 0.0,
+    gravitySoftening: 0.0,
+    gravityPoissonOmega: 1.0,
+    spongeWidth: 0.0,
+    spongeStrength: 0.0,
+    coolingTableMix: 0.0,
+    radiationC: 0.0,
+    radiationKappaAbs: 0.0,
+    radiationKappaScat: 0.0,
+    radiationConst: 1.0,
+    radiationFloor: 1.0e-12,
+    electronInertiaLength: 0.0,
+    electronInertiaDamping: 0.0,
+});
+
+// Anomalous-resistivity default activation threshold J_crit (code units).
+// α = 0 (the default) keeps the constant-η baseline; J_crit only matters
+// once the η-anomalous slider arms α > 0. See sim.js.
+export const ETA_ANOM_JCRIT_DEFAULT = 10.0;
+
+// ── Pointer perturbation tuning ─────────────────────────────────────────
+// Left-drag deposits Gaussian momentum (δv ≈ DRAG_VSCALE × Δcell at the
+// center cell); right-drag deposits a divergence-free B rotation
+// (δB ≈ EXCITE_BSCALE × Δcell). σ defaults to PERTURB_SIGMA_CELLS cells at
+// the live resolution so the footprint is visible without dominating.
+// PERTURB_MAX_DCELL clamps per-event drag so fast flicks don't blow up a
+// cell. Consumed by ui.js wirePointerPerturbation.
+export const PERTURB_SIGMA_CELLS = 4.0;
+export const DRAG_VSCALE         = 0.25;  // cell-velocity per cell-of-drag
+export const EXCITE_BSCALE       = 0.20;  // code-B per cell-of-drag
+export const PERTURB_MAX_DCELL   = 6.0;   // per-event drag clamp (cells)
+
+// ── Playback + diagnostics cadence ──────────────────────────────────────
+// Topbar speed-cycle multipliers (steps per displayed frame). Index 0 is
+// the startup value.
+export const SPEED_OPTIONS = [1, 2, 4, 8, 16];
+
+// Stats sparkline ring-buffer capacity (≈ 20 s at 12 Hz). See stats-display.js.
+export const STATS_SPARK_CAP = 240;
+
+// Stats readback cadence in render frames between GPU→CPU stat copies,
+// resolution-adaptive (≈12 / 6 / 3 Hz at 60 fps). Coarser at high res so
+// the readback never dominates the frame budget. See stats-display.js.
+export const READBACK_CADENCE = Object.freeze({
+    lo:  5,   // n < 512
+    mid: 10,  // n >= 512
+    hi:  20,  // n >= 1024
+});
+
+// Probe (hover-sample) readback frequency, independent of render cadence.
+export const PROBE_HZ = 10;  // 100 ms interval
+
+// Dual-energy switchover: trust the independently-advected internal energy
+// for pressure only when it exceeds this fraction of total E (else the
+// E − KE − B² subtraction is well-conditioned). See probe.js / shaders.
+export const DUAL_ENERGY_FRACTION = 1e-3;
+
+// ── UI slider tuning ────────────────────────────────────────────────────
+// η log-slider snap-to-0 floor: values at or below this read as "0" (ideal
+// MHD) when the active preset has no grid-Reynolds η floor. See ui.js.
+export const ETA_SLIDER_MIN_FLOOR = -6.5;
+
+// Every interactive slider's geometry in one table so ranges can be
+// retuned without hunting through ui.js / physics-panel.js. Two shapes:
+//   • linear sliders        → { min, max, step }
+//   • log10 / snap-off sliders → { lo, hi, step }  (the builder extends the
+//     range 0.5 decade below `lo` for the off zone; off boundary = lo−0.05)
+// Linear sliders that snap to 0 at the bottom (heatingTCut, radiation κ's,
+// viscosity bulk/shock, electron damping) use { min, max, step } and treat
+// `min + 0.05` as their off boundary. Keys are grouped by the panel section
+// they render in.
+export const SLIDER_BOUNDS = Object.freeze({
+    // Settings ▸ Numerics
+    cfl:                { min: 0.1, max: 0.8, step: 0.05 },
+    gamma:              { min: 1.1, max: 2.0, step: 0.05 },
+    pressureFloorLog:   { min: -8,  max: -3,  step: 0.5 },   // log10(p_floor)
+    sourceSubstepsCap:  { min: 1,   max: 64,  step: 1 },
+
+    // Settings ▸ Resistivity η
+    etaAnomAlpha:       { lo: -6, hi: 0, step: 0.25 },        // log10; snap-to-0, no flag
+    etaAnomJcrit:       { min: 1, max: 100, step: 1 },
+
+    // Settings ▸ Render
+    licIntensity:       { min: 0, max: 2, step: 0.05 },
+    licDrift:           { min: 0, max: 4, step: 0.1 },
+
+    // Physics ▸ Hall
+    hallDi:             { lo: -4, hi: 0, step: 0.25 },        // log10; FLAG_HALL
+    hallElectronPe:     { min: 0, max: 1, step: 0.05 },       // p_e/p
+
+    // Physics ▸ Cooling & Heating
+    coolingLambda0:     { lo: -4, hi: 0, step: 0.25 },        // log10; FLAG_COOLING
+    coolingMetallicity: { min: 0, max: 3, step: 0.1 },
+    heatingGamma0:      { lo: -6, hi: 0, step: 0.25 },        // log10; FLAG_HEATING
+    heatingDensityExp:  { min: 0, max: 2, step: 0.1 },
+    heatingTCut:        { min: -4.5, max: 2, step: 0.25 },    // log10; snap-to-0
+
+    // Physics ▸ Conduction
+    conductionKappa:    { lo: -6, hi: 0, step: 0.25 },        // log10; FLAG_CONDUCTION
+    conductionIsoFrac:  { min: 0, max: 1, step: 0.05 },
+    conductionSatFrac:  { min: 0, max: 1, step: 0.05 },
+
+    // Physics ▸ Radiation
+    radiationC:         { lo: -2, hi: 2, step: 0.25 },        // log10; FLAG_RADIATION
+    radiationKappaAbs:  { min: -4.5, max: 2, step: 0.25 },    // log10; snap-to-0
+    radiationKappaScat: { min: -4.5, max: 2, step: 0.25 },    // log10; snap-to-0
+    radiationConst:     { min: -4, max: 1, step: 0.25 },      // log10 a_r
+
+    // Physics ▸ Viscosity
+    viscosityNu:        { lo: -7, hi: -1, step: 0.25 },       // log10; FLAG_VISCOSITY
+    viscosityBulk:      { min: -7.5, max: -1, step: 0.25 },   // log10; snap-to-0
+    viscosityAnisoFrac: { min: 0, max: 1, step: 0.05 },
+    viscosityShock:     { min: -7.5, max: -1, step: 0.25 },   // log10; snap-to-0
+
+    // Physics ▸ Non-ideal Ohm
+    ambipolarEta:       { lo: -7, hi: -1, step: 0.25 },       // log10; FLAG_AMBIPOLAR
+    neutralFrac:        { min: 0, max: 1, step: 0.05 },
+    ionizationT0:       { min: -4, max: 2, step: 0.25 },      // log10
+    biermannCoeff:      { lo: -8, hi: -1, step: 0.25 },       // log10; FLAG_BIERMANN
+    electronInertiaLen: { lo: -5, hi: -1, step: 0.25 },       // log10; FLAG_ELECTRON_INERTIA
+    electronDamping:    { min: -4.5, max: 0, step: 0.25 },    // log10; snap-to-0
+
+    // Physics ▸ Gravity
+    gravityG:           { lo: -4, hi: 2, step: 0.25 },        // log10; FLAG_GRAVITY_SELF
+    gravityPoissonIters:{ min: 0, max: 128, step: 1 },
+    gravitySoftening:   { min: 0, max: 0.2, step: 0.005 },
+    gravityPoissonOmega:{ min: 0.2, max: 1.8, step: 0.05 },
+
+    // Physics ▸ Geometry & sponge
+    geometryRMin:       { min: 0, max: 0.25, step: 0.005 },
+    spongeWidth:        { min: 0, max: 32, step: 1 },
+    spongeStrength:     { lo: -3, hi: 1, step: 0.25 },        // log10; FLAG_SPONGE
+});

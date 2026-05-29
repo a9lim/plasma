@@ -54,6 +54,7 @@ import {
     GRID_N, GHOST_WIDTH, UNIFORM_BUFFER_SIZE, BC_UNIFORM_BUFFER_SIZE,
     VIEW_DENSITY, BC_PERIODIC, ETA_DEFAULT, PRESSURE_FLOOR,
     LIC_NOISE_N, LIC_INTENSITY_DEFAULT, LIC_DRIFT_X, LIC_DRIFT_Y, LIC_NOISE_SEED,
+    STS_COEFFS_MAX_S,
 } from '../config.js';
 import { buildMicrophysicsTable, MICRO_TABLE_ENTRIES, MICRO_STRIDE } from '../microphysics.js';
 
@@ -152,11 +153,10 @@ export class PlasmaBuffers {
 
         // RKL2 coefficient buffer — packed (μ, ν, μ̃, γ̃) per substep.
         // Re-uploaded once per super-step (s coefficients × 4 f32).
-        // STS_COEFFS_MAX_S = 100 caps in-browser super-step length —
+        // STS_COEFFS_MAX_S (config.js) caps in-browser super-step length —
         // Athena++ uses 200 in batch runs; 100 is safer for an
         // interactive sim (a single super-step never blocks the UI
         // for more than a few ms).
-        const STS_COEFFS_MAX_S = 100;
         this.sts_coeffs_max_s = STS_COEFFS_MAX_S;
         this.sts_coeffs = device.createBuffer({
             label: 'plasma.sts_coeffs',

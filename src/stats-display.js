@@ -26,8 +26,7 @@
  */
 
 import { readbackBatch, ReadbackPool } from './gpu/readback.js';
-
-const SPARK_CAP = 240;
+import { STATS_SPARK_CAP as SPARK_CAP, READBACK_CADENCE } from './config.js';
 
 /** Helper: create a DOM element with optional class + text. */
 function el(tag, cls, text) {
@@ -213,9 +212,9 @@ export class StatsDisplay {
     }
 
     _cadence() {
-        if (this.sim.n >= 1024) return 20;
-        if (this.sim.n >= 512)  return 10;
-        return 5;
+        if (this.sim.n >= 1024) return READBACK_CADENCE.hi;
+        if (this.sim.n >= 512)  return READBACK_CADENCE.mid;
+        return READBACK_CADENCE.lo;
     }
 
     async _doReadback() {

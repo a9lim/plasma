@@ -17,9 +17,14 @@ mesh. The constrained-transport update is the important structural choice:
 face-centered magnetic fluxes are advanced by the curl of a corner electric
 field, so the discrete divergence of B cancels by construction.
 
-The default Orszag-Tang preset is a compact turbulence and shock test. It
-starts smooth, then folds into interacting shocks, magnetic islands, and dense
-current sheets. Harris current sheet is the reconnection test: a pressure-
+The default Sandbox preset is a uniform, quiescent medium with the full
+extended-physics stack enabled. Nothing moves on its own — a uniform state has
+no gradients for the source terms to act on — so you drive it with the pointer:
+left-drag pushes the plasma, right-drag twists the field, and currents,
+reconnection, and the rest of the physics develop from there. Orszag-Tang is a
+compact turbulence and shock test. It starts smooth, then folds into
+interacting shocks, magnetic islands, and dense current sheets. Harris current
+sheet is the reconnection test: a pressure-
 balanced sheet with a small perturbation, resistivity, and open vertical
 boundaries. Brio-Wu and Sod are shock tubes, useful because they isolate wave
 fan structure in one dimension. The extended Orszag-Tang and driven wind/cloud
@@ -36,7 +41,7 @@ opt into the source physics.
 
 ## Hidden presets
 
-The preset dropdown intentionally surfaces only the ten presets that are
+The preset dropdown intentionally surfaces only the eleven presets that are
 useful as exploratory starting points. Nine more are kept in
 `src/presets.js` for the validation harness and for hand-driven testing:
 

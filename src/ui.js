@@ -20,26 +20,17 @@ import {
     VIEW_DENSITY, VIEW_PRESSURE, VIEW_VMAG, VIEW_BMAG, VIEW_JZ,
     VIEW_T, VIEW_QMAG, VIEW_PHI, VIEW_ENTROPY,
     FLAG_POSITIVITY, EMF_MODE_BS_MEAN, EMF_MODE_GS_UPWIND,
+    SLIDER_BOUNDS, ETA_SLIDER_MIN_FLOOR, SPEED_OPTIONS,
+    PERTURB_SIGMA_CELLS, DRAG_VSCALE, EXCITE_BSCALE, PERTURB_MAX_DCELL,
 } from './config.js';
 import { StatsDisplay } from './stats-display.js';
 import { Probe } from './probe.js';
 import { buildPhysicsPanel } from './physics-panel.js';
+import { section, sliderRow, epSlider, modeRow, toggleRow } from './panel-ui.js';
 
 const SAVE_KEY = 'plasma.state.v1';
 const THEME_KEY = 'plasma-theme';
-const SPEED_OPTIONS = [1, 2, 4, 8, 16];
-
-// ── Pointer perturbation tuning (locked decisions; live in code) ─────
-// Drag = left-click, deposits Gaussian momentum (δv ≈ DRAG_VSCALE × Δcell
-// at the center cell). Excite = right-click, divergence-free B rotation
-// (δB ≈ EXCITE_BSCALE × Δcell). σ is in domain units; defaults to 4 cells
-// at the current resolution so the perturbation footprint is large
-// enough to be visible without dominating the field.
-const PERTURB_SIGMA_CELLS  = 4.0;
-const DRAG_VSCALE          = 0.25;   // cell-velocity per cell-of-drag
-const EXCITE_BSCALE        = 0.20;   // code-B per cell-of-drag
-// Per-event clamp so very fast flicks don't deposit absurd impulses.
-const PERTURB_MAX_DCELL    = 6.0;
+const B = SLIDER_BOUNDS;
 
 const BC_NAME_TO_ID = {
     periodic: BC_PERIODIC,
@@ -65,7 +56,6 @@ export function setupUI(simShell) {
     const loadBtn   = document.getElementById('loadBtn');
     const themeBtn  = document.getElementById('themeToggleBtn');
     const aboutBtn  = document.getElementById('about-btn');
-    const settingsBtn = document.getElementById('settings-btn');
     const panelToggle = document.getElementById('panelToggle');
     const panel       = document.getElementById('control-panel');
     const panelClose  = document.getElementById('panelClose');
@@ -106,64 +96,12 @@ export function setupUI(simShell) {
         stats.tick();
     };
 
-    // ── Settings gear dropdown — numerics + render only ─────────
-    // The extended-physics scalars (Hall, cooling, conduction, ...)
-    // moved to the dedicated Physics sidebar tab during the Session 22
-    // coherence pass; the gear now carries just the universal solver
-    // knobs, the EMF / positivity switches that don't fit a section,
-    // the η-anomaly pair (lives next to η morally but the η slider's
-    // already its own sidebar section), and the LIC render controls.
-    if (settingsBtn && typeof _settings !== 'undefined') {
-        _settings.create(settingsBtn, [
-            { type: 'slider', label: 'CFL', min: 0.1, max: 0.8, step: 0.05,
-              value: sim.cfl, format: v => v.toFixed(2),
-              onChange: v => sim.setCFL(v) },
-            { type: 'slider', label: 'γ', min: 1.1, max: 2.0, step: 0.05,
-              value: sim.gamma, format: v => v.toFixed(2),
-              onChange: v => sim.setGamma(v) },
-            { type: 'slider', label: 'p-floor (log10)', min: -8, max: -3, step: 0.5,
-              value: Math.log10(sim.pressureFloor), format: v => '1e' + v.toFixed(1),
-              onChange: v => sim.setPressureFloor(Math.pow(10, v)) },
-            // Anomalous resistivity — α = 0 disables the boost (sim
-            // runs with constant η_0). α > 0 activates Birn-2001-style
-            // |J|>J_crit enhanced resistivity for fast reconnection.
-            { type: 'slider', label: 'η-anom α (log10)', min: -6, max: 0, step: 0.25,
-              value: (sim.etaAnomAlpha > 0 ? Math.log10(sim.etaAnomAlpha) : -6.5),
-              format: v => (v <= -6.05 ? 'off' : '1e' + v.toFixed(2)),
-              onChange: v => sim.setEtaAnomAlpha(v <= -6.05 ? 0 : Math.pow(10, v)) },
-            { type: 'slider', label: 'η-anom J_crit', min: 1, max: 100, step: 1,
-              value: sim.etaAnomJcrit, format: v => v.toFixed(0),
-              onChange: v => sim.setEtaAnomJcrit(v) },
-            { type: 'slider', label: 'Source substeps cap', min: 1, max: 64, step: 1,
-              value: sim.sourceSubstepsMax, format: v => String(v | 0),
-              onChange: v => sim.setSourceSubstepsMax(v | 0) },
-            { type: 'mode', label: 'EMF', dataAttr: 'emf-mode',
-              buttons: [
-                  { value: String(EMF_MODE_BS_MEAN),   label: 'BS mean',
-                    active: sim.emfMode === EMF_MODE_BS_MEAN },
-                  { value: String(EMF_MODE_GS_UPWIND), label: 'GS upwind',
-                    active: sim.emfMode === EMF_MODE_GS_UPWIND },
-              ],
-              onChange: v => sim.setEmfMode(parseInt(v, 10)) },
-            { type: 'toggle', label: 'Positivity guard',
-              checked: (sim.physicsFlags & FLAG_POSITIVITY) !== 0,
-              onChange: on => sim.setPhysicsFlag(FLAG_POSITIVITY, on) },
-
-            { type: 'slider', label: 'LIC intensity', min: 0, max: 2, step: 0.05,
-              value: sim.licIntensity, format: v => v.toFixed(2),
-              onChange: v => sim.setLicIntensity(v) },
-            { type: 'slider', label: 'LIC drift', min: 0, max: 4, step: 0.1,
-              value: sim.licDriftX, format: v => v.toFixed(1) + ' px/s',
-              onChange: v => sim.setLicDrift(v, sim.licDriftY) },
-        ], { width: 280 });
-    }
-
     // ── About panel ───────────────────────────────────────────
     if (typeof initAboutPanel === 'function') {
         const aboutHandle = initAboutPanel({
             title: 'Plasma',
             lastUpdated: '2026-05-27',
-            description: 'WebGPU-native 2D resistive MHD plasma simulator. Hover the canvas to sample the local state; left-drag pushes the plasma, right-drag twists the field. Settings holds preset / view / η / resolution / boundaries; Physics holds the extended source layer (Hall, cooling, conduction, radiation, viscosity, non-ideal Ohm, gravity, geometry); Stats and Probe surface the live diagnostics.',
+            description: 'WebGPU-native 2D resistive MHD plasma simulator. Hover the canvas to sample the local state; left-drag pushes the plasma, right-drag twists the field. Settings holds preset / view / resistivity (η + anomalous) / numerics / render / resolution / boundaries; Physics holds the extended source layer (Hall, cooling, conduction, radiation, viscosity, non-ideal Ohm, gravity, geometry); Stats and Probe surface the live diagnostics.',
             controls: [
                 { label: 'Sample cell',  value: 'Hover canvas' },
                 { label: 'Push plasma',  value: 'Left-click drag' },
@@ -299,7 +237,7 @@ function wireSettings(ctx) {
     const etaSlider = root.querySelector('#ctrl-eta');
     const etaLabel  = root.querySelector('#ctrl-eta-val');
     const etaHint   = root.querySelector('#ctrl-eta-hint');
-    const SLIDER_MIN_FLOOR = -6.5;   // matches HTML's default min (snap-to-0)
+    const SLIDER_MIN_FLOOR = ETA_SLIDER_MIN_FLOOR;   // snap-to-0 floor (config.js)
     const etaFromSlider = (v) => {
         if (v <= -6.05) return 0;        // snap-to-0 below 1e-6
         return Math.pow(10, v);
@@ -409,6 +347,79 @@ function wireSettings(ctx) {
             }
         });
     }
+
+    // ── η-anomalous (Birn 2001) — appended into the Resistivity section ──
+    // α = 0 (off) keeps the constant-η₀ baseline; α > 0 activates
+    // |J| > J_crit enhanced resistivity for fast reconnection.
+    const etaSection = etaSlider.closest('.panel-section');
+    epSlider(etaSection, 'η-anom α (log10)', {
+        ...B.etaAnomAlpha, sim,
+        getScalar: () => sim.etaAnomAlpha,
+        setScalar: v => sim.setEtaAnomAlpha(v),
+        hint: 'α > 0 enables |J|>J_crit enhanced resistivity; off = constant η₀.',
+    });
+    sliderRow(etaSection, 'η-anom J_crit', {
+        ...B.etaAnomJcrit,
+        value: sim.etaAnomJcrit,
+        format: v => v.toFixed(0),
+        onChange: v => sim.setEtaAnomJcrit(v),
+    });
+
+    // ── Numerics + Render — folded in from the former gear dropdown.
+    // Built in JS (like the Physics tab) and inserted between the
+    // Resistivity and Resolution sections so the tab reads
+    // preset → view → resistivity → numerics → render → resolution → BCs.
+    const resolutionSection = resGroup.closest('.panel-section');
+
+    const numerics = section('Numerics');
+    sliderRow(numerics, 'CFL', {
+        ...B.cfl, value: sim.cfl,
+        format: v => v.toFixed(2),
+        onChange: v => sim.setCFL(v),
+    });
+    sliderRow(numerics, 'γ', {
+        ...B.gamma, value: sim.gamma,
+        format: v => v.toFixed(2),
+        onChange: v => sim.setGamma(v),
+    });
+    sliderRow(numerics, 'p-floor (log10)', {
+        ...B.pressureFloorLog, value: Math.log10(sim.pressureFloor),
+        format: v => '1e' + v.toFixed(1),
+        onChange: v => sim.setPressureFloor(Math.pow(10, v)),
+    });
+    sliderRow(numerics, 'Source substeps cap', {
+        ...B.sourceSubstepsCap, value: sim.sourceSubstepsMax,
+        format: v => String(v | 0),
+        onChange: v => sim.setSourceSubstepsMax(v | 0),
+    });
+    modeRow(numerics, 'EMF', {
+        dataAttr: 'emf-mode',
+        buttons: [
+            { value: String(EMF_MODE_BS_MEAN),   label: 'BS mean',
+              active: sim.emfMode === EMF_MODE_BS_MEAN },
+            { value: String(EMF_MODE_GS_UPWIND), label: 'GS upwind',
+              active: sim.emfMode === EMF_MODE_GS_UPWIND },
+        ],
+        onChange: v => sim.setEmfMode(parseInt(v, 10)),
+    });
+    toggleRow(numerics, 'Positivity guard', {
+        checked: (sim.physicsFlags & FLAG_POSITIVITY) !== 0,
+        onChange: on => sim.setPhysicsFlag(FLAG_POSITIVITY, on),
+    });
+
+    const render = section('Render');
+    sliderRow(render, 'LIC intensity', {
+        ...B.licIntensity, value: sim.licIntensity,
+        format: v => v.toFixed(2),
+        onChange: v => sim.setLicIntensity(v),
+    });
+    sliderRow(render, 'LIC drift', {
+        ...B.licDrift, value: sim.licDriftX,
+        format: v => v.toFixed(1) + ' px/s',
+        onChange: v => sim.setLicDrift(v, sim.licDriftY),
+    });
+
+    resolutionSection.before(numerics, render);
 
     // Initial sync
     syncBCDropdowns();

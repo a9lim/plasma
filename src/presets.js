@@ -40,7 +40,8 @@ import {
     FLAG_RADIATION, FLAG_ELECTRON_INERTIA,
     COOLING_CURVE_TABLE, COOLING_CURVE_TABULATED,
     GEOMETRY_CARTESIAN, GEOMETRY_CYLINDRICAL,
-    GRAVITY_BOUNDARY_ISOLATED,
+    GRAVITY_BOUNDARY_ISOLATED, GRAVITY_BOUNDARY_PERIODIC, GRAVITY_SOLVER_MULTIGRID,
+    VIEW_BMAG,
 } from './config.js';
 import {
     CGS, applyInteractiveBounds, deriveCodePhysicsFromTargets,
@@ -1650,7 +1651,131 @@ export function makeCylindricalGravityColumnPreset(n = GRID_N) {
     };
 }
 
+/**
+ * Sandbox — a uniform, quiescent medium with the FULL extended-physics
+ * stack enabled and sane interactive defaults. This is the landing
+ * scenario: nothing happens on its own (a uniform state has no gradients,
+ * so Hall / conduction / viscosity / ambipolar / Biermann / electron
+ * inertia are all inert, self-gravity is periodic-mean-subtracted, and the
+ * radiation reservoir starts at LTE), so the user drives everything with
+ * the pointer — left-drag pushes the plasma, right-drag twists the field —
+ * and watches every term respond once gradients appear.
+ *
+ * Background: ρ = p = 1 (so T = 1), v = 0, uniform in-plane Bx = 1
+ * → magnetic pressure ½B² = 0.5, β = p/(½B²) = 2, v_A = 1, c_s = √(5/3).
+ * All characteristic speeds are O(1) so the CFL-limited dt is well behaved.
+ * Cooling and heating are gentle and roughly balanced at the background
+ * state, so the medium stays quasi-steady until perturbed. Default view is
+ * |B| so the uniform field + LIC streamlines are visible on a blank canvas.
+ */
+export function makeSandboxPreset(n = GRID_N) {
+    const gamma = 5.0 / 3.0;
+    const L = DOMAIN_LENGTH;
+    const { nT, ghost, U0, U1, Bx_face, By_face } = allocData(n);
+
+    const rho0 = 1.0;
+    const p0   = 1.0;          // T0 = p0 / rho0 = 1
+    const Bx0  = 1.0;          // uniform in-plane guide field (β = 2)
+
+    // Radiation reservoir seeded at LTE (E_r = a_r·T0^4) so grey radiation
+    // exchanges no net energy with the uniform background.
+    const aRad  = 0.05;
+    const T0    = p0 / rho0;
+    const erLte = aRad * T0 ** 4;
+    const radiation = new Float32Array(nT * nT);
+
+    for (let j = 0; j < nT; j++) {
+        for (let i = 0; i < nT; i++) {
+            const idx = cellIdx(i, j, nT);
+            writeCell(U0, U1, idx, rho0, 0, 0, 0, p0, Bx0, 0, 0, gamma);
+            radiation[idx] = erLte;
+        }
+    }
+    // Uniform horizontal field: every x-face carries Bx0, every y-face 0.
+    Bx_face.fill(Bx0);
+    // By_face stays zero (allocData zero-inits). ∇·B = 0 trivially.
+
+    return {
+        id: 'sandbox', label: 'Sandbox (all physics)',
+        gamma,
+        domainLength: L,
+        eta: ETA_DEFAULT,
+        bc: {
+            modeN: BC_PERIODIC, modeS: BC_PERIODIC,
+            modeE: BC_PERIODIC, modeW: BC_PERIODIC,
+        },
+        physics: {
+            physicsFlags: EXTENDED_PHYSICS_FLAGS,
+            // Hall
+            hallDi: 0.02,
+            hallSubstepsMax: 8,
+            hallElectronPressureFrac: 0.5,
+            // Cooling & heating — gentle, balanced at the background state
+            coolingLambda0: 1.0e-3,
+            coolingTFloor: 1.0e-4,
+            coolingTRef: 1.0,
+            coolingCurveMode: COOLING_CURVE_TABULATED,
+            coolingMetallicity: 1.0,
+            heatingGamma0: 1.0e-3,
+            heatingDensityExp: 1.0,
+            heatingTCut: 0.0,
+            // Anisotropic conduction
+            conductionKappa: 1.0e-3,
+            conductionIsoFrac: 0.1,
+            conductionSatFrac: 0.3,
+            // Self + external gravity (periodic mean-subtracted → inert on uniform ρ)
+            gravityGx: 0.0,
+            gravityGy: 0.0,
+            gravityG: 1.0e-3,
+            gravityPoissonIters: 30,
+            gravitySoftening: 0.05,
+            gravityPoissonOmega: 0.8,
+            gravityBoundaryMode: GRAVITY_BOUNDARY_PERIODIC,
+            gravitySolverMode: GRAVITY_SOLVER_MULTIGRID,
+            // Non-ideal Ohm
+            ambipolarEta: 1.0e-3,
+            biermannCoeff: 1.0e-4,
+            neutralFrac: 0.05,
+            ionizationT0: 0.5,
+            electronInertiaLength: 1.0e-3,
+            electronInertiaDamping: 0.1,
+            // Viscosity. Shear/bulk ν stay 0: the conservative Spitzer
+            // T^(5/2) dt-sizing (MICRO_TRANSPORT_MAX_SCALE = 1e5) makes any
+            // interactive-meaningful shear ν collapse the macro timestep at
+            // 256² (measured: ν=1e-3 → dt ~3e-7). Shock (artificial)
+            // viscosity is NOT inflated, so it carries the enabled-viscosity
+            // demonstration; raise shear ν in the Physics tab to explore it.
+            viscosityNu: 0.0,
+            viscosityBulk: 0.0,
+            viscosityAnisoFrac: 0.5,
+            viscosityShock: 1.0e-3,
+            // Grey radiation (E_r seeded at LTE above). Reduced speed of
+            // light kept low (0.01): the FLD diffusion is stiff on a fine
+            // grid, so a larger c would dominate the timestep (c=1 → dt
+            // ~1e-6). At 0.01 radiation is genuinely active and dt stays
+            // ~1e-4 (3× faster than the orszag-tang-extended full-stack
+            // preset); raise c in the Physics tab for stronger coupling.
+            radiationC: 0.01,
+            radiationKappaAbs: 0.5,
+            radiationKappaScat: 4.0,
+            radiationConst: aRad,
+            radiationFloor: 1.0e-10,
+            // Shared source sub-cycle cap; Cartesian geometry; sponge off
+            sourceSubstepsMax: 12,
+            geometryMode: GEOMETRY_CARTESIAN,
+            geometryRMin: 0.0,
+            spongeWidth: 0.0,
+            spongeStrength: 0.0,
+        },
+        data: { U0, U1, Bx_face, By_face, radiation },
+        viewMode: VIEW_BMAG,
+        viewMin: 0.0, viewMax: 2.0,
+        etaFloorCoeff: 0,
+    };
+}
+
 export const PRESETS = {
+    sandbox: makeSandboxPreset,
     sod: makeSodPreset,
     'brio-wu': makeBrioWuPreset,
     'orszag-tang': makeOrszagTangPreset,

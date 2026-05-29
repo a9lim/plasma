@@ -20,10 +20,7 @@
  */
 
 import { readbackBatch, ReadbackPool } from './gpu/readback.js';
-import { GHOST_WIDTH } from './config.js';
-
-const PROBE_HZ = 10;          // 100 ms readback interval
-const DUAL_ENERGY_FRACTION = 1e-3;
+import { GHOST_WIDTH, PROBE_HZ, DUAL_ENERGY_FRACTION } from './config.js';
 
 const FIELDS = [
     { id: 'rho',     label: 'ρ' },
