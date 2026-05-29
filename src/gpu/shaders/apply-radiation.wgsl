@@ -212,11 +212,24 @@ fn compute_delta(@builtin(global_invocation_id) gid: vec3<u32>) {
     let T = cell_temperature_rad(ix, iy, n_total);
     let er_lte = max(U_uniforms.radiation_const, 0.0) * pow(max(T, 0.0), 4.0);
     let kappa_abs = radiation_kappa_abs_at(ix, iy, n_total);
-    let exchange = U_uniforms.radiation_c * kappa_abs * rho * (er_lte - er_c);
     let dt = max(dt_buf.dt, 0.0);
 
-    radiation_dE[c] = vec4<f32>((-div_flux + exchange) * dt,
-                                -exchange * dt,
+    // Gas<->radiation absorption exchange is a stiff LINEAR relaxation
+    //   dE_r/dt = a (er_lte - E_r),   a = c * kappa_abs * rho  (>= 0).
+    // Integrate it EXACTLY over the substep, holding er_lte = a_r T^4 frozen
+    // (linearized in E_r) — unconditionally stable for any dt. Previously this
+    // was an explicit forward-Euler kick (a*(er_lte-er_c)*dt) that overshot and
+    // oscillated once a*dt > 2, and the host substep sizing dropped the rho
+    // factor, so dense cells were under-substepped. The exact form removes the
+    // stiffness; radiation therefore no longer needs the exchange term in its
+    // substep budget (diffusion still does — see _radiationSizing).
+    let a = U_uniforms.radiation_c * kappa_abs * rho;   // >= 0 relaxation rate
+    let exch_dEr = (er_lte - er_c) * (1.0 - exp(-a * dt));
+
+    // Diffusion (FLD) stays explicit forward-Euler and is what the substep
+    // count covers. Exchange is added exactly on top.
+    radiation_dE[c] = vec4<f32>(-div_flux * dt + exch_dEr,
+                                -exch_dEr,
                                 0.0,
                                 0.0);
 }

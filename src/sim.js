@@ -231,7 +231,7 @@ export class Sim {
         if (physics.gravityGx !== undefined)           this.gravityGx = +physics.gravityGx || 0;
         if (physics.gravityGy !== undefined)           this.gravityGy = +physics.gravityGy || 0;
         if (physics.gravityG !== undefined)            this.gravityG = Math.max(0, +physics.gravityG || 0);
-        if (physics.gravityPoissonIters !== undefined) this.gravityPoissonIters = Math.max(0, physics.gravityPoissonIters | 0);
+        if (physics.gravityPoissonIters !== undefined) this.gravityPoissonIters = Math.max(1, physics.gravityPoissonIters | 0);
         if (physics.gravityBoundaryMode !== undefined) this.gravityBoundaryMode = Math.max(0, physics.gravityBoundaryMode | 0);
         if (physics.gravitySolverMode !== undefined)   this.gravitySolverMode = physics.gravitySolverMode | 0;
         if (physics.hallElectronPressureFrac !== undefined) {
@@ -463,7 +463,7 @@ export class Sim {
     setHallElectronPressureFrac(v) { this.hallElectronPressureFrac = Math.min(1, Math.max(0, +v || 0)); this._pushUniforms(); }
     setGravityG(v)               { this.gravityG = Math.max(0, +v || 0); this._pushUniforms(); }
     setGravityVec(gx, gy)        { this.gravityGx = +gx || 0; this.gravityGy = +gy || 0; this._pushUniforms(); }
-    setGravityPoissonIters(n)    { this.gravityPoissonIters = Math.max(0, n | 0); this._pushUniforms(); }
+    setGravityPoissonIters(n)    { this.gravityPoissonIters = Math.max(1, n | 0); this._pushUniforms(); }
     setGravityBoundaryMode(mode) { this.gravityBoundaryMode = Math.max(0, mode | 0); this._pushUniforms(); }
     setGravitySolverMode(mode)   { this.gravitySolverMode = mode === GRAVITY_SOLVER_JACOBI ? GRAVITY_SOLVER_JACOBI : GRAVITY_SOLVER_MULTIGRID; }
     setCoolingMetallicity(v)     { this.coolingMetallicity = Math.max(0, +v || 0); this._pushUniforms(); }
@@ -2292,6 +2292,12 @@ export class Sim {
                     pass.dispatchWorkgroups(gInterior, gInterior, 1);
                     pass.setPipeline(pipelines.pipelines.applyOhmDissipative);
                     pass.dispatchWorkgroups(gN1, gN1, 1);
+                    // Separate energy-repair dispatch: recompute cell pressure
+                    // from the now-fully-written faces (cross-dispatch ordering
+                    // makes the dissipative face writes visible here), avoiding
+                    // the in-dispatch read-after-write race on neighbour faces.
+                    pass.setPipeline(pipelines.pipelines.repairOhmDissipativeEnergy);
+                    pass.dispatchWorkgroups(gInterior, gInterior, 1);
                 });
                 if (o + 1 < ohmSubsteps) {
                     applyBcs(`${labelPrefix}.afterOhm${o + 1}ApplyBcs`);
@@ -2326,7 +2332,15 @@ export class Sim {
             const maxRatio = Math.max(1, (sMax * sMax + sMax - 2) / 2);
             return { dtSuper: DT_MAX, dtParabolic: DT_MAX / maxRatio };
         }
-        const etaMax = Math.max(this.eta || 0, this._lastEtaMax || 0);
+        let etaMax = Math.max(this.eta || 0, this._lastEtaMax || 0);
+        // Anomalous eta ~ |J|^2 can spike within a single step during a current-
+        // sheet collapse, but _lastEtaMax is one step lagged — so RKL2 could
+        // briefly under-size its substep count s and let the highest-k resistive
+        // mode grow for one step. Inflate the estimate by a growth margin when
+        // alpha > 0 so s covers a one-step anomalous jump. Costs ~sqrt(margin)
+        // extra substeps; a no-op at alpha = 0 (constant eta cannot spike).
+        const ETA_ANOM_RKL2_MARGIN = 4.0;
+        if (alpha > 0) etaMax *= ETA_ANOM_RKL2_MARGIN;
         const hostDtPar = etaMax > 1.0e-30
             ? 0.25 * this.dx * this.dx / etaMax
             : 1.0e30;
@@ -2485,14 +2499,23 @@ export class Sim {
         // Biermann is a source rather than diffusion; use a conservative
         // gradient-scale proxy so large coefficients get smaller explicit
         // substeps without adding another storage reduction to compute-dt.
+        // This proxy is blind to the 1/rho^2 amplification at low density, so
+        // the hard stability backstop is the per-substep dB_z cap in
+        // apply-ohm.wgsl (BIERMANN_DBZ_CAP_FRAC), which bounds the kick where
+        // the live density is actually known.
         const batteryRate = biermannOn
             ? Math.abs(this.biermannCoeff) / Math.max(this.dx, 1e-30)
             : 0.0;
         const eta4 = electronInertiaOn
             ? this.electronInertiaDamping * this.electronInertiaLength * this.electronInertiaLength
             : 0.0;
+        // Hyper-resistive E_ei = -eta4 del^2 J gives dB/dt = -eta4 del^4 B.
+        // The 2D composed biharmonic has spectral radius ~64/dx^4 (= (8/dx^2)^2),
+        // so the forward-Euler bound is dt <= dx^4/(32 eta4) — the rate is
+        // 32*eta4/dx^4, NOT the 1D 16/dx^4 (which left only ~11% margin and could
+        // under-substep the highest-k current mode in 2D).
         const hyperRate = eta4 > 0
-            ? 16.0 * eta4 / Math.max(this.dx ** 4, 1e-30)
+            ? 32.0 * eta4 / Math.max(this.dx ** 4, 1e-30)
             : 0.0;
         const rate = ambiRate + batteryRate + hyperRate;
         if (rate <= 0 || dtMacro <= 0) return { nSubsteps: 1, dtSub: dtMacro };
@@ -2517,14 +2540,16 @@ export class Sim {
                     + Math.max(this.radiationKappaScat || 0, 0);
         const dx2 = Math.max(this.dx * this.dx, 1e-30);
         const opacityMin = 0.01;
-        const opacityMaxAbs = 32.0;
+        // Only the explicit FLD diffusion term constrains the substep count.
+        // The gas<->radiation absorption exchange is now integrated exactly
+        // (implicit/exponential) in apply-radiation.wgsl, so it is
+        // unconditionally stable and no longer enters the stiffness budget.
+        // (This also retires the old exchange-rate estimate, which incorrectly
+        // dropped the rho factor and under-substepped dense cells.)
         const diffusionRate = kappa > 0
             ? 4.0 * this.radiationC / Math.max(kappa * opacityMin * dx2, 1e-30)
             : 0.0;
-        const exchangeRate = this.radiationC
-            * Math.max(this.radiationKappaAbs || 0, 0)
-            * opacityMaxAbs;
-        const rate = diffusionRate + exchangeRate;
+        const rate = diffusionRate;
         if (rate <= 0) return { nSubsteps: 1, dtSub: dtMacro };
         const safety = 0.35;
         const dtHalf = 0.5 * Math.max(dtMacro, 0);

@@ -375,7 +375,12 @@ fn pressure_from_dual_energy(U0: vec4<f32>, U1: vec4<f32>, bx_c: f32, by_c: f32,
     let eth_floor = p_floor / max(gamma - 1.0, 1.0e-6);
     let total_ok = eth_total > max(eth_floor, DUAL_ENERGY_FRACTION * max(abs(U1.x), eth_floor))
                 && eth_total == eth_total;
-    let dual_eth = max(U1.z, eth_floor);
+    // FIX C: explicit `x == x` NaN scrub on the dual-energy e_int (U1.z)
+    // before max(). WGSL (§17.5) does not guarantee max(NaN, x) = x, so a
+    // NaN e_int could otherwise propagate through the fallback and defeat
+    // it on a non-IEEE-maxNum backend. select() is false for NaN → floor.
+    let dual_eth_in = select(eth_floor, U1.z, U1.z == U1.z);
+    let dual_eth = max(dual_eth_in, eth_floor);
     let eth = select(dual_eth, eth_total, total_ok);
     return max((gamma - 1.0) * eth, p_floor);
 }

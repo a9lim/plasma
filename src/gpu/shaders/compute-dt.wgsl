@@ -54,7 +54,13 @@
 @group(0) @binding(8) var<storage, read_write>     hall_speed_buf: atomic<u32>;
 @group(0) @binding(9) var<storage, read_write>     cond_speed_buf: atomic<u32>;
 
-const DT_MIN: f32 = 1.0e-8;
+// DT_MIN is a hard floor on the macro timestep purely to prevent a dt->0
+// deadlock; it must sit BELOW any timestep the CFL/source caps can legitimately
+// demand, otherwise clamping to it would silently run the solver above its own
+// stability bound. 1e-8 was reachable by stiff full-stack configs, so it is
+// lowered to 1e-10 (a stable-but-slow step is always preferable to an unstable
+// fast one — the NaN auto-pause and floors backstop the truly catastrophic case).
+const DT_MIN: f32 = 1.0e-10;
 const DT_MAX: f32 = 1.0e-2;
 
 @compute @workgroup_size(1, 1, 1)
@@ -208,7 +214,9 @@ fn reduce(
             let eta4 = U_uniforms.electron_inertia_damping
                 * U_uniforms.electron_inertia_length
                 * U_uniforms.electron_inertia_length;
-            r_nonideal = r_nonideal + 16.0 * eta4 / max(dx * dx * dx * dx, 1.0e-30);
+            // 2D biharmonic FE bound: dt <= dx^4/(32 eta4) (spectral radius
+            // ~64/dx^4), so the rate is 32*eta4/dx^4 — not the 1D 16/dx^4.
+            r_nonideal = r_nonideal + 32.0 * eta4 / max(dx * dx * dx * dx, 1.0e-30);
         }
         let s_nonideal_cap = cfl_safe * dx * r_nonideal / (2.0 * n_src * 0.45);
         s = s + select(0.0, s_nonideal_cap, s_nonideal_cap >= 0.0 && s_nonideal_cap == s_nonideal_cap);
@@ -218,15 +226,15 @@ fn reduce(
             let kappa = max(U_uniforms.radiation_kappa_abs, 0.0)
                       + max(U_uniforms.radiation_kappa_scat, 0.0);
             let opacity_min = 0.01;
-            let opacity_max_abs = 32.0;
-            let r_rad_diff = select(0.0,
-                                    4.0 * U_uniforms.radiation_c
-                                      / max(kappa * opacity_min * dx * dx, 1.0e-30),
-                                    kappa > 0.0);
-            let r_rad_exchange = U_uniforms.radiation_c
-                * max(U_uniforms.radiation_kappa_abs, 0.0)
-                * opacity_max_abs;
-            let r_rad = r_rad_diff + r_rad_exchange;
+            // Only the explicit FLD diffusion term constrains the macro dt.
+            // The gas<->radiation absorption exchange is integrated exactly
+            // (implicit) in apply-radiation.wgsl now, so it is unconditionally
+            // stable and no longer contributes a source-cap rate here. (The
+            // dropped exchange estimate also omitted the rho factor anyway.)
+            let r_rad = select(0.0,
+                               4.0 * U_uniforms.radiation_c
+                                 / max(kappa * opacity_min * dx * dx, 1.0e-30),
+                               kappa > 0.0);
             let s_rad_cap = cfl_safe * dx * r_rad / (2.0 * n_src * 0.35);
             s = s + select(0.0, s_rad_cap, s_rad_cap >= 0.0 && s_rad_cap == s_rad_cap);
         }
@@ -254,6 +262,22 @@ fn reduce(
             let omega_g = sqrt(max(4.0 * 3.141592653589793 * U_uniforms.gravity_G * rho, 0.0));
             let s_self_g = 4.0 * cfl_safe * dx * omega_g;
             s = s + select(0.0, s_self_g, s_self_g >= 0.0 && s_self_g == s_self_g);
+        }
+
+        // ── Cylindrical geometry curvature source ──────────────────
+        // In axisymmetric (x=r) mode the curvature source ~ (p + rho v^2 -
+        // B_phi^2)/r and the r-weighted CT update both act on a 1/r timescale
+        // that the Cartesian wave CFL never sees; near the axis r -> 0.5*dx so
+        // it can dominate. Treat it like the gravity-frequency bound: an
+        // equivalent rate omega_geom = s_fast / r, recast into `s` so dt is
+        // sized for the axis source. Away from the axis (r ~ O(1)) it is
+        // negligible vs the bare wave CFL.
+        if (flag_set(flags, FLAG_GEOMETRY) && U_uniforms.geometry_mode == 1u) {
+            let r_cell = max(U_uniforms.geometry_r_min + (f32(gid.x) + 0.5) * dx, 0.5 * dx);
+            let s_fast = max(sx, sy);
+            let omega_geom = s_fast / r_cell;
+            let s_geom = 4.0 * cfl_safe * dx * omega_geom;
+            s = s + select(0.0, s_geom, s_geom >= 0.0 && s_geom == s_geom);
         }
 
         let s_safe = select(0.0, s, s >= 0.0 && s == s);

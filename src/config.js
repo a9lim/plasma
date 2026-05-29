@@ -417,7 +417,7 @@ export const SLIDER_BOUNDS = Object.freeze({
 
     // Physics ▸ Gravity
     gravityG:           { lo: -4, hi: 2, step: 0.25 },        // log10; FLAG_GRAVITY_SELF
-    gravityPoissonIters:{ min: 0, max: 128, step: 1 },
+    gravityPoissonIters:{ min: 8, max: 128, step: 1 },   // >=1 enforced in sim.js so the solve never silently skips (stale-phi-as-force)
     gravitySoftening:   { min: 0, max: 0.2, step: 0.005 },
     gravityPoissonOmega:{ min: 0.2, max: 1.8, step: 0.05 },
 

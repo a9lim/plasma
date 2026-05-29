@@ -179,7 +179,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var mz = select(0.0, u0_raw.w, u0_raw.w == u0_raw.w);
 
     // Density: clamp to [floor, large]. NaN → floor.
-    let rho = clamp(u0_raw.x, DENSITY_FLOOR, 1.0e30);
+    // FIX B: explicit `x == x` NaN scrub before clamp — WGSL (§17.5) does
+    // not guarantee IEEE maxNum, so clamp(NaN, lo, hi) may be indeterminate.
+    // select() is false for NaN, so a non-finite density snaps to the floor
+    // portably rather than relying on clamp(NaN) collapsing to `low`.
+    let rho_in = select(DENSITY_FLOOR, u0_raw.x, u0_raw.x == u0_raw.x);
+    let rho = clamp(rho_in, DENSITY_FLOOR, 1.0e30);
+    // FIX A: predicate for the floored-density pathological case the
+    // velocity clamp below was designed for. True when the raw density is
+    // NaN or at/below the floor (negated `>` is also true for NaN).
+    let density_floored = !(u0_raw.x > DENSITY_FLOOR);
 
     // ── Momentum sanitization for the floored-density case ─────────────
     // Session 12 retrospective (fifth Harris bug): when ρ_raw falls below
@@ -200,13 +209,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // cell at ½·1e-6·100 = 5e-5 — negligible vs background pressure
     // contribution, so the sanitization doesn't bias physics in cells
     // that didn't need it.
+    //
+    // FIX A: gate the clamp on `density_floored`. It previously ran on
+    // EVERY interior cell, silently braking any legitimately fast flow
+    // (high-Alfvén sandbox, fast driven inflow > 10 code-units). It now
+    // only fires for the floored-density cells it was designed for —
+    // physical v ≤ V_MAX_SANE is the artifact case, fast healthy flow
+    // is left untouched.
     let V_MAX_SANE: f32 = 10.0;
     let v_inv_rho = 1.0 / rho;
     let vx_raw = mx * v_inv_rho;
     let vy_raw = my * v_inv_rho;
     let vz_raw = mz * v_inv_rho;
     let v_mag = sqrt(vx_raw*vx_raw + vy_raw*vy_raw + vz_raw*vz_raw);
-    if (v_mag > V_MAX_SANE) {
+    if (density_floored && v_mag > V_MAX_SANE) {
         let scale = V_MAX_SANE / v_mag;
         mx = mx * scale;
         my = my * scale;
@@ -220,12 +236,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // magnetic contribution here (Bx/By live on faces, not in U), but
     // the downstream cons_to_prim floor catches the residual slop.
     let E_min = ke + U_uniforms.pressure_floor / (U_uniforms.gamma - 1.0);
-    let E = clamp(u1_raw.x, E_min, 1.0e30);
+    // FIX B: explicit `x == x` NaN scrub before clamp (see density above) —
+    // a non-finite total energy snaps to E_min portably without relying on
+    // clamp(NaN) semantics.
+    let E_in = select(E_min, u1_raw.x, u1_raw.x == u1_raw.x);
+    let E = clamp(E_in, E_min, 1.0e30);
 
     // Bz: zero if non-finite.
     let bz = select(0.0, u1_raw.y, u1_raw.y == u1_raw.y);
 
-    let eth_aux = max(u1_raw.z, U_uniforms.pressure_floor / max(U_uniforms.gamma - 1.0, 1.0e-6));
+    // FIX B: guard the dual-energy aux against NaN before the max floor —
+    // max(NaN, x) is not guaranteed to return x in WGSL, so scrub first.
+    let eth_floor = U_uniforms.pressure_floor / max(U_uniforms.gamma - 1.0, 1.0e-6);
+    let eth_in = select(eth_floor, u1_raw.z, u1_raw.z == u1_raw.z);
+    let eth_aux = max(eth_in, eth_floor);
     let p_aux = max((U_uniforms.gamma - 1.0) * eth_aux, U_uniforms.pressure_floor);
 
     U0_out[idx_c] = vec4<f32>(rho, mx, my, mz);

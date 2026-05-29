@@ -30,6 +30,15 @@ const MICRO_TRANSPORT_START_VISC: u32 = 72u;
 const MICRO_TRANSPORT_COUNT_VISC: u32 = 24u;
 const INV_LN10_VISC: f32 = 0.4342944819032518;
 const TRANSPORT_SCALE_MAX_VISC: f32 = 1.0e5;
+// Per-substep FE velocity-change cap, as a fraction of the cell-crossing
+// speed dx/dt. Bounds an under-resolved viscous transient WITHOUT penalizing
+// low-momentum cells: a cap relative to the existing |ρv| would wrongly forbid
+// viscosity from accelerating a near-stationary cell, which is exactly what
+// momentum diffusion does (and would fire in normal operation at every
+// stagnation point / zero-crossing). 1.0 = up to one cell-crossing of velocity
+// change per substep, already the CFL ceiling, so it is a no-op under correct
+// host substep sizing and clips only pathological overshoots.
+const FE_DMOM_CAP_FRAC: f32 = 1.0;
 
 fn cell_bx_visc(ix: u32, iy: u32, n_total: u32) -> f32 {
     return 0.5 * (Bx_face[bx_face_idx(ix,      iy, n_total)]
@@ -194,8 +203,35 @@ fn apply_delta(@builtin(global_invocation_id) gid: vec3<u32>) {
     let du = dU_visc[c];
     let u0 = U0[c];
     let u1 = U1[c];
-    let u0_new = vec4<f32>(u0.x, u0.y + du.x, u0.z + du.y, u0.w + du.z);
-    let E = u1.x + du.w;
+
+    // ── Per-substep FE update limiter (rare-activation safety net) ──────
+    // The viscosity sub-cycle count N is sized HOST-SIDE from a one-step-
+    // lagged stiffness estimate. When a transient (a fast-forming shear
+    // layer, a pointer perturbation) under-resolves within a single macro
+    // step, this forward-Euler d_mom can overshoot, and the downstream
+    // max(p, p_floor) recovery would silently INJECT energy. Cap the
+    // per-substep momentum change so viscosity cannot accelerate a cell by
+    // more than ~one cell-crossing speed (dx/dt) per substep — the CFL
+    // ceiling. This bounds an under-resolved transient WITHOUT suppressing
+    // legitimate momentum diffusion into slow/stationary cells (a cap relative
+    // to existing |ρv| would do exactly that, and would fire in normal
+    // operation). No-op under correct sizing: a resolved viscous substep gives
+    // |Δv| ≪ dx/dt. The energy work term dot(v, d_mom) is re-derived from the
+    // LIMITED d_mom so momentum and energy stay consistent; the sign-definite
+    // viscous heating term is preserved intact.
+    let rho_old = max(u0.x, DENSITY_FLOOR);
+    let vc = vec3<f32>(u0.y, u0.z, u0.w) / rho_old; // frozen velocity, == compute_delta vc
+    let d_mom_raw = vec3<f32>(du.x, du.y, du.z);
+    let dt_visc = max(dt_buf.dt, 1.0e-30);
+    let dmom_cap = FE_DMOM_CAP_FRAC * rho_old * U_uniforms.dx / dt_visc;
+    let dmom_mag = length(d_mom_raw);
+    let d_mom = select(d_mom_raw,
+                       d_mom_raw * (dmom_cap / max(dmom_mag, 1.0e-30)),
+                       dmom_mag > dmom_cap);
+    let dE_lim = du.w - dot(vc, d_mom_raw) + dot(vc, d_mom);
+
+    let u0_new = vec4<f32>(u0.x, u0.y + d_mom.x, u0.z + d_mom.y, u0.w + d_mom.z);
+    let E = u1.x + dE_lim;
     let rho = max(u0_new.x, DENSITY_FLOOR);
     let bx = cell_bx_visc(ix, iy, n_total);
     let by = cell_by_visc(ix, iy, n_total);

@@ -40,6 +40,16 @@ const MICRO_ION_START: u32 = 24u;
 const MICRO_ION_COUNT: u32 = 24u;
 const INV_LN10_OHM: f32 = 0.4342944819032518;
 
+// Biermann battery per-substep increment cap. The battery carries a 1/rho^2
+// factor, so a near-floor-density baroclinic cell can take an unbounded dB_z
+// kick that the one-step-lagged dt feedback only catches next step. We cap the
+// per-substep increment to ~the local beta=1 (equipartition) field sqrt(2p):
+// the battery still SEEDS field and physically saturates near equipartition,
+// but cannot generate a wildly super-equipartition field (and the resulting
+// super-fast Alfven speed) in a single kick. A correctly-resolved step adds
+// dB_z << B_eq, so this is a no-op except on the pathological low-rho transient.
+const BIERMANN_DBZ_CAP_FRAC: f32 = 1.0;
+
 struct CornerJB {
     Jx: f32, Jy: f32, Jz: f32,
     Bx: f32, By: f32, Bz: f32,
@@ -390,15 +400,59 @@ fn apply_dissipative_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if (biermann_on) {
             let b = ohm_E[ez_edge_idx(ix, iy, n_total)].w;
-            u1 = vec4<f32>(u1.x, u1.y + b * dt, u1.z, u1.w);
+            // Cap the per-substep dB_z to the local equipartition field so a
+            // near-floor-density cell's 1/rho^2 amplification cannot blow up
+            // B_z (and the Alfven CFL) before the lagged dt feedback reacts.
+            let p_c = max(cell_pressure_ohm(ix, iy, n_total), U_uniforms.pressure_floor);
+            let bz_cap = BIERMANN_DBZ_CAP_FRAC * sqrt(2.0 * p_c);
+            let dbz = clamp(b * dt, -bz_cap, bz_cap);
+            u1 = vec4<f32>(u1.x, u1.y + dbz, u1.z, u1.w);
         }
-        let u0 = U0[c];
-        let rho = max(u0.x, DENSITY_FLOOR);
-        let ke = 0.5 * (u0.y*u0.y + u0.z*u0.z + u0.w*u0.w) / rho;
-        let mb = cell_magnetic_energy_ohm(ix, iy, n_total);
-        let p = max((U_uniforms.gamma - 1.0) * (u1.x - ke - mb),
-                    U_uniforms.pressure_floor);
-        U1[c] = pack_u1_aux(u1.x, u1.y, rho, p,
-                             U_uniforms.gamma, U_uniforms.pressure_floor);
+        // Store only the updated Bz here. The cell-centered magnetic
+        // energy (cell_magnetic_energy_ohm) reads the right/top faces, which
+        // are owned and written by the (gid.x+1)/(gid.y+1) invocations in
+        // THIS same dispatch — recomputing p here is a read-after-write race
+        // (nondeterministic, and inconsistent with the energy bookkeeping).
+        // The energy/pressure recompute moves to repair_dissipative_energy,
+        // mirroring the apply_hall_update / repair_hall_energy split above.
+        U1[c] = u1;
     }
+}
+
+// Second half of the dissipative update: now that every invocation in the
+// prior dispatch has finished writing its face B (WebGPU orders writes from
+// one dispatch before reads in the next), recompute the cell-centered
+// magnetic energy from the FULLY updated faces and restore the gas pressure
+// at fixed total energy. This is the dissipative-path analogue of
+// repair_hall_energy; splitting it out removes the in-dispatch face race.
+@compute @workgroup_size(8, 8, 1)
+fn repair_dissipative_energy(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let ambi_on = flag_set(U_uniforms.physics_flags, FLAG_AMBIPOLAR)
+               && U_uniforms.ambipolar_eta > 0.0
+               && U_uniforms.neutral_frac > 0.0;
+    let electron_inertia_on = flag_set(U_uniforms.physics_flags, FLAG_ELECTRON_INERTIA)
+                           && U_uniforms.electron_inertia_length > 0.0
+                           && U_uniforms.electron_inertia_damping > 0.0;
+    let biermann_on = flag_set(U_uniforms.physics_flags, FLAG_BIERMANN)
+                   && U_uniforms.biermann_coeff != 0.0
+                   && U_uniforms.hall_electron_pressure_frac > 0.0;
+    if (!ambi_on && !electron_inertia_on && !biermann_on) { return; }
+
+    let n_interior = U_uniforms.grid_n;
+    let n_total    = U_uniforms.grid_n_total;
+    let ghost      = U_uniforms.ghost_w;
+    if (gid.x >= n_interior || gid.y >= n_interior) { return; }
+
+    let ix = ghost + gid.x;
+    let iy = ghost + gid.y;
+    let c  = cell_idx_total(ix, iy, n_total);
+    let u0 = U0[c];
+    let u1 = U1[c];
+    let rho = max(u0.x, DENSITY_FLOOR);
+    let ke = 0.5 * (u0.y*u0.y + u0.z*u0.z + u0.w*u0.w) / rho;
+    let mb = cell_magnetic_energy_ohm(ix, iy, n_total);
+    let p = max((U_uniforms.gamma - 1.0) * (u1.x - ke - mb),
+                U_uniforms.pressure_floor);
+    U1[c] = pack_u1_aux(u1.x, u1.y, rho, p,
+                         U_uniforms.gamma, U_uniforms.pressure_floor);
 }

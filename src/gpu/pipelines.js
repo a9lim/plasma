@@ -868,6 +868,11 @@ export async function createPipelines(device, format) {
         layout: ohmPipeLayout,
         compute: { module: ohmModule, entryPoint: 'apply_dissipative_update' },
     });
+    const repairOhmDissipativeEnergy = device.createComputePipeline({
+        label: 'plasma.apply-ohm.repair-dissipative-energy',
+        layout: ohmPipeLayout,
+        compute: { module: ohmModule, entryPoint: 'repair_dissipative_energy' },
+    });
     const computeViscosityDelta = device.createComputePipeline({
         label: 'plasma.apply-viscosity.compute-delta',
         layout: mkPipeLayout(viscosityLayout),
@@ -966,6 +971,7 @@ export async function createPipelines(device, format) {
             computeHallEmf, applyHall, repairHallEnergy,
             computeNonidealEmf, applyNonideal,
             computeOhmEmf, applyOhmHall, repairOhmHallEnergy, applyOhmDissipative,
+            repairOhmDissipativeEnergy,
             computeViscosityDelta, applyViscosityDelta,
             applyGeometry,
             computeRadiationDelta, applyRadiationDelta,

@@ -371,8 +371,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rcL_pre = AL.rho * (SL - AL.un);
     let rcR_pre = AR.rho * (SR - AR.un);
     let SM_den_pre = rcR_pre - rcL_pre;
+    // Floor the denominator with sign preserved. sign(0.0)==0.0 in WGSL, so
+    // sign(SM_den_pre)*1e-12 would be exactly 0 on symmetric/quiescent faces
+    // (uniform sandbox background, symmetric ICs at t=0) → divide-by-zero.
+    // Pick -1e-12 only when strictly negative, else default to +1e-12.
     let SM_face = (rcR_pre * AR.un - rcL_pre * AL.un - AR.pT + AL.pT)
-                / select(SM_den_pre, sign(SM_den_pre) * 1.0e-12, abs(SM_den_pre) < 1.0e-30);
+                / select(SM_den_pre, select(1.0e-12, -1.0e-12, SM_den_pre < 0.0), abs(SM_den_pre) < 1.0e-30);
 
     // Cell index of the FACE itself (the left face of cell idx_r). flux
     // arrays use the same cell-centered indexing scheme; we write at
@@ -438,8 +442,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rhoLs = AL.rho * (SL - AL.un) / denom_L;
         let rhoRs = AR.rho * (SR - AR.un) / denom_R;
 
-        let E_Ls = ((SL - AL.un) * AL.E - AL.pT * AL.un + pT_star * SM) / (SL - SM);
-        let E_Rs = ((SR - AR.un) * AR.E - AR.pT * AR.un + pT_star * SM) / (SR - SM);
+        // Use the floored denom_L/denom_R (not raw SL-SM / SR-SM): when the
+        // contact SM nears a fast wave, (SL-SM)/(SR-SM) → 0 and the raw divide
+        // yields a large-but-finite star energy that slips past the positivity
+        // gate and seeds a CT B-spike. denom_L/denom_R cap the magnitude.
+        let E_Ls = ((SL - AL.un) * AL.E - AL.pT * AL.un + pT_star * SM) / denom_L;
+        let E_Rs = ((SR - AR.un) * AR.E - AR.pT * AR.un + pT_star * SM) / denom_R;
         if (!(star_state_ok(rhoLs, E_Ls) && star_state_ok(rhoRs, E_Rs))) {
             var hin: HllInputs;
             hin.QL = QL; hin.QR = QR;
@@ -458,16 +466,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             Fout.f_mt1 = FL.f_mt1 + SL * (rhoLs * AL.ut1       - AL.rho * AL.ut1);
             Fout.f_mt2 = FL.f_mt2 + SL * (rhoLs * AL.ut2       - AL.rho * AL.ut2);
             Fout.f_E   = FL.f_E   + SL * (E_Ls                 - AL.E);
-            Fout.f_bt1 = FL.f_bt1 + SL * (AL.bt1 * (SL - AL.un)/(SL - SM) - AL.bt1);
-            Fout.f_bt2 = FL.f_bt2 + SL * (AL.bt2 * (SL - AL.un)/(SL - SM) - AL.bt2);
+            // Floored denom_L instead of raw (SL-SM) — same fast-wave guard.
+            Fout.f_bt1 = FL.f_bt1 + SL * (AL.bt1 * (SL - AL.un)/denom_L - AL.bt1);
+            Fout.f_bt2 = FL.f_bt2 + SL * (AL.bt2 * (SL - AL.un)/denom_L - AL.bt2);
         } else {
             Fout.f_rho = FR.f_rho + SR * (rhoRs                - AR.rho);
             Fout.f_mn  = FR.f_mn  + SR * (rhoRs * SM           - AR.rho * AR.un);
             Fout.f_mt1 = FR.f_mt1 + SR * (rhoRs * AR.ut1       - AR.rho * AR.ut1);
             Fout.f_mt2 = FR.f_mt2 + SR * (rhoRs * AR.ut2       - AR.rho * AR.ut2);
             Fout.f_E   = FR.f_E   + SR * (E_Rs                 - AR.E);
-            Fout.f_bt1 = FR.f_bt1 + SR * (AR.bt1 * (SR - AR.un)/(SR - SM) - AR.bt1);
-            Fout.f_bt2 = FR.f_bt2 + SR * (AR.bt2 * (SR - AR.un)/(SR - SM) - AR.bt2);
+            // Floored denom_R instead of raw (SR-SM) — same fast-wave guard.
+            Fout.f_bt1 = FR.f_bt1 + SR * (AR.bt1 * (SR - AR.un)/denom_R - AR.bt1);
+            Fout.f_bt2 = FR.f_bt2 + SR * (AR.bt2 * (SR - AR.un)/denom_R - AR.bt2);
         }
         let pfA = pack_flux(Fout, axis);
         flux_0[dst] = pfA.f0;
@@ -504,10 +514,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vdotbLs  = SM     * b_normal + ut1_Ls  * bt1_Ls  + ut2_Ls  * bt2_Ls;
     let vdotbRs  = SM     * b_normal + ut1_Rs  * bt1_Rs  + ut2_Rs  * bt2_Rs;
 
+    // Divide by the floored dL/dR (same as rhoLs/rhoRs above), not the raw
+    // (SL-SM)/(SR-SM): when the contact nears a fast wave the raw denominator
+    // -> 0 and E_Ls/E_Rs can blow up to a large-but-finite value that slips
+    // through the star_state_ok gate (denomL_raw ~= -bn^2 keeps its own gate
+    // satisfied here, since Branch A already handled bn^2 ~ 0). Flooring bounds it.
     let E_Ls = ((SL - AL.un) * AL.E - AL.pT * AL.un + pT_star * SM
-               + b_normal * (vdotb_L - vdotbLs)) / (SL - SM);
+               + b_normal * (vdotb_L - vdotbLs)) / dL;
     let E_Rs = ((SR - AR.un) * AR.E - AR.pT * AR.un + pT_star * SM
-               + b_normal * (vdotb_R - vdotbRs)) / (SR - SM);
+               + b_normal * (vdotb_R - vdotbRs)) / dR;
 
     if (!(finite_hlld(pT_star)
        && abs(denomL_raw) > 1.0e-20

@@ -55,6 +55,11 @@ const MICRO_TRANSPORT_START: u32 = 72u;
 const MICRO_TRANSPORT_COUNT: u32 = 24u;
 const INV_LN10_COND: f32 = 0.4342944819032518;
 const TRANSPORT_SCALE_MAX_COND: f32 = 1.0e5;
+// Per-substep FE energy-update cap as a fraction of the cell's internal
+// energy. Loose by design (1.0 = ±100%/substep) so it is a no-op under
+// correct host substep sizing and clips only pathological overshoots —
+// see the apply_delta limiter comment.
+const FE_DE_CAP_FRAC: f32 = 1.0;
 
 fn micro_log_interp_cond(start: u32, count: u32, theta: f32) -> f32 {
     let log_theta = log(max(theta, 1.0e-30)) * INV_LN10_COND;
@@ -251,12 +256,29 @@ fn apply_delta(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let u0 = U0[c];
     let u1 = U1[c];
-    let E = u1.x + dE_cond[c];
     let rho = max(u0.x, DENSITY_FLOOR);
     let bx_c = cell_bx(ix, iy, n_total);
     let by_c = cell_by(ix, iy, n_total);
     let ke = 0.5 * (u0.y*u0.y + u0.z*u0.z + u0.w*u0.w) / rho;
     let mb = 0.5 * (bx_c*bx_c + by_c*by_c + u1.y*u1.y);
+
+    // ── Per-substep FE update limiter (rare-activation safety net) ──────
+    // The conduction sub-cycle count N is sized HOST-SIDE from a one-step-
+    // lagged stiffness estimate. When a transient (a freshly steepened hot
+    // front, a pointer perturbation) under-resolves within a single macro
+    // step, this forward-Euler dE can overshoot far past the local thermal
+    // energy; the downstream max(p, p_floor) recovery would then silently
+    // INJECT energy. We cap |dE| at a generous multiple of the cell's
+    // current internal energy so an under-resolved transient can't produce
+    // a wild overshoot. FE_DE_CAP_FRAC = 1.0 lets a single substep change
+    // eint by up to ±100% — a correctly-resolved diffusion substep changes
+    // it by far less, so this clips ONLY pathological overshoots and is a
+    // no-op under correct host sizing. Trades exact conservation for
+    // boundedness exclusively in the rare under-resolution case.
+    let eint_floor = U_uniforms.pressure_floor / max(U_uniforms.gamma - 1.0, 1.0e-30);
+    let eint = max(u1.x - ke - mb, eint_floor);
+    let dE_lim = clamp(dE_cond[c], -FE_DE_CAP_FRAC * eint, FE_DE_CAP_FRAC * eint);
+    let E = u1.x + dE_lim;
     let p = max((U_uniforms.gamma - 1.0) * (E - ke - mb), U_uniforms.pressure_floor);
     U1[c] = pack_u1_aux(E, u1.y, rho, p, U_uniforms.gamma, U_uniforms.pressure_floor);
 }
