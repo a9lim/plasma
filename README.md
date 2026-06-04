@@ -72,13 +72,13 @@ cd path/to/a9lim.github.io && python -m http.server
 
 Serve from the repository root, because the shared design files load via absolute paths. There is no build step and no dependencies, and ES6 modules require HTTP rather than `file://`.
 
-Plasma needs WebGPU. Please use a recent Chrome or Edge, or Safari 26+, on a machine with a working GPU; the simulator shows a fallback notice if WebGPU is unavailable. A CPU fallback compiled from the WGSL shaders by the parent repo's transpiler is planned but not yet wired in.
+Plasma needs WebGPU. Please use a recent Chrome or Edge, or Safari 26+, on a machine with a working GPU; the simulator shows a notice if WebGPU is unavailable. There is no CPU fallback — Plasma is WebGPU-only.
 
 ## Tech
 
 Vanilla JavaScript with no dependencies. ES6 modules for the host side and around 35 WGSL compute and render shaders for the GPU side. Canvas is rendered through a WebGPU device; all of the MHD numerics, source physics, and diagnostics are written from scratch.
 
-The whole macro step encodes as a single command submit. Stage weights, sweep directions, and boundary configuration live in pre-written uniform buffers, so there are no `writeBuffer` calls in the hot path. The compute pipelines are written to one bind group each, with workgroup barriers only at the top level, so they stay compilable by the parent repo's `shared-wgsl-transpile.js` for the future CPU path. The composite pass is a fragment shader and stays GPU-only.
+The whole macro step encodes as a single command submit. Stage weights, sweep directions, and boundary configuration live in pre-written uniform buffers, so there are no `writeBuffer` calls in the hot path. The compute pipelines are written to one bind group each, with workgroup barriers only at the top level, so they stay compilable by the parent repo's `shared-wgsl-transpile.js` (kept available, though no CPU path is currently wired up). The composite pass is a fragment shader and stays GPU-only.
 
 PPM caches per-cell primitives in a workgroup-shared tile with a halo, the dt reduction and the LIC contrast stretch use per-tile shared-atomic min/max reductions, and the self-gravity solve uses a Cartesian geometric multigrid V-cycle with a weighted-Jacobi fallback for cylindrical geometry.
 

@@ -11,8 +11,9 @@
  *   - Riemann/PPM dispatch ranges no longer mirror grid_n exactly;
  *     sim.js owns the dispatch counts.
  *
- * Bind-group layouts kept vanilla for the upcoming WebGPU→CPU transpiler
- * contract:
+ * Bind-group layouts kept vanilla so the compute shaders stay compilable
+ * by the parent repo's WebGPU→CPU transpiler (retained but currently
+ * unwired — no CPU path is built in-tree):
  *   - one uniform buffer + N storage buffers per layout
  *   - no dynamic offsets
  *   - no push constants

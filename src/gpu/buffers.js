@@ -432,8 +432,7 @@ export class PlasmaBuffers {
         // current stage needs — there is no per-step writeBuffer call.
         // Splitting into three immutable buffers (rather than one buffer
         // with offset views) lets each bind group cache aim at a single
-        // GPU resource and matches the transpiler's static-uniform
-        // specialization pattern (see _build.mjs RK3_STAGE_WEIGHTS).
+        // GPU resource.
         const stageMk = (label) => device.createBuffer({
             label, size: STAGE_PARAMS_BYTES,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,

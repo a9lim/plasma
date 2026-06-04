@@ -16,8 +16,9 @@
 //     in favour of direct indexing.
 //
 // ── Transpiler contract (vanilla WebGPU only) ───────────────────────
-// The codebase is written so a future WebGPU→CPU JS transpiler can map
-// each compute dispatch onto a clean nested loop:
+// The codebase is written so the parent repo's WebGPU→CPU JS transpiler
+// (retained but currently unwired) can map each compute dispatch onto a
+// clean nested loop:
 //   • No subgroup ops, no indirect dispatch, no push constants.
 //   • All bind-group layouts are static: one uniform + N storage buffers,
 //     no dynamic offsets.

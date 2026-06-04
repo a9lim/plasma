@@ -6,9 +6,9 @@ design system and shared-code policy. Sibling sims: `geon`, `shoals`,
 
 WebGPU-only interactive 2D resistive magnetohydrodynamics simulator.
 Grid-Eulerian finite-volume on a regular Cartesian mesh. No CPU
-fallback in-tree; the parent repo's `shared-wgsl-transpile.js` can
-compile our compute shaders to JS for a CPU path — see the transpiler
-contract section below.
+fallback in-tree. The shaders stay compilable by the parent repo's
+`shared-wgsl-transpile.js` (retained but currently unwired — no CPU
+path is built), see the transpiler contract section below.
 
 Implementation plan (source of truth for design decisions):
 `~/.claude/plans/geon-currently-uses-cpu-abstract-cat.md`.
@@ -878,8 +878,11 @@ current detailed punch list.
 
 ## Transpiler contract
 
-All compute pipelines are designed to be compilable by the parent
-repo's `shared-wgsl-transpile.js`:
+The transpiler is **currently retained but unwired** — the parent repo
+no longer transpiles these shaders and there is no CPU fallback built.
+These constraints are kept anyway so the shaders stay transpilable if
+the path is ever re-wired. All compute pipelines are designed to be
+compilable by the parent repo's `shared-wgsl-transpile.js`:
 
 * One bind group per pipeline (group 0). No dynamic offsets, no push
   constants.
@@ -925,16 +928,18 @@ swipe-to-dismiss on the sidebar's `.sheet-handle`; plasma calls no
 custom GPU-readback panel, not a tooltip, and there is no info/reference
 overlay.
 
-For CPU fallback: `shared-wgsl-transpile.js` (compile-time conversion
-of compute shaders to JS).
+For a CPU fallback (not currently wired up): `shared-wgsl-transpile.js`
+at the parent repo (compile-time conversion of compute shaders to JS) —
+retained but not hooked into the build or runtime.
 
 ## Rules
 
 - **No innerHTML assignments.** Use `textContent` or `createElement`.
   A Write hook blocks innerHTML in new files.
 - Always prefer shared modules over re-implementations.
-- WebGPU-only in-tree. The `shared-wgsl-transpile.js` hookup is the
-  CPU fallback path; the `#no-webgpu` landing page is the interim
-  message.
+- WebGPU-only in-tree. There is no CPU fallback wired up —
+  `shared-wgsl-transpile.js` (retained at the parent repo) is the path
+  one would use to build one, but the `#no-webgpu` landing page is the
+  current behavior when WebGPU is unavailable.
 - `shared-tokens.js` loads as a synchronous `<script>` (no `defer`) so
   it runs before CSS parses.
