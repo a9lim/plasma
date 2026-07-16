@@ -37,7 +37,7 @@ Boundaries are per-edge selectable: periodic, outflow, reflecting, or driven inf
 
 ## Presets
 
-The dropdown surfaces ten starting points. Six are canonical numerical tests on the base MHD numerics:
+The dropdown surfaces eleven starting points, including the interactive Sandbox. Six are canonical numerical tests on the base MHD numerics:
 
 - **Orszag-Tang**: a smooth periodic vortex that folds into interacting shocks, magnetic islands, and dense current sheets by t ≈ 0.5
 - **Harris current sheet**: a pressure-balanced sheet with a small perturbation, resistivity, and open vertical boundaries; reconnection develops with plasmoid chains along the sheet
@@ -61,7 +61,7 @@ The four-tab sidebar carries the full control surface:
 - **Stats**: energy, plasma beta, field maxima, the divergence of B, reconnection rate on the Harris sheet, and conservation drift
 - **Probe**: click a cell to sample its state, with a small time-series
 
-Keyboard shortcuts 1 through 4 switch tabs. Play, pause, step, speed, reset, and theme live on the top toolbar, and the gear dropdown holds the numerics and render knobs (CFL, gamma, pressure floor, anomalous resistivity, source-substep cap, EMF mode, positivity guard, and LIC intensity and drift).
+Keyboard shortcuts 1 through 4 switch tabs. Play, pause, step, speed, reset, and theme live on the top toolbar. Numerics and render controls (CFL, gamma, pressure floor, anomalous resistivity, source-substep cap, EMF mode, positivity guard, and LIC intensity and drift) live in Settings with the rest of the control surface.
 
 ## Running Locally
 

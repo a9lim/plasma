@@ -1,3 +1,10 @@
+---
+name: Plasma
+title: Plasma — 2D Resistive MHD Simulator
+description: Explore shocks, reconnection, waves, transport, radiation, self-gravity, and cylindrical flows in a WebGPU 2.5D magnetohydrodynamics laboratory.
+updated: 2026-07-16
+---
+
 # Plasma
 
 Plasma is a WebGPU-native simulator for two-dimensional resistive
@@ -33,11 +40,12 @@ anisotropic conduction, Hall and ambipolar terms, Biermann battery generation,
 viscosity, gravity, geometry sources, and sponge or driven boundaries.
 
 This is still a browser simulation, not a production plasma code. The cooling
-table is a compact code-unit model, the self-gravity solve is periodic Jacobi,
-and source terms are split after the main hyperbolic update. The implementation
-is built to keep those compromises explicit. Canonical verification presets
-default to just the base MHD numerics and guard terms, while extended presets
-opt into the source physics.
+table is a compact code-unit model, while self-gravity uses a Cartesian
+geometric-multigrid solve with a weighted-Jacobi fallback and separate
+cylindrical operators. Source physics is Strang-bracketed around the
+hyperbolic and resistive update. The implementation keeps those compromises
+explicit: canonical verification presets default to the base MHD numerics and
+guard terms, while extended presets opt into the source physics.
 
 ## Hidden presets
 

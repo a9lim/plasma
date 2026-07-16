@@ -5,12 +5,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Plasma — 2D Resistive MHD Simulator | a9l.im</title>
-    <meta name="description" content="WebGPU-native interactive 2D resistive magnetohydrodynamics plasma simulator. Educational physics in the browser.">
+    <meta name="description" content="Explore shocks, reconnection, waves, transport, radiation, self-gravity, and cylindrical flows in a WebGPU 2.5D magnetohydrodynamics laboratory.">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
     <meta name="author" content="a9lim">
     <meta name="theme-color" content="#e11107">
     <meta property="og:title" content="Plasma — 2D Resistive MHD Simulator">
-    <meta property="og:description" content="WebGPU-native interactive 2D resistive MHD plasma simulator.">
+    <meta property="og:description" content="Explore shocks, reconnection, waves, transport, radiation, self-gravity, and cylindrical flows in a WebGPU 2.5D magnetohydrodynamics laboratory.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://a9l.im/plasma">
     <meta property="og:site_name" content="a9l.im">
@@ -22,7 +22,7 @@
     <meta property="og:image:alt" content="Plasma — 2D resistive magnetohydrodynamics simulator">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="Plasma — 2D Resistive MHD Simulator">
-    <meta name="twitter:description" content="WebGPU-native interactive 2D resistive MHD plasma simulator.">
+    <meta name="twitter:description" content="Explore shocks, reconnection, waves, transport, radiation, self-gravity, and cylindrical flows in a WebGPU 2.5D magnetohydrodynamics laboratory.">
     <meta name="twitter:image" content="https://a9l.im/plasma/og-image.webp">
     <meta name="twitter:site" content="@_a9lim">
     <meta name="twitter:creator" content="@_a9lim">
@@ -65,7 +65,7 @@
           "@id": "https://a9l.im/plasma#app",
           "name": "Plasma",
           "url": "https://a9l.im/plasma",
-          "description": "Interactive 2D resistive magnetohydrodynamics simulator with HLLD Riemann solver, PPM reconstruction, RK3 SSP time integration, constrained-transport divergence cleaning, tabulated microphysics, and optional nonideal source physics.",
+          "description": "Explore shocks, reconnection, waves, transport, radiation, self-gravity, and cylindrical flows in a WebGPU 2.5D magnetohydrodynamics laboratory.",
           "applicationCategory": "EducationalApplication",
           "learningResourceType": "Simulation",
           "operatingSystem": "Any modern browser with WebGPU",
@@ -77,7 +77,7 @@
           "inLanguage": "en",
           "interactivityType": "active",
           "datePublished": "2026-05-24",
-          "dateModified": "2026-05-27",
+          "dateModified": "2026-07-16",
           "author": {
             "@type": "Person",
             "name": "a9lim",
@@ -222,7 +222,7 @@
               "name": "Is this a production plasma code?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "No. It is an educational browser simulator. The numerics borrow from production MHD methods, but some closures use compact code-unit tables, source terms are split, and gravity is a periodic Jacobi solve."
+                "text": "No. It is an educational browser simulator. The numerics borrow from production MHD methods, but some closures use compact code-unit tables. Source physics is Strang-bracketed around the MHD update, and self-gravity uses geometric multigrid with weighted-Jacobi fallback and separate cylindrical operators."
               }
             }
           ]

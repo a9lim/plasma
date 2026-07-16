@@ -118,7 +118,7 @@ export function setupUI(simShell) {
     if (typeof initAboutPanel === 'function') {
         const aboutHandle = initAboutPanel({
             title: 'Plasma',
-            lastUpdated: '2026-05-27',
+            lastUpdated: '2026-07-16',
             description: 'WebGPU-native 2D resistive MHD plasma simulator. Hover the canvas to sample the local state; left-drag pushes the plasma, right-drag twists the field. Settings holds preset / view / resistivity (η + anomalous) / numerics / render / resolution / boundaries; Physics holds the extended source layer (Hall, cooling, conduction, radiation, viscosity, non-ideal Ohm, gravity, geometry); Stats and Probe surface the live diagnostics.',
             controls: [
                 { label: 'Sample cell',  value: 'Hover canvas' },
