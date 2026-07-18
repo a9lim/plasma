@@ -19,6 +19,9 @@ convergence. Each
 row reads back the actual GPU state and reports density/pressure ranges,
 divergence, and a case-specific physical metric.
 
+Latest full run: **21/21 passed on 2026-07-17** with the headless Playwright
+driver against the parent static-server root.
+
 ### Run it
 
 ```bash
@@ -76,8 +79,8 @@ python -m http.server
 # → http://localhost:8787/plasma/tests/alfven-convergence.html
 ```
 
-Open the page in a WebGPU-capable browser (Chrome 113+, Edge 113+,
-Safari TP 184+) and click **Run sweep**. Each resolution streams a
+Open the page in a current WebGPU-capable browser and click **Run sweep**.
+Each resolution streams a
 progress line to the log as it finishes. `N=256` takes the longest
 (~10–60 s depending on the GPU).
 
@@ -154,15 +157,11 @@ the run.
   by setting `sim.n` and re-instantiating `PlasmaBuffers` directly.
   This lets us sweep `N ∈ {32, 64, 128, 256}` without touching the
   production sim's resolution policy.
-- `sim.step()` does not advance `sim.simTime` — the test reads the
-  per-step `dt` back from `sim.buffers.dt` after each step and
-  accumulates simTime manually. This matches what
-  `src/stats-display.js` does at 12 Hz to display the wall clock.
-- The final step may overshoot `T` by up to one CFL `dt`. The
-  resulting per-cell bias is `O(dx)` at most when CFL saturates — it
-  washes out at high `N` and shouldn't dominate the slope. If you
-  need a cleaner test, add a "cap dt at T - simTime" path inside
-  `sim.step()` (currently not exposed).
+- The convergence pages do not call the public `sim.step()` hot path. They
+  dispatch `compute-dt` to probe the natural CFL step, then run a private
+  RK3-only sequence and accumulate test time explicitly. The final step writes
+  `T - simTime` into the dt buffer, so each resolution lands exactly on the
+  analytic period instead of carrying an O(dt) phase error from overshoot.
 - L1 is averaged per cell per conserved component over 8 components:
   `(ρ, ρv_x, ρv_y, ρv_z, E, B_x, B_y, B_z)`. Face B contributes via
   face averages at each cell center to match the engine's

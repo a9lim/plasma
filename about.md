@@ -2,7 +2,7 @@
 name: Plasma
 title: Plasma — 2D Resistive MHD Simulator
 description: Explore shocks, reconnection, waves, transport, radiation, self-gravity, and cylindrical flows in a WebGPU 2.5D magnetohydrodynamics laboratory.
-updated: 2026-07-16
+updated: 2026-07-17
 ---
 
 # Plasma
@@ -50,7 +50,7 @@ guard terms, while extended presets opt into the source physics.
 ## Hidden presets
 
 The preset dropdown intentionally surfaces only the eleven presets that are
-useful as exploratory starting points. Nine more are kept in
+useful as exploratory starting points. Ten more are kept in
 `src/presets.js` for the validation harness and for hand-driven testing:
 
 * `alfven-cpaw` and `acoustic-wave-hydro` are linear convergence rigs.
@@ -82,13 +82,13 @@ the `tests/physics-validation.{html,py}` matrix.
 The simulator is written for readers with some exposure to vector calculus,
 partial differential equations, and electromagnetism. Fluid dynamics helps,
 but the controls are also useful for exploratory play: change the preset,
-switch scalar diagnostics, click a probe point, and compare how the fields
+switch scalar diagnostics, hover a probe point, and compare how the fields
 organize themselves.
 
 ## Accessibility
 
 The app uses keyboard-reachable controls, ARIA labels on the canvas and panel,
-high-contrast theme support through the site design system, and text labels
+light and dark themes through the site design system, and text labels
 for all major controls. The simulation is animated and can be paused, stepped,
 or reset. It does not use sound.
 

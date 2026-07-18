@@ -77,7 +77,7 @@
           "inLanguage": "en",
           "interactivityType": "active",
           "datePublished": "2026-05-24",
-          "dateModified": "2026-07-16",
+          "dateModified": "2026-07-17",
           "author": {
             "@type": "Person",
             "name": "a9lim",
@@ -163,7 +163,6 @@
           ],
           "accessibilityFeature": [
             "keyboardNavigation",
-            "highContrastDisplay",
             "ARIA",
             "alternativeText"
           ],
@@ -190,7 +189,7 @@
               "name": "What equations does the simulator solve?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "It solves a 2.5D resistive magnetohydrodynamics system with optional source terms for cooling, heating, conduction, Hall physics, ambipolar diffusion, Biermann battery generation, viscosity, gravity, geometry, and boundary sponge damping."
+                "text": "It solves a 2.5D resistive magnetohydrodynamics system with optional source terms for cooling, heating, conduction, grey radiation, Hall physics, ambipolar diffusion, Biermann battery generation, electron-inertia current smoothing, viscosity, gravity, cylindrical geometry, and boundary sponge damping."
               }
             },
             {
@@ -264,12 +263,12 @@
             {
               "@type": "HowToStep",
               "name": "Adjust physics controls",
-              "text": "Use settings to change resistivity, resolution, boundary modes, cooling, conduction, nonideal terms, viscosity, gravity, geometry, and source substep caps."
+              "text": "Use Settings for resistivity, numerics, LIC rendering, resolution, and boundaries. Use the Physics tab for cooling, conduction, radiation, Hall and nonideal terms, viscosity, gravity, geometry, and source substep caps."
             },
             {
               "@type": "HowToStep",
               "name": "Probe a cell",
-              "text": "Open the Probe tab and click the canvas to inspect local primitive variables, beta, current density, vorticity, and entropy over time."
+              "text": "Open the Probe tab and hover the canvas to inspect the local primitive variables, temperature, current density, field and velocity magnitudes, and plasma beta."
             },
             {
               "@type": "HowToStep",

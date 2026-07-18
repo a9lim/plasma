@@ -21,8 +21,9 @@ self-gravity, ambipolar, Biermann, kinetic-scale current smoothing,
 viscosity, cylindrical geometry, sponge, grey radiation) was built
 across Sessions 14–21 and is now Strang-bracketed
 around the hyperbolic step with a production validation matrix in
-`tests/physics-validation.{html,py}` (21/21 passing as of Session 21).
-See [`docs/HANDOFF.md`](docs/HANDOFF.md) for what's left and
+`tests/physics-validation.{html,py}` (21 production checks; 21/21 verified
+2026-07-17).
+See [`docs/HANDOFF.md`](docs/HANDOFF.md) for the current verification state and
 [`docs/sessions/`](docs/sessions/) for per-session retrospectives —
 comments in code that say "Session N" point at
 `docs/sessions/session-N.md`.
@@ -38,7 +39,8 @@ comments in code that say "Session N" point at
 - **Boundaries**: per-edge selectable — periodic / outflow / reflecting / driven
 - **Default view**: J_z (out-of-plane current density)
 - **Field visualization**: animated LIC only (no quiver, streamlines, or arrow glyphs)
-- **Pointer**: drag injects a velocity perturbation (Phase 7 wiring)
+- **Pointer**: left-drag injects momentum; right-drag applies a
+  divergence-preserving magnetic perturbation derived from a vector potential
 - **Grid**: 256² default; sidebar selector for 256 / 512 / 1024
 - **Ghost cells**: 2 layers per side (PPM's 5-point stencil at edges)
 
@@ -66,7 +68,7 @@ plasma/
     ├── ui.js               ← shared-* module wiring (Phase 5; Session 22+ coherence: gear dropdown removed, its knobs folded into the Settings tab Numerics + Render sections)
     ├── physics-panel.js    ← Physics sidebar tab: 8 extended-physics sections (Session 22)
     ├── stats-display.js    ← Stats tab: energy / β / maxima / ∇·B / reconnection / conservation drift — Session 22 trim removed Health + Clock; NaN auto-pause kept as safety
-    ├── probe.js            ← Probe tab: cell sampling + mini time-series
+    ├── probe.js            ← Probe tab: 10 Hz primitive-state readout for the cell under the pointer
     └── gpu/
         ├── device.js       ← adapter + device init
         ├── buffers.js      ← ghost-padded slots, BC uniforms, stage params, noise + lic_out, Poisson φ, source scratch, dt_half
@@ -407,7 +409,11 @@ drift; per the Session 22 coherence pass it no longer surfaces the
 NaN-cell / floor-cell / dt-min counters (Health) or the per-step
 substep counts and GPU step time (Clock) — those were debug surface
 during the Session 14–21 hardening pass. The NaN auto-pause is
-preserved as a safety mechanism. The Probe tab is unchanged.
+preserved as a safety mechanism. The Probe tab follows the canvas hover
+position and reports the local primitive state, temperature, current density,
+field/velocity magnitudes, and plasma beta. It has no click-to-pin or
+time-series mode; left- and right-drag gestures belong to the perturbation
+path in `ui.js`.
 
 There is no topbar settings gear dropdown — the Session 22+ coherence
 pass removed it and folded its numerics + render knobs into the
@@ -429,7 +435,7 @@ Biermann, electron inertia, cooling/heating, gravity, shock viscosity)
 runs at meaningful values; the uniform LTE background stays exactly steady
 until the pointer creates the gradients the source terms act on.
 
-The preset dropdown surfaces 11 starting points; nine validation /
+The preset dropdown surfaces 11 starting points; ten validation /
 cylindrical presets stay in `src/presets.js` for the validation
 matrix and are reachable via `sim.setPreset('...')` — see
 `about.md` for the full list.

@@ -59,9 +59,11 @@ The four-tab sidebar carries the full control surface:
 - **Settings**: preset, view mode, resistivity and grid Reynolds floor, resolution, and per-edge boundary conditions with driven inflow states
 - **Physics**: the extended source layer, with one section each for Hall, cooling and heating, conduction, radiation, viscosity, the non-ideal Ohm terms, gravity, and geometry and sponge
 - **Stats**: energy, plasma beta, field maxima, the divergence of B, reconnection rate on the Harris sheet, and conservation drift
-- **Probe**: click a cell to sample its state, with a small time-series
+- **Probe**: hover the canvas to sample the local primitive state, current density, and plasma beta
 
 Keyboard shortcuts 1 through 4 switch tabs. Play, pause, step, speed, reset, and theme live on the top toolbar. Numerics and render controls (CFL, gamma, pressure floor, anomalous resistivity, source-substep cap, EMF mode, positivity guard, and LIC intensity and drift) live in Settings with the rest of the control surface.
+
+On the canvas, left-drag pushes the plasma and right-drag applies a divergence-preserving magnetic perturbation. Hovering selects the cell reported by Probe.
 
 ## Running Locally
 
@@ -72,7 +74,7 @@ cd path/to/a9lim.github.io && python -m http.server
 
 Serve from the repository root, because the shared design files load via absolute paths. There is no build step and no dependencies, and ES6 modules require HTTP rather than `file://`.
 
-Plasma needs WebGPU. Please use a recent Chrome or Edge, or Safari 26+, on a machine with a working GPU; the simulator shows a notice if WebGPU is unavailable. There is no CPU fallback — Plasma is WebGPU-only.
+Plasma needs WebGPU. Use a current WebGPU-capable browser on a machine with a working GPU; the simulator shows a notice if WebGPU is unavailable. There is no CPU fallback — Plasma is WebGPU-only.
 
 ## Tech
 
@@ -82,7 +84,7 @@ The whole macro step encodes as a single command submit. Stage weights, sweep di
 
 PPM caches per-cell primitives in a workgroup-shared tile with a halo, the dt reduction and the LIC contrast stretch use per-tile shared-atomic min/max reductions, and the self-gravity solve uses a Cartesian geometric multigrid V-cycle with a weighted-Jacobi fallback for cylindrical geometry.
 
-This is a browser simulation, not a production plasma code. The cooling table is a compact code-unit model, source terms are operator-split after the hyperbolic and resistive step, and the cylindrical closure does not yet cover every source coupling. The implementation is built to keep those compromises explicit: the canonical verification presets default to just the base MHD numerics and the guard flags, and the extended presets opt into the source physics.
+This is a browser simulation, not a production plasma code. The cooling table is a compact code-unit model, source terms are operator-split in Strang half-steps around the hyperbolic and resistive core, and the cylindrical closure does not yet cover every source coupling. The implementation is built to keep those compromises explicit: the canonical verification presets default to just the base MHD numerics and the guard flags, and the extended presets opt into the source physics.
 
 ## Sibling Projects
 
