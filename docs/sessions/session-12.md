@@ -186,7 +186,7 @@ Documented for next session, to spare them the rabbit holes:
   parent-repo http.server context) rather than `/tests/...` (under
   the plasma-only context). Allows running the harness without
   bouncing servers when working in the parent repo. The harness
-  itself reads absolute paths (`/shared-tokens.js`) which require
+  itself reads absolute paths (`/shared/tokens.js`) which require
   the parent-repo context anyway, so this is just a config alignment.
 
 ## Lessons

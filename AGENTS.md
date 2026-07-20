@@ -50,7 +50,7 @@ comments in code that say "Session N" point at
 plasma/
 ├── index.html              ← canvas, topbar, sidebar, crawlable edu content, JSON-LD
 ├── main.js                 ← entry: WebGPU init, frame loop, accumulator, setupUI hook
-├── styles.css              ← canvas + HUD layout (mostly inherits from /shared-base.css)
+├── styles.css              ← canvas + HUD layout (mostly inherits from /shared/base.css)
 ├── colors.js               ← _PALETTE extensions, frozen at startup
 ├── about.md                ← technical educational overview for LLM/index surfaces
 ├── AGENTS.md               ← this file

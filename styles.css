@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════
    plasma — Phase 5 layout overrides
-   Most styling inherits from /shared-base.css
+   Most styling inherits from /shared/base.css
    (.glass, .sim-toolbar, .sim-panel, .tool-btn,
    .ctrl-row, .stats-header, .sidebar-tabs, etc.).
    This file adds plasma-specific positioning,
