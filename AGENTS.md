@@ -7,7 +7,7 @@ design system and shared-code policy. Sibling sims: `geon`, `shoals`,
 WebGPU-only interactive 2D resistive magnetohydrodynamics simulator.
 Grid-Eulerian finite-volume on a regular Cartesian mesh. No CPU
 fallback in-tree. The shaders stay compilable by the parent repo's
-`shared-wgsl-transpile.js` (retained but currently unwired — no CPU
+`lib/wgsl/transpile.js` (retained but currently unwired — no CPU
 path is built), see the transpiler contract section below.
 
 Implementation plan (source of truth for design decisions):
@@ -418,7 +418,7 @@ path in `ui.js`.
 There is no topbar settings gear dropdown — the Session 22+ coherence
 pass removed it and folded its numerics + render knobs into the
 Settings tab (Numerics + Render sections above), so every control lives
-in a sidebar tab and `shared-settings.js` is no longer a dependency.
+in a sidebar tab and `shared/settings.js` is no longer a dependency.
 Keyboard shortcuts: 1=Settings, 2=Physics, 3=Stats, 4=Probe.
 
 `sandbox` is the default landing preset (`sim.presetName` / the
@@ -888,7 +888,7 @@ The transpiler is **currently retained but unwired** — the parent repo
 no longer transpiles these shaders and there is no CPU fallback built.
 These constraints are kept anyway so the shaders stay transpilable if
 the path is ever re-wired. All compute pipelines are designed to be
-compilable by the parent repo's `shared-wgsl-transpile.js`:
+compilable by the parent repo's `lib/wgsl/transpile.js`:
 
 * One bind group per pipeline (group 0). No dynamic offsets, no push
   constants.
@@ -917,24 +917,24 @@ clause.
 
 ## Shared module dependencies
 
-Compute path: `shared-tokens.js`, `shared-base.css`, `shared-utils.js`.
+Compute path: `shared/tokens.js`, `shared/base.css`, `shared/utils.js`.
 
-UI: `shared-toolbar.js`, `shared-forms.js`, `shared-dropdown.js`,
-`shared-about.js`, `shared-tabs.js`,
-`shared-icons.js`, `shared-shortcuts.js`, `shared-sparkline.js`,
-`shared-touch.js`, `shared-haptics.js`. (`shared-settings.js` was
+UI: `shared/toolbar.js`, `shared/forms.js`, `shared/dropdown.js`,
+`shared/about.js`, `shared/tabs.js`,
+`shared/icons.js`, `shared/shortcuts.js`, `shared/sparkline.js`,
+`shared/touch.js`, `shared/haptics.js`. (`shared/settings.js` was
 dropped with the gear dropdown — all controls now live in sidebar tabs.)
 
-`shared-touch.js` is loaded only so `_toolbar.initSidebar` can wire
+`shared/touch.js` is loaded only so `_toolbar.initSidebar` can wire
 swipe-to-dismiss on the sidebar's `.sheet-handle`; plasma calls no
 `initSwipeDismiss` directly.
 
-`shared-camera.js` is intentionally NOT used — fixed orthographic 2D.
-`shared-info.js` / `shared-tooltip.js` are NOT used — the probe is a
+`shared/camera.js` is intentionally NOT used — fixed orthographic 2D.
+`shared/info.js` / `shared/tooltip.js` are NOT used — the probe is a
 custom GPU-readback panel, not a tooltip, and there is no info/reference
 overlay.
 
-For a CPU fallback (not currently wired up): `shared-wgsl-transpile.js`
+For a CPU fallback (not currently wired up): `lib/wgsl/transpile.js`
 at the parent repo (compile-time conversion of compute shaders to JS) —
 retained but not hooked into the build or runtime.
 
@@ -944,8 +944,8 @@ retained but not hooked into the build or runtime.
   A Write hook blocks innerHTML in new files.
 - Always prefer shared modules over re-implementations.
 - WebGPU-only in-tree. There is no CPU fallback wired up —
-  `shared-wgsl-transpile.js` (retained at the parent repo) is the path
+  `lib/wgsl/transpile.js` (retained at the parent repo) is the path
   one would use to build one, but the `#no-webgpu` landing page is the
   current behavior when WebGPU is unavailable.
-- `shared-tokens.js` loads as a synchronous `<script>` (no `defer`) so
+- `shared/tokens.js` loads as a synchronous `<script>` (no `defer`) so
   it runs before CSS parses.
