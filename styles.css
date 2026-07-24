@@ -28,6 +28,7 @@ html, body {
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-sans);
+    font-variation-settings: var(--fvs-prose);
 }
 
 /* ─── Canvas (full viewport) ──────────────────── */
@@ -82,7 +83,8 @@ html, body {
 }
 
 .panel-hint {
-    font-family: var(--font-mono);
+    font-family: var(--font-sans);
+    font-variation-settings: var(--fvs-prose);
     font-style: italic;
     font-size: var(--font-sm);
     color: var(--text-muted);
@@ -124,6 +126,7 @@ html, body {
     background: var(--bg-panel-solid);
     color: var(--text);
     font-family: var(--font-mono);
+    font-variation-settings: var(--fvs-mono);
     font-size: var(--font-base);
     padding: var(--sp-1) var(--sp-2);
     border: none;
@@ -175,6 +178,7 @@ html, body {
 
 #no-webgpu h1 {
     font-family: var(--font-display);
+    font-variation-settings: var(--fvs-prose);
     font-weight: 600;
     font-size: 1.5rem;
     margin: 0;

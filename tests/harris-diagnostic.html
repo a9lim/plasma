@@ -14,17 +14,18 @@
 
 <style>
   body.sim-body { overflow: auto; padding: 24px; }
-  #wrap { max-width: 1200px; margin: 0 auto; font-family: var(--font-sans); }
-  h1 { font-family: var(--font-display); margin: 0 0 8px; }
+  #wrap { max-width: 1200px; margin: 0 auto; font-family: var(--font-sans); font-variation-settings: var(--fvs-prose); }
+  h1 { font-family: var(--font-display); font-variation-settings: var(--fvs-prose); margin: 0 0 8px; }
   .hint { color: var(--text-muted); margin: 4px 0 16px; font-size: var(--font-sm); }
   .actions { display: flex; gap: 12px; align-items: center; margin: 16px 0; }
   button.tool-btn { padding: 8px 16px; font-size: var(--font-base); }
-  input[type=number] { font-family: var(--font-mono); padding: 6px 10px;
+  input[type=number] { font-family: var(--font-mono); font-variation-settings: var(--fvs-mono); padding: 6px 10px;
                        background: var(--bg-elevated); color: var(--text);
                        border: none; outline: 0; border-radius: var(--radius);
                        width: 80px; }
   table { width: 100%; border-collapse: collapse; margin-top: 16px;
-          font-family: var(--font-mono); font-size: var(--font-sm);
+          font-family: var(--font-mono);
+          font-variation-settings: var(--fvs-mono); font-size: var(--font-sm);
           font-variant-numeric: tabular-nums; }
   th, td { padding: 6px 8px; text-align: right; white-space: nowrap; }
   th { background: var(--bg-elevated); color: var(--text); font-weight: 600;
@@ -33,7 +34,7 @@
   tbody tr:nth-child(even) { background: var(--bg-elevated); }
   tr.bad td { color: #c02520; }
   tr.warn td { color: #aa6600; }
-  #log { font-family: var(--font-mono); font-size: var(--font-sm);
+  #log { font-family: var(--font-mono); font-variation-settings: var(--fvs-mono); font-size: var(--font-sm);
          background: var(--bg-elevated); padding: 12px; border-radius: var(--radius);
          margin-top: 16px; white-space: pre-wrap; min-height: 60px;
          max-height: 220px; overflow: auto; }
